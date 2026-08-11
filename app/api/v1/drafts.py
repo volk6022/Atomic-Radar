@@ -23,7 +23,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.api.deps import GetDB, requires
 from app.api.v1.system import current_mode
@@ -87,25 +87,55 @@ async def _payload(db, draft: Draft) -> dict:
         "source_message_link": draft.source_message_link,
         "disqualifiers": lead.disqualifiers or [],
         "state": draft.state,
+        # Сохранённая правка человека. Экран обязан показать именно её, иначе
+        # оператор увидит исходный вариант и решит, что правка потерялась.
+        "final_text": draft.final_text,
+        "chosen_variant": draft.chosen_variant,
+        "decided_by": draft.decided_by,
+        "decided_at": draft.decided_at.isoformat() if draft.decided_at else None,
+        "reject_reason": draft.reject_reason,
     }
 
 
 # ── чтение ────────────────────────────────────────────────────────────────────
 
-@router.get("/next")
-async def next_draft(db: GetDB, after: int | None = None,
-                     user=requires(Section.DRAFTS)):
-    """Следующий неразобранный черновик.
+STATES = ("pending", "approved", "rejected")
 
-    Когда очередь разобрана, отдаём `draft: null`, а не 404: пустая очередь —
+
+def _state_filter(state: str | None):
+    """`state=all` или пусто — без фильтра. Иначе один из известных статусов."""
+    if not state or state == "all":
+        return None
+    if state not in STATES:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"неизвестный статус «{state}», ожидается один из "
+                            f"{', '.join(STATES)} или all")
+    return Draft.state == state
+
+
+@router.get("/next")
+async def next_draft(db: GetDB, after: int | None = None, state: str = "pending",
+                     user=requires(Section.DRAFTS)):
+    """Следующий черновик в выбранном срезе очереди.
+
+    По умолчанию срез — неразобранные: именно ради них экран и существует. Но
+    одобренный черновик обязан оставаться доступным для просмотра, иначе решение
+    оператора исчезает с глаз сразу после того, как принято, и проверить его
+    можно только в базе.
+
+    Когда в срезе пусто, отдаём `draft: null`, а не 404: пустая очередь —
     нормальное состояние экрана, а не ошибка запроса.
     """
     await _ensure_queue(db)
+    cond = _state_filter(state)
 
-    remaining = (await db.execute(
-        select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
+    count_q = select(func.count(Draft.id))
+    q = select(Draft).order_by(Draft.id)
+    if cond is not None:
+        count_q, q = count_q.where(cond), q.where(cond)
 
-    q = select(Draft).where(Draft.state == "pending").order_by(Draft.id)
+    remaining = (await db.execute(count_q)).scalar_one()
+
     draft = None
     if after is not None:
         draft = (await db.execute(q.where(Draft.id > after).limit(1))).scalar_one_or_none()
@@ -113,8 +143,74 @@ async def next_draft(db: GetDB, after: int | None = None,
         # Дойдя до конца, заворачиваем на начало — так же ведёт себя клавиша J.
         draft = (await db.execute(q.limit(1))).scalar_one_or_none()
 
-    return {"remaining": remaining,
+    return {"remaining": remaining, "state": state,
             "draft": (await _payload(db, draft)) if draft else None}
+
+
+@router.get("/list")
+async def list_drafts(db: GetDB, user=requires(Section.DRAFTS),
+                      state: str | None = None, channel: str | None = None,
+                      q: str | None = None, min_score: int = 0,
+                      limit: int = 100, offset: int = 0):
+    """Полный список черновиков — то, чего очереди принципиально не хватает.
+
+    Очередь показывает по одному и только неразобранные: так и задумано, иначе
+    ревью превращается в блуждание. Но после решения черновик из неё исчезает, и
+    без этого списка одобренный текст нельзя ни перечитать, ни показать заказчику.
+    """
+    await _ensure_queue(db)
+
+    stmt = (select(Draft, Lead, Channel)
+            .join(Lead, Draft.lead_id == Lead.id)
+            .join(Channel, Lead.channel_id == Channel.id))
+    count_stmt = (select(func.count(Draft.id))
+                  .join(Lead, Draft.lead_id == Lead.id)
+                  .join(Channel, Lead.channel_id == Channel.id))
+
+    cond = _state_filter(state)
+    if cond is not None:
+        stmt, count_stmt = stmt.where(cond), count_stmt.where(cond)
+    if channel:
+        stmt, count_stmt = stmt.where(Channel.title == channel), count_stmt.where(
+            Channel.title == channel)
+    if min_score:
+        stmt, count_stmt = stmt.where(Lead.score >= min_score), count_stmt.where(
+            Lead.score >= min_score)
+    if q:
+        # Поиск идёт и по автору, и по цитате: оператор помнит либо «кому писали»,
+        # либо «про что было», и заранее неизвестно, что именно.
+        like = f"%{q.lower()}%"
+        search = or_(func.lower(Lead.author_name).like(like),
+                     func.lower(Lead.author_username).like(like),
+                     func.lower(Lead.quote).like(like))
+        stmt, count_stmt = stmt.where(search), count_stmt.where(search)
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(
+        stmt.order_by(Draft.id.desc()).limit(limit).offset(offset))).all()
+
+    out = []
+    for draft, lead, channel_row in rows:
+        variants = draft.variants or []
+        chosen = draft.final_text or (
+            variants[draft.chosen_variant]["text"]
+            if draft.chosen_variant is not None and draft.chosen_variant < len(variants)
+            else (variants[0]["text"] if variants else ""))
+        out.append({
+            "id": draft.id, "lead_id": lead.id, "state": draft.state,
+            "author_name": lead.author_name or "—",
+            "author_username": ("@" + lead.author_username) if lead.author_username else None,
+            "channel": channel_row.title, "pain": lead.pain, "score": lead.score,
+            "text": chosen, "edited": bool(draft.final_text),
+            "reject_reason": draft.reject_reason,
+            "decided_by": draft.decided_by,
+            "decided_at": draft.decided_at.isoformat() if draft.decided_at else None,
+        })
+
+    return {"total": total, "limit": limit, "offset": offset, "rows": out,
+            "states": {s: (await db.execute(
+                select(func.count(Draft.id)).where(Draft.state == s))).scalar_one()
+                for s in STATES}}
 
 
 @router.get("/reasons")
@@ -122,6 +218,23 @@ async def reject_reasons(user=requires(Section.DRAFTS)):
     """Справочник причин отклонения. Список закрытый: причина уходит в eval-датасет,
     на котором меряется качество генерации, и свободный текст его размывает."""
     return REASONS
+
+
+# ВНИМАНИЕ: всё, что объявлено ниже `/{draft_id}`, будет им перехвачено —
+# FastAPI сопоставляет маршруты в порядке объявления. `/reasons` однажды уже
+# уехал сюда и стал возвращать 422 «draft_id не число», из-за чего на экране
+# молча переставала открываться правка.
+@router.get("/{draft_id}")
+async def one_draft(draft_id: int, db: GetDB, user=requires(Section.DRAFTS)):
+    """Конкретный черновик — по нему из полного списка открывается очередь."""
+    draft = (await db.execute(
+        select(Draft).where(Draft.id == draft_id))).scalar_one_or_none()
+    if draft is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"черновик {draft_id} не найден")
+    remaining = (await db.execute(
+        select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
+    return {"remaining": remaining, "state": draft.state,
+            "draft": await _payload(db, draft)}
 
 
 # ── решения ───────────────────────────────────────────────────────────────────
@@ -186,7 +299,10 @@ async def approve(draft_id: int, body: ApproveRequest, request: Request, db: Get
                             f"(их {len(variants)})")
 
     original = variants[body.variant_index]["text"]
-    text = (body.text or original).strip()
+    # Приоритет: присланный текст → ранее сохранённая правка → исходный вариант.
+    # Иначе одобрение после «сохранить с пометкой» молча отправило бы генерацию,
+    # а не то, что человек написал руками.
+    text = (body.text or draft.final_text or original).strip()
     if not text:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "пустой текст сообщения")
     edited = text != original
@@ -216,6 +332,51 @@ async def approve(draft_id: int, body: ApproveRequest, request: Request, db: Get
     return {"draft_id": draft_id, "decision": "approved",
             "variant_index": body.variant_index, "edited": edited,
             "send": send, "remaining": remaining}
+
+
+class EditRequest(BaseModel):
+    variant_index: int = Field(ge=0)
+    text: str
+
+
+@router.post("/{draft_id}/edit")
+async def edit(draft_id: int, body: EditRequest, request: Request, db: GetDB,
+               user=requires(Section.DRAFTS)):
+    """Сохранить правку, НЕ принимая решения.
+
+    Отдельно от одобрения, потому что это разные действия: «текст поправлен, ещё
+    думаю» — нормальное состояние работы, и заставлять человека одобрять только
+    ради того, чтобы не потерять правку, значит подталкивать его к решению.
+
+    Черновик остаётся в очереди, но помечен как отредактированный вручную — этот
+    признак идёт в eval-датасет и говорит о генерации больше, чем отказ: человек
+    не отверг текст, а дописал за него.
+    """
+    draft = await _draft_for_decision(db, draft_id)
+    variants = draft.variants or []
+    if body.variant_index >= len(variants):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"вариант {body.variant_index} не существует "
+                            f"(их {len(variants)})")
+
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "пустой текст сообщения")
+
+    draft.chosen_variant = body.variant_index
+    draft.final_text = text
+    # Состояние намеренно не трогаем: черновик остаётся неразобранным.
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="draft_edit",
+        detail={"draft_id": draft_id, "lead_id": draft.lead_id,
+                "variant_index": body.variant_index,
+                "changed": text != variants[body.variant_index]["text"]},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("draft_edited draft=%s by=%s", draft_id, user.email)
+
+    return {"draft_id": draft_id, "saved": True, "state": draft.state,
+            "edited": True, "text": text}
 
 
 @router.post("/{draft_id}/reject")

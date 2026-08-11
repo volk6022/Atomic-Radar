@@ -357,12 +357,27 @@ async def leads(db: GetDB, user=requires(Section.LEADS),
 # набором чистых заглушек без побочных эффектов.
 
 
+CONVERSATION_STATES = ("new", "awaiting_reply", "replied", "handed_off", "closed")
+
+
 @router.get("/conversations")
-async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS)):
+async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
+                        state: str | None = None):
     """Диалоги. Пока система в сухом прогоне, их не будет ни одного — и это
-    не поломка экрана, а главное свойство режима."""
-    rows = (await db.execute(
-        select(Conversation).order_by(Conversation.id.desc()))).scalars().all()
+    не поломка экрана, а главное свойство режима.
+
+    Фильтр по состоянию считается здесь: на клиенте он работал бы только по уже
+    загруженной странице, а диалоги — единственная сущность, которая растёт
+    без ограничений сверху.
+    """
+    if state and state not in CONVERSATION_STATES:
+        raise HTTPException(422, f"неизвестное состояние «{state}», ожидается одно из "
+                                 f"{', '.join(CONVERSATION_STATES)}")
+
+    stmt = select(Conversation).order_by(Conversation.id.desc())
+    if state:
+        stmt = stmt.where(Conversation.state == state)
+    rows = (await db.execute(stmt)).scalars().all()
     out = []
     for c in rows:
         lead = (await db.execute(
@@ -375,9 +390,16 @@ async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS)):
             "account": c.account_id, "state": c.state, "sent_count": c.sent_count,
             "last_sent_at": c.last_sent_at.isoformat() if c.last_sent_at else None,
         })
-    return {"rows": out, "total": len(out),
+    by_state = dict((await db.execute(
+        select(Conversation.state, func.count(Conversation.id))
+        .group_by(Conversation.state))).all())
+
+    return {"rows": out, "total": len(out), "state": state,
+            "states": [{"key": k, "count": by_state.get(k, 0)}
+                       for k in CONVERSATION_STATES],
             "note": None if out else
-                    "Диалогов нет: в сухом прогоне ни одно сообщение не отправляется"}
+                    ("Диалогов в этом состоянии нет" if state else
+                     "Диалогов нет: в сухом прогоне ни одно сообщение не отправляется")}
 
 
 # ── настройка ─────────────────────────────────────────────────────────────────
