@@ -1,0 +1,410 @@
+"""Схема Radar.
+
+Спроектирована от `radar-api-contract.md`, а не от моков напрямую: в моках все числа
+записаны строками, а цвета лежат рядом с данными. Здесь числа — числа, а цвет бейджа
+не хранится вовсе, он выводится из статуса на фронтенде.
+
+Отдельно про `server_default=func.now()`: в Engage тут была строка `"now()"`, которую
+Postgres вычислил один раз при создании таблиц и заморозил, — все `created_at` во всех
+таблицах хранили момент накатки схемы. Повторять не будем.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON,
+    Numeric, String, Text, UniqueConstraint, func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    type_annotation_map = {dict: JSONB, list: JSONB}
+
+
+def _created() -> Mapped[datetime]:
+    return mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+def _updated() -> Mapped[datetime]:
+    return mapped_column(DateTime(timezone=True), nullable=False,
+                         server_default=func.now(), onupdate=func.now())
+
+
+# ── доступ ────────────────────────────────────────────────────────────────────
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    initials: Mapped[str] = mapped_column(String(8), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Секрет TOTP. Обязателен: без второго фактора эта админка одобряет отправку
+    # сообщений живым людям, имея только пароль.
+    totp_secret: Mapped[str] = mapped_column(String(64), nullable=False)
+    totp_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_login_ip: Mapped[str | None] = mapped_column(String(45))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"))
+    user_email: Mapped[str | None] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(120), nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSONB)
+    ip: Mapped[str | None] = mapped_column(String(45))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_audit_created", "created_at"),)
+
+
+# ── состояние системы ─────────────────────────────────────────────────────────
+
+class SystemState(Base):
+    """Одна строка. Режим живёт здесь, а не в конфиге, потому что переключение
+    DRY_RUN ⇄ LIVE и kill switch обязаны действовать немедленно и без рестарта."""
+    __tablename__ = "system_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    mode: Mapped[str] = mapped_column(String(10), nullable=False, default="DRY_RUN")
+    killed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    killed_reason: Mapped[str | None] = mapped_column(Text)
+    changed_by: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = _updated()
+
+
+class Limit(Base):
+    """Пары ключ-значение из раздела Safety. Значение числовое — пороги сравниваются,
+    а не показываются."""
+    __tablename__ = "limits"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32))
+    description: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = _updated()
+
+
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+
+
+# ── флот и источники ──────────────────────────────────────────────────────────
+
+class Account(Base):
+    """Зеркало аккаунта из Engage. Radar не владеет сессиями — он их только показывает
+    и просит Engage что-то с ними сделать, поэтому здесь кеш, а не источник истины."""
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    engage_account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    engage_instance: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    phone_country: Mapped[str | None] = mapped_column(String(2))
+    proxy_country: Mapped[str | None] = mapped_column(String(2))
+    tz_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    limit_day: Mapped[int | None] = mapped_column(Integer)
+    limit_hour: Mapped[int | None] = mapped_column(Integer)
+    last_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    watcher_uptime: Mapped[float | None] = mapped_column(Numeric(6, 2))
+    synced_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (UniqueConstraint("engage_instance", "engage_account_id",
+                                       name="uq_account_engage"),)
+
+
+class Channel(Base):
+    __tablename__ = "channels"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    peer_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    topic: Mapped[str | None] = mapped_column(String(120))
+
+    # Обсуждение канала. `get_chat_info` в Engage отдаёт linked_chat_username, поэтому
+    # группу для чтения комментариев находим автоматически, а не спрашиваем руками.
+    linked_chat_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    linked_chat_username: Mapped[str | None] = mapped_column(String(64))
+
+    members: Mapped[int | None] = mapped_column(Integer)
+    msgs_per_day: Mapped[int | None] = mapped_column(Integer)
+    prefilter_rate: Mapped[float | None] = mapped_column(Numeric(6, 4))
+    leads_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    leads_per_1000: Mapped[float | None] = mapped_column(Numeric(8, 3))
+
+    ingest_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_junk: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    backfill_cursor: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+# ── конвейер ──────────────────────────────────────────────────────────────────
+
+class Message(Base):
+    """Сырое сообщение из обсуждения плюс результат каскада L0-L3.
+
+    Самая большая таблица системы: одна активная группа даёт ~9000 сообщений в сутки.
+    Отсюда индексы по (channel_id, tg_date) и уникальность по (channel_id, tg_message_id) —
+    ингест обязан быть идемпотентным, бэкфилл и реалтайм неизбежно пересекаются.
+    """
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("channels.id"), nullable=False)
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tg_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    author_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    author_username: Mapped[str | None] = mapped_column(String(64))
+    author_name: Mapped[str | None] = mapped_column(String(160))
+    author_is_bot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Пост канала, автоматически отзеркаленный в обсуждение. На такие не отвечаем:
+    # это не человек. В Engage поле называется automatic_forward (без is_).
+    is_automatic_forward: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reply_to_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    thread_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    text: Mapped[str | None] = mapped_column(Text)
+
+    # Каскад: на каком уровне сообщение отсеяно и почему. NULL — ещё не обрабатывалось.
+    cascade_level: Mapped[int | None] = mapped_column(Integer)
+    cascade_passed: Mapped[bool | None] = mapped_column(Boolean)
+    cascade_detail: Mapped[dict | None] = mapped_column(JSONB)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        UniqueConstraint("channel_id", "tg_message_id", name="uq_message_tg"),
+        Index("ix_message_channel_date", "channel_id", "tg_date"),
+        Index("ix_message_unprocessed", "cascade_level", "created_at"),
+    )
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("messages.id"), nullable=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("channels.id"), nullable=False)
+
+    author_peer_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    author_username: Mapped[str | None] = mapped_column(String(64))
+    author_name: Mapped[str | None] = mapped_column(String(160))
+
+    pain: Mapped[str | None] = mapped_column(String(255))
+    quote: Mapped[str | None] = mapped_column(Text)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Разбор скора по слагаемым: [{label, value}]. Оператор обязан видеть, из чего
+    # сложилась оценка, иначе доверять ей нельзя.
+    score_breakdown: Mapped[list | None] = mapped_column(JSONB)
+    disqualifiers: Mapped[list | None] = mapped_column(JSONB)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
+    reject_reason: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        Index("ix_lead_status_created", "status", "created_at"),
+        Index("ix_lead_author", "author_peer_id"),
+    )
+
+
+class Draft(Base):
+    """Черновик ответа на лид: три варианта, из которых человек выбирает и одобряет.
+
+    `variants` — JSONB, а не отдельная таблица: они всегда читаются и пишутся вместе
+    с черновиком, отдельно не запрашиваются и не переиспользуются.
+    """
+    __tablename__ = "drafts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    lead_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("leads.id"), nullable=False)
+
+    variants: Mapped[list] = mapped_column(JSONB, nullable=False)
+    thread_context: Mapped[list | None] = mapped_column(JSONB)
+    chosen_variant: Mapped[int | None] = mapped_column(Integer)
+    final_text: Mapped[str | None] = mapped_column(Text)
+
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    reject_reason: Mapped[str | None] = mapped_column(String(120))
+    decided_by: Mapped[str | None] = mapped_column(String(255))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+    source_message_link: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (Index("ix_draft_state_created", "state", "created_at"),)
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    lead_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("leads.id"), nullable=False)
+    account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("accounts.id"), nullable=False)
+    peer_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="new")
+    sent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    waiting_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    handed_off_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    events: Mapped[list["ConversationEvent"]] = relationship(back_populates="conversation")
+
+    __table_args__ = (UniqueConstraint("peer_id", name="uq_conversation_peer"),)
+
+
+class ConversationEvent(Base):
+    """Журнал диалога, только на добавление. Состояние диалога — свёртка этих событий.
+
+    Так сделано, потому что «почему бот это написал» — вопрос, который зададут, и
+    ответить на него по текущему состоянию невозможно: оно уже перезаписано.
+    """
+    __tablename__ = "conversation_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("conversations.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()
+
+    conversation: Mapped[Conversation] = relationship(back_populates="events")
+
+    __table_args__ = (Index("ix_convevent_conv", "conversation_id", "created_at"),)
+
+
+class OutboundAttempt(Base):
+    """Каждая попытка отправки, включая заблокированные, с причинами.
+
+    Отдельно от событий диалога: это журнал гардрейла. Он отвечает на вопрос «почему
+    не отправилось», который иначе превращается в раскопки по логам.
+    """
+    __tablename__ = "outbound_attempts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("drafts.id"))
+    conversation_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("conversations.id"))
+    account_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("accounts.id"))
+
+    allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasons: Mapped[list | None] = mapped_column(JSONB)
+    mode: Mapped[str] = mapped_column(String(10), nullable=False)
+    delivered_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    text_snapshot: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_outbound_created", "created_at"),)
+
+
+# ── настройка и наблюдение ────────────────────────────────────────────────────
+
+class ProfileVersion(Base):
+    """Версия профиля заказчика и таксономии болей. Версионируется, потому что от неё
+    зависит качество классификации: без версии нельзя сказать, на чём мерили."""
+    __tablename__ = "profile_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    version: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    business_description: Mapped[str | None] = mapped_column(Text)
+    pains: Mapped[list | None] = mapped_column(JSONB)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = _created()
+
+
+class Run(Base):
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    params: Mapped[dict | None] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    progress: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+    eta_seconds: Mapped[int | None] = mapped_column(Integer)
+    gpu_hours: Mapped[float | None] = mapped_column(Numeric(8, 3))
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+
+
+class LlmTrace(Base):
+    """Трейс вызова модели. Нужен и для отладки, и для счёта себестоимости лида."""
+    __tablename__ = "llm_traces"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(80), nullable=False)
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+    temperature: Mapped[float | None] = mapped_column(Numeric(4, 2))
+    prompt: Mapped[str | None] = mapped_column(Text)
+    response: Mapped[str | None] = mapped_column(Text)
+    tokens_in: Mapped[int | None] = mapped_column(Integer)
+    tokens_out: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    lead_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("leads.id"))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_trace_created", "created_at"),)
+
+
+class Evaluation(Base):
+    __tablename__ = "evaluations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    dataset_size: Mapped[int | None] = mapped_column(Integer)
+    precision: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    recall: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    f1: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+
+class Attribution(Base):
+    """Реф-токен связывает конкретного лида с его конверсией у заказчика."""
+    __tablename__ = "attribution"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    ref_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    lead_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("leads.id"))
+    channel_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("channels.id"))
+    clicked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bot_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    converted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    created_at: Mapped[datetime] = _created()

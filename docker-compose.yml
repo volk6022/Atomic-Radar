@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres-radar
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - radar_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [radar_network]
+
+  api:
+    image: atomic-radar:latest
+    container_name: api-radar
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      RADAR_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RADAR_SECRET_KEY: ${RADAR_SECRET_KEY}
+      RADAR_ENGAGE_BASE_URL: ${RADAR_ENGAGE_BASE_URL}
+      RADAR_ENGAGE_API_KEY: ${RADAR_ENGAGE_API_KEY}
+      RADAR_CORS_ORIGINS: ${RADAR_CORS_ORIGINS}
+      RADAR_DEBUG: "false"
+    ports:
+      # Только петля. Наружу — исключительно через Caddy по TLS: сервис держит
+      # cookie-сессии, открытый порт сделал бы их доступными по http.
+      - "127.0.0.1:8104:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [radar_network]
+
+volumes:
+  radar_pgdata:
+
+networks:
+  radar_network:
+    driver: bridge
