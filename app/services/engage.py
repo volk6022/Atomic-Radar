@@ -75,3 +75,33 @@ async def safety_config() -> dict:
 
 async def fleet_health() -> dict:
     return await _get("/v1/fleet/health")
+
+
+async def action(*, account_id: int, action: str, payload: dict, webhook_url: str,
+                 priority: int = 5) -> dict:
+    """Поставить задачу в Engage. Отсюда доступны ТОЛЬКО read-действия.
+
+    Список закрытый и проверяется здесь, а не по договорённости: `send_message` из
+    этого клиента невозможен физически, потому что отправка обязана идти через
+    `OutboundGate`. Забытая ветка кода, дергающая Engage напрямую, обнулила бы
+    условие сухого прогона, и лучше поймать её падением на старте, чем в проде.
+    """
+    allowed = {"get_chat_info", "get_chat_history", "get_chat_admins",
+               "resolve_username", "get_dialogs"}
+    if action not in allowed:
+        raise ValueError(
+            f"действие {action!r} недоступно из Radar: разрешены только чтения "
+            f"({', '.join(sorted(allowed))}); отправка идёт через OutboundGate"
+        )
+
+    body = {"account_id": account_id, "action": action, "payload": payload,
+            "webhook_url": webhook_url, "priority": priority}
+    try:
+        r = await _get_client().post("/v1/action", json=body)
+    except httpx.HTTPError as e:
+        logger.warning("engage_action_unreachable action=%s error=%s", action, e)
+        raise EngageUnavailable(f"Engage недоступен: {type(e).__name__}") from e
+
+    if r.status_code >= 400:
+        raise EngageUnavailable(f"Engage ответил {r.status_code}: {r.text[:200]}")
+    return r.json()

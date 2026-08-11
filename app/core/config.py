@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     ENGAGE_BASE_URL: str = "http://localhost:8103"
     ENGAGE_API_KEY: str = ""
 
+    # Адрес, по которому Engage достучится до нас с вебхуком. Внутрисетевой:
+    # наружу ручка приёма не нужна и на Caddy закрыта.
+    SELF_BASE_URL: str = "http://api-radar:8000"
+    # Секрет в URL вебхука — заголовок Engage поставить не может.
+    INGEST_TOKEN: str = ""
+
     # Стартовое значение режима. После первой миграции источник истины — БД:
     # переключатель в интерфейсе обязан действовать без рестарта.
     DEFAULT_MODE: str = "DRY_RUN"
