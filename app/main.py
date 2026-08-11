@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import auth, screens, system
+from app.api.v1 import auth, drafts, screens, system
 from app.core.config import get_settings
 from app.db.models import Base
 from app.db.session import get_engine
@@ -53,6 +53,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth.router)
     app.include_router(system.router)
+    app.include_router(drafts.router)
     app.include_router(screens.router)
 
     @app.get("/api/v1/health")

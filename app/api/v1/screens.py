@@ -18,6 +18,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from app.api.deps import requires
+from app.api.v1 import drafts as drafts_api
 from app.core.access import Section
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
@@ -49,8 +50,13 @@ async def alerts(user=requires(Section.DASHBOARD)):
 
 @router.get("/counters")
 async def counters(user=requires(Section.DASHBOARD)):
-    """Бейджи в меню. В вёрстке они захардкожены (`badge:'12'`, `badge:'3'`)."""
-    return {"drafts": 12, "conversations": 3}
+    """Бейджи в меню.
+
+    Счётчик черновиков берётся из самой очереди, а не из константы: оператор разобрал
+    три штуки, а бейдж продолжал показывать 12 — расхождение мелкое, но именно такие
+    приучают не верить цифрам на экране.
+    """
+    return {"drafts": len(drafts_api._pending()), "conversations": 3}
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -62,13 +68,15 @@ async def dashboard(user=requires(Section.DASHBOARD)):
             {"key": "messages", "label": "Сообщений за 24ч", "value": 8712, "go": "stream"},
             {"key": "prefiltered", "label": "После префильтра", "value": 431, "go": "stream"},
             {"key": "leads", "label": "Лидов найдено", "value": 27, "go": "leads"},
-            {"key": "drafts", "label": "Черновиков в очереди", "value": 12, "go": "drafts"},
+            {"key": "drafts", "label": "Черновиков в очереди",
+             "value": len(drafts_api._pending()), "go": "drafts"},
             {"key": "conversations", "label": "Диалогов активно", "value": 3, "go": "conversations"},
             {"key": "sent", "label": "Отправлено", "value": 0, "go": "conversations"},
             {"key": "revenue", "label": "Конверсий", "value": 0, "go": "attribution"},
         ],
         "queues": [
-            {"key": "drafts", "label": "Черновики", "count": 12, "go": "drafts"},
+            {"key": "drafts", "label": "Черновики",
+             "count": len(drafts_api._pending()), "go": "drafts"},
             {"key": "leads", "label": "Лиды на ревью", "count": 5, "go": "leads"},
             {"key": "runs", "label": "Прогоны", "count": 1, "go": "runs"},
             {"key": "conversations", "label": "Ждут ответа", "count": 3, "go": "conversations"},
@@ -85,7 +93,7 @@ async def dashboard(user=requires(Section.DASHBOARD)):
             {"step": "L1 ключевые слова", "count": 890, "go": "stream"},
             {"step": "L2 эмбеддинги", "count": 431, "go": "stream"},
             {"step": "L3 LLM", "count": 27, "go": "leads"},
-            {"step": "Черновики", "count": 12, "go": "drafts"},
+            {"step": "Черновики", "count": len(drafts_api._pending()), "go": "drafts"},
         ],
         # Режим показывается всегда: оператор должен видеть его, не заходя в Safety.
         "mode": "DRY_RUN",
@@ -186,67 +194,9 @@ async def leads(user=requires(Section.LEADS),
     return _page(rows, limit, offset)
 
 
-@router.get("/drafts/next")
-async def next_draft(user=requires(Section.DRAFTS), after: int | None = None):
-    """Экран черновиков курсорный: показывает один и двигается по очереди.
-
-    Поэтому не список, а «следующий после». `remaining` нужен, чтобы оператор видел
-    объём работы — это единственный экран, где он сидит подолгу.
-    """
-    return {
-        "id": 901, "lead_id": 4821, "remaining": 12,
-        "author_name": "Дмитрий К.", "author_username": "@dmitry_kzl",
-        "channel": "VPS & Hosting Talk", "pain": "хостинг тормозит/дорого", "score": 87,
-        "score_breakdown": [
-            {"label": "совпадение с болью", "value": 32},
-            {"label": "срочность/интент", "value": 24},
-            {"label": "признаки ЛПР", "value": 15},
-            {"label": "свежесть", "value": 10},
-            {"label": "достижимость в ЛС", "value": 6},
-        ],
-        "thread": [
-            {"meta": "15:02 · корневой пост",
-             "text": "«Обзор провайдеров VPS 2026 — делимся опытом в комментах»", "target": False},
-            {"meta": "15:15 · сосед", "text": "«а кто как считает?»", "target": False},
-            {"meta": "15:41 · Дмитрий К. — кандидат",
-             "text": "«ребят, задолбался с текущим хостингом, тормозит жутко»", "target": True},
-        ],
-        "variants": [
-            {"text": "«Видел твой вопрос про хостинг — обратись к Андрею (@vertsanov_biz), "
-                     "мне он за день поднял новый сервер, полёт нормальный»",
-             "spam_score": 0.12, "prompt_version": "v3", "lint_ok": True,
-             "critic_passed": True,
-             "critic_text": "Звучит нативно, как реальная рекомендация, не как реклама"},
-            {"text": "«Привет! По хостингу — знакомый Андрей (@vertsanov_biz) занимается "
-                     "инфраструктурой, переносил меня без простоя»",
-             "spam_score": 0.18, "prompt_version": "v3", "lint_ok": True,
-             "critic_passed": True, "critic_text": "Чуть обобщённее первого, но без штампов"},
-            {"text": "«Хостинг тормозит? Андрей решает под ключ за 1 день, "
-                     "гарантия аптайма 99.9%, пиши прямо сейчас!»",
-             "spam_score": 0.61, "prompt_version": "v3", "lint_ok": False,
-             "critic_passed": False,
-             "critic_text": "Читается как реклама: обещание гарантии и призыв к действию"},
-        ],
-        "source_message_link": "https://t.me/c/1923847561/88213",
-        "state": "pending",
-    }
-
-
-@router.get("/drafts/reasons")
-async def reject_reasons(user=requires(Section.DRAFTS)):
-    """Справочник причин отклонения. Список закрытый: причина уходит в eval-датасет,
-    на котором меряется качество генерации, поэтому свободный текст его размывает."""
-    return [
-        {"n": 1, "label": "Не та боль"},
-        {"n": 2, "label": "Не тот человек"},
-        {"n": 3, "label": "Звучит как реклама"},
-        {"n": 4, "label": "Слишком длинно"},
-        {"n": 5, "label": "Фактическая ошибка"},
-        {"n": 6, "label": "Неверный тон"},
-        {"n": 7, "label": "Дублирует отправленное"},
-        {"n": 8, "label": "Ссылка в первом сообщении"},
-        {"n": 9, "label": "Другое"},
-    ]
+# Очередь черновиков живёт в `app/api/v1/drafts.py`: там появилось состояние
+# (решения оператора) и вызов OutboundGate, а этот модуль намеренно остаётся
+# набором чистых заглушек без побочных эффектов.
 
 
 @router.get("/conversations")
