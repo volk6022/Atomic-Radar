@@ -17,6 +17,9 @@ services:
     networks: [radar_network]
 
   api:
+    # build обязателен: без него `docker compose up -d --build` молча поднимает
+    # старый образ, и выкатка выглядит успешной, не изменив ни строчки кода.
+    build: .
     image: atomic-radar:latest
     container_name: api-radar
     restart: unless-stopped
@@ -38,7 +41,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    networks: [radar_network]
+    networks: [radar_network, engage_vertsanov]
 
 volumes:
   radar_pgdata:
@@ -46,3 +49,9 @@ volumes:
 networks:
   radar_network:
     driver: bridge
+  # Сеть инстанса Engage vertsanov, поднятого своим compose. Radar подключается
+  # к ней вторым интерфейсом, чтобы ходить в gateway по имени контейнера, а не по
+  # опубликованному порту: наружу у Engage торчит только петля, и правильно.
+  engage_vertsanov:
+    external: true
+    name: fleet_network-vertsanov

@@ -11,6 +11,7 @@ from app.api.v1 import auth, drafts, screens, system
 from app.core.config import get_settings
 from app.db.models import Base
 from app.db.session import get_engine
+from app.services import engage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("radar_started mode_default=%s", settings.DEFAULT_MODE)
     yield
+    await engage.close()
     logger.info("radar_stopping")
 
 

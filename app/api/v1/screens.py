@@ -15,11 +15,14 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+# `status` из fastapi здесь не импортируется намеренно: у ручки лидов есть параметр
+# с таким же именем, и одноимённый модуль рядом читался бы как ошибка.
+from fastapi import APIRouter, HTTPException, Query
 
 from app.api.deps import requires
 from app.api.v1 import drafts as drafts_api
 from app.core.access import Section
+from app.services import engage
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
 
@@ -107,19 +110,62 @@ async def dashboard(user=requires(Section.DASHBOARD)):
 
 # ── флот и источники ──────────────────────────────────────────────────────────
 
+def _mask_phone(phone: str | None) -> str:
+    """`+12159021784` → `+1215•••1784`.
+
+    Аккаунт нужно опознавать, а полный номер для этого не требуется. Экран смотрят
+    и с чужих экранов тоже; отдавать наружу то, что не нужно для работы, — лишний риск.
+    """
+    if not phone:
+        return "—"
+    digits = phone.lstrip("+")
+    if len(digits) <= 8:
+        return phone
+    return f"+{digits[:4]}•••{digits[-4:]}"
+
+
 @router.get("/accounts")
 async def accounts(user=requires(Section.FLEET)):
-    return [
-        {"id": 1, "label": "vertsanov-01", "status": "active", "phone_country": "US",
-         "proxy_country": "US", "tz_offset": -18000, "limit_day": 30, "limit_hour": 4,
-         "last_action_at": "2026-08-11T09:41:00Z", "watcher_uptime": 99.2},
-        {"id": 2, "label": "vertsanov-02", "status": "active", "phone_country": "FR",
-         "proxy_country": "US", "tz_offset": -18000, "limit_day": 30, "limit_hour": 4,
-         "last_action_at": "2026-08-11T09:38:00Z", "watcher_uptime": 98.7},
-        {"id": 3, "label": "vertsanov-03", "status": "sleeping", "phone_country": "GB",
-         "proxy_country": "US", "tz_offset": -18000, "limit_day": 30, "limit_hour": 4,
-         "last_action_at": "2026-08-04T09:12:00Z", "watcher_uptime": 0.0},
-    ]
+    """Живой флот из Engage — единственная ручка, за которой уже стоят настоящие данные.
+
+    Поля, которых Engage не знает (часовой пояс собеседника, израсходованные за сутки
+    лимиты, аптайм вотчера), не выдумываются: экран показывает по ним прочерк. Пустая
+    клетка честнее правдоподобного числа — по такому экрану принимают решение о паузе
+    аккаунта.
+    """
+    try:
+        raw = await engage.list_accounts()
+        safety = await engage.safety_config()
+    except engage.EngageUnavailable as e:
+        # 503, а не пустой список: «аккаунтов нет» и «мы не смогли спросить» — разные
+        # новости, и путать их на экране здоровья флота нельзя.
+        raise HTTPException(503, str(e)) from e
+
+    totals = safety.get("warmup_totals", {})
+    rows = []
+    for a in raw:
+        proxy = a.get("proxy") or {}
+        phone_country = a.get("phone_country")
+        proxy_country = proxy.get("country")
+        rows.append({
+            "id": a.get("account_id"),
+            "label": f"acc-{a.get('account_id')}",
+            "phone_masked": _mask_phone(a.get("phone")),
+            "status": a.get("status"),
+            "phone_country": phone_country,
+            "proxy_country": proxy_country,
+            "proxy_type": proxy.get("type"),
+            "proxy_healthy": proxy.get("is_healthy"),
+            # Тот самый рассинхрон, из-за которого гейт Engage усыплял аккаунты и
+            # пришлось заводить `geo_override`: страна номера против страны прокси.
+            "geo_match": bool(phone_country and proxy_country
+                              and phone_country == proxy_country),
+            "use_case": a.get("use_case"),
+            "warmup_tier": a.get("warmup_tier"),
+            "warmup_day": a.get("warmup_day"),
+            "warmup_total": totals.get(a.get("use_case")),
+        })
+    return rows
 
 
 @router.get("/channels")
@@ -142,22 +188,100 @@ async def channels(user=requires(Section.CHANNELS)):
 
 @router.get("/messages")
 async def messages(user=requires(Section.STREAM),
-                   limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+                   limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+                   channel: str | None = None, passed: str | None = None):
+    """Поток сообщений с результатом каскада L0→L3.
+
+    У каждой ступени рядом с вердиктом лежит `notes` — человеческая причина. Экран
+    потока существует ради вопроса «почему это не стало лидом», и голое `false`
+    на него не отвечает: отладка префильтра иначе превращается в гадание.
+
+    `l2`/`l3` равны `null`, когда до ступени не дошло. Это не то же самое, что «не
+    прошло», и на экране рисуется третьим значком, а не крестом.
+    """
     rows = [
-        {"id": 1, "channel": "VPS & Hosting Talk", "author_name": "Дмитрий К.",
+        {"id": 88213, "channel": "VPS & Hosting Talk", "author_name": "Дмитрий К.",
          "author_username": "@dmitry_kzl",
-         "text": "ребят, задолбался с текущим хостингом, тормозит жутко",
+         "text": "ребят, задолбался с текущим хостингом, тормозит жутко, "
+                 "кто может посоветовать замену?",
          "tg_date": "2026-08-11T15:41:00Z", "is_automatic_forward": False,
-         "cascade": {"l0": True, "l1": True, "l2": True, "l3": True}},
-        {"id": 2, "channel": "VPS & Hosting Talk", "author_name": "сосед",
+         "cascade": {"l0": True, "l1": True, "l2": True, "l3": True},
+         "cascade_notes": {
+             "l0": "не пост канала, длина 96, автор не бот и не админ",
+             "l1": "совпало «хостинг», «тормозит», «посоветовать»",
+             "l2": "близость 0.79 к «жалоба на хостинг» (порог 0.62)",
+             "l3": "боль подтверждена, интент явный, признаки ЛПР есть",
+         },
+         "lead_id": 4821},
+        {"id": 88215, "channel": "VPS & Hosting Talk", "author_name": "сосед",
          "author_username": None, "text": "+1, тоже думаю",
          "tg_date": "2026-08-11T15:44:00Z", "is_automatic_forward": False,
-         "cascade": {"l0": True, "l1": False, "l2": None, "l3": None}},
-        {"id": 3, "channel": "Информационная безопасность", "author_name": "Игорь С.",
-         "author_username": "@igor_secops", "text": "VPN постоянно отваливается",
+         "cascade": {"l0": True, "l1": False, "l2": None, "l3": None},
+         "cascade_notes": {
+             "l0": "не пост канала, длина 13",
+             "l1": "ни одного ключевого слова, длина ниже порога",
+             "l2": "не запускался: отсеяно на L1",
+             "l3": "не запускался: отсеяно на L1",
+         },
+         "lead_id": None},
+        {"id": 44120, "channel": "Информационная безопасность", "author_name": "Игорь С.",
+         "author_username": "@igor_secops",
+         "text": "у меня VPN постоянно отваливается на удалёнке, задрало",
          "tg_date": "2026-08-11T14:02:00Z", "is_automatic_forward": False,
-         "cascade": {"l0": True, "l1": True, "l2": True, "l3": True}},
+         "cascade": {"l0": True, "l1": True, "l2": True, "l3": True},
+         "cascade_notes": {
+             "l0": "не пост канала, длина 55, автор не бот и не админ",
+             "l1": "совпало «VPN», «отваливается»",
+             "l2": "близость 0.83 к «жалоба на VPN» (порог 0.62)",
+             "l3": "боль подтверждена, срочность высокая",
+         },
+         "lead_id": 4822},
+        {"id": 44118, "channel": "Информационная безопасность", "author_name": "Бот Новостей",
+         "author_username": "@infosec_news_bot",
+         "text": "Дайджест уязвимостей за неделю — читайте в канале",
+         "tg_date": "2026-08-11T13:50:00Z", "is_automatic_forward": True,
+         "cascade": {"l0": False, "l1": None, "l2": None, "l3": None},
+         "cascade_notes": {
+             "l0": "автопересылка поста канала — комментарии к ней не считаются репликой",
+             "l1": "не запускался: отсеяно на L0",
+             "l2": "не запускался: отсеяно на L0",
+             "l3": "не запускался: отсеяно на L0",
+         },
+         "lead_id": None},
+        {"id": 88377, "channel": "VPS & Hosting Talk", "author_name": "Марина Л.",
+         "author_username": "@marina_l",
+         "text": "кто-нибудь поднимал 3x-ui на дебиане? запутался в конфигах",
+         "tg_date": "2026-08-11T15:21:00Z", "is_automatic_forward": False,
+         "cascade": {"l0": True, "l1": True, "l2": True, "l3": True},
+         "cascade_notes": {
+             "l0": "не пост канала, длина 58, автор не бот и не админ",
+             "l1": "совпало «3x-ui», «конфиг»",
+             "l2": "близость 0.71 к «не может настроить сам» (порог 0.62)",
+             "l3": "боль подтверждена, интент — просьба о помощи",
+         },
+         "lead_id": 4824},
+        {"id": 88401, "channel": "IT Стартапы РФ", "author_name": "Сергей П.",
+         "author_username": "@sergey_p",
+         "text": "а вы какой стек берёте для MVP? думаю между next и remix",
+         "tg_date": "2026-08-11T12:10:00Z", "is_automatic_forward": False,
+         "cascade": {"l0": True, "l1": True, "l2": False, "l3": None},
+         "cascade_notes": {
+             "l0": "не пост канала, длина 61, автор не бот и не админ",
+             "l1": "совпало «стек» — слово общее, само по себе боли не значит",
+             "l2": "близость 0.34, порог 0.62 — тема не про инфраструктуру",
+             "l3": "не запускался: отсеяно на L2",
+         },
+         "lead_id": None},
     ]
+
+    if channel:
+        rows = [r for r in rows if r["channel"] == channel]
+    # Фильтр «дошло до конца каскада» — то, ради чего на экран заходят чаще всего.
+    if passed == "true":
+        rows = [r for r in rows if r["cascade"]["l3"] is True]
+    elif passed == "false":
+        rows = [r for r in rows if r["cascade"]["l3"] is not True]
+
     return _page(rows, limit, offset)
 
 
