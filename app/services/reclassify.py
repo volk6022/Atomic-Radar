@@ -186,7 +186,8 @@ async def _stage_l3(db, messages, verdicts, *, limit, report, cancelled,
 
 
 async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
-    leads = {l.message_id: l for l in (await db.execute(select(Lead))).scalars().all()}
+    leads = {row.message_id: row
+             for row in (await db.execute(select(Lead))).scalars().all()}
     created = removed = kept = 0
 
     for m in messages:

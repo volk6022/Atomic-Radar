@@ -30,8 +30,7 @@ from app.api.v1.system import current_mode
 from app.core import clock
 from app.core.access import Capability, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (AuditLog, Channel, Draft, Lead, Message,
-                           OutboundAttempt)
+from app.db.models import (AuditLog, Channel, Draft, Lead, OutboundAttempt)
 from app.services import drafting
 
 logger = logging.getLogger(__name__)

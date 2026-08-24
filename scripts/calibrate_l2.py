@@ -75,7 +75,7 @@ async def main() -> None:
     for m, vec in zip(candidates, vectors):
         ranked = embeddings.rank(vec, protos)
         top_kind, top_label, top_sim = ranked[0]
-        other = next(((k, l, s) for k, l, s in ranked if k != top_kind), None)
+        other = next(((k, name, s) for k, name, s in ranked if k != top_kind), None)
         margin = top_sim - other[2] if other else top_sim
         rows.append({"m": m, "kind": top_kind, "label": top_label,
                      "sim": top_sim, "margin": margin})

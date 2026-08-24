@@ -117,8 +117,9 @@ def test_no_username_costs_reachability():
     with_name = classify("ищу админа, нужен человек настроить vpn для команды")
     without = classify("ищу админа, нужен человек настроить vpn для команды",
                        author_username=None)
-    reach = lambda v: next(b["value"] for b in v["breakdown"]
-                           if b["label"] == "достижимость в ЛС")
+    def reach(v):
+        return next(b["value"] for b in v["breakdown"]
+                    if b["label"] == "достижимость в ЛС")
     assert reach(with_name) == 6 and reach(without) == 0
     assert without["score"] < with_name["score"]
 

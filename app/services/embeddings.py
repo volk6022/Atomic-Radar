@@ -128,5 +128,5 @@ def rank(vector: list[float],
         key = (kind, label)
         if sim > best.get(key, -1.0):
             best[key] = sim
-    return sorted(((k, l, s) for (k, l), s in best.items()),
+    return sorted(((kind, name, s) for (kind, name), s in best.items()),
                   key=lambda t: t[2], reverse=True)
