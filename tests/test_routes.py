@@ -35,6 +35,11 @@ NAMED_BEFORE_PARAM = [
     ("/api/v1/drafts/reasons", "/api/v1/drafts/{draft_id}"),
     ("/api/v1/drafts/next", "/api/v1/drafts/{draft_id}"),
     ("/api/v1/drafts/list", "/api/v1/drafts/{draft_id}"),
+    # Ручных отправок это касается на будущее: сейчас `/{entry_id}` только PATCH, и
+    # перехватить GET он не может. Но стоит завести `GET /{entry_id}` — и `/form`
+    # начнёт отвечать «entry_id не число». Порядок объявления удержим заранее.
+    ("/api/v1/manual-sends/form", "/api/v1/manual-sends/{entry_id}"),
+    ("/api/v1/manual-sends/list", "/api/v1/manual-sends/{entry_id}"),
 ]
 
 

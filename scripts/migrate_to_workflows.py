@@ -254,7 +254,12 @@ async def migrate_outbound(db, wf: Workflow, apply: bool) -> tuple[int, int]:
         if apply:
             db.add(WfOutbound(
                 workflow_id=wf.id, target_id=target_id, draft_id=draft_id,
-                conversation_id=a.conversation_id, account_id=a.account_id,
+                conversation_id=a.conversation_id,
+                # Значение переносится как есть. В старой таблице это был локальный
+                # `accounts.id`, в новой — id Engage, и сопоставить их нечем: таблица
+                # `accounts` никогда не наполнялась. Практического расхождения нет —
+                # `outbound_attempts` пуста, писателя у неё не существует.
+                engage_account_id=a.account_id,
                 allowed=a.allowed, reasons=a.reasons, mode=a.mode,
                 delivered_message_id=a.delivered_message_id,
                 text_snapshot=a.text_snapshot, created_at=a.created_at,

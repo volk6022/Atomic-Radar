@@ -29,6 +29,7 @@ class Section(StrEnum):
     LEADS = "leads"
     DRAFTS = "drafts"
     CONVERSATIONS = "conversations"
+    MANUAL_SENDS = "manual_sends"
     PROFILE = "profile"
     RUNS = "runs"
     EVALS = "evals"
@@ -50,6 +51,9 @@ ACCESS: dict[Section, frozenset[Role]] = {
     Section.LEADS: _STAFF,
     Section.DRAFTS: _STAFF,
     Section.CONVERSATIONS: _STAFF,
+    # Отправляет руками заказчик, а разборщик видит, что именно ушло, и с чем это
+    # расходится с предложенным. Гостю здесь делать нечего: это внутренняя кухня.
+    Section.MANUAL_SENDS: _STAFF,
     Section.PROFILE: _STAFF,
     # Разборщик должен видеть, что идёт пересчёт: иначе замершая очередь выглядит
     # поломкой. Запускать задачи он при этом не может — см. CAPABILITIES.
@@ -83,6 +87,7 @@ class Capability(StrEnum):
     DRAFT_REOPEN = "draft.reopen"
     LEAD_STATUS = "lead.status"
     BULK_DECIDE = "bulk.decide"
+    MANUAL_SEND_RECORD = "manual_send.record"
     # конфигурация классификации
     CONFIG_EDIT = "config.edit"
     CONFIG_PROPOSE = "config.propose"
@@ -128,6 +133,13 @@ CAPABILITIES: dict[Capability, frozenset[Role]] = {
     # отклонены одним нажатием; владельцу такой инструмент нужен, ему — нет.
     # Ограничение по количеству строк проверяется в ручке (см. BULK_LIMIT_REVIEWER).
     Capability.BULK_DECIDE: _STAFF,
+
+    # Запись — рассказ о том, что уже произошло, наружу от неё ничего не уходит.
+    # Правило «ужесточение шире ослабления» здесь ни при чём: запретить записывать
+    # факт значит остаться без данных, ради которых форма и делается. Правка чужой
+    # записи при этом закрыта — проверяется в ручке, а не таблицей: тут вопрос не
+    # «кто вообще может», а «своя запись или нет».
+    Capability.MANUAL_SEND_RECORD: _STAFF,
 
     Capability.CONFIG_EDIT: _OWNER,
     # Заказчик может предложить правку болей: черновик создаётся, но не включается.

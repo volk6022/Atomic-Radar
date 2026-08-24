@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, drafts, ingest, leads, runs, screens,
-                        system)
+from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, runs,
+                        screens, system)
 from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
@@ -81,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(ingest.operator_router)
     app.include_router(alerts.router)
     app.include_router(leads.router)
+    app.include_router(manual_sends.router)
     app.include_router(runs.router)
     app.include_router(screens.router)
 

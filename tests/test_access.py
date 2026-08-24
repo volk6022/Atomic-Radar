@@ -18,6 +18,10 @@ EXPECTED = {
     "leads": {"owner", "customer", "reviewer"},
     "drafts": {"owner", "customer", "reviewer"},
     "conversations": {"owner", "customer", "reviewer"},
+    # ВНИМАНИЕ: раздела ручных отправок в `Atomic Radar.dc.html` ещё НЕТ — бэкенд
+    # опережает оболочку. Пока в GUI не появится соответствующий пункт, эта строка
+    # описывает намерение, а не зеркало. Как только пункт добавят — свериться дословно.
+    "manual_sends": {"owner", "customer", "reviewer"},
     "profile": {"owner", "customer", "reviewer"},
     "runs": {"owner", "customer", "reviewer"},
     "evals": {"owner", "customer", "reviewer"},

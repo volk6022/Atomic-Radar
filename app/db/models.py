@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
     Numeric, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -696,7 +696,10 @@ class WfOutbound(Base):
     target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
     draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
     conversation_id: Mapped[int | None] = mapped_column(BigInteger)
-    account_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Как и в `manual_sends` — id аккаунта в Engage. В старой `outbound_attempts`
+    # здесь был внешний ключ на локальную `accounts`, но та таблица мертва, а
+    # отправлять всё равно придётся через Engage, который знает только свои id.
+    engage_account_id: Mapped[int | None] = mapped_column(BigInteger)
 
     # Куда фактически уходило.
     recipient_peer_id: Mapped[int | None] = mapped_column(BigInteger)
@@ -737,7 +740,10 @@ class ManualSend(Base):
     target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
     draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
     message_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("messages.id"))
-    account_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Именно id аккаунта в Engage, а не в локальной `accounts`: та таблица мертва, и
+    # экран флота берёт список прямо из Engage. Одного числа хватает, потому что
+    # инстанс задан сценарием — пара (workflow, аккаунт) однозначна.
+    engage_account_id: Mapped[int | None] = mapped_column(BigInteger)
 
     text: Mapped[str] = mapped_column(Text, nullable=False)
     # Снимок того, что предлагал Radar на момент отправки. Черновик потом могут
