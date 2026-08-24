@@ -13,7 +13,8 @@
 Лиды, по которым человек уже принял решение, не трогаются: переписывать чужое решение
 задним числом нельзя. Лиды в статусе `new`, переставшие проходить каскад, удаляются —
 держать в очереди то, что система больше не считает лидом, значит тратить время
-оператора на заведомый мусор.
+оператора на заведомый мусор. «Решение принято» означает и статус лида, и решение по
+его черновику; подробности в `_reconcile_leads`.
 
 Модуль — общее ядро для CLI (`scripts/reclassify.py`) и для задачи, запускаемой из
 интерфейса. Отсюда `report` и `cancelled`: снаружи прогон обязан показывать, сколько
@@ -27,7 +28,7 @@ import logging
 from sqlalchemy import func, or_, select
 
 from app.core import cascade
-from app.db.models import Channel, Lead, LlmTrace, Message
+from app.db.models import Channel, Draft, Lead, LlmTrace, Message
 from app.services import drafting, embeddings, llm
 
 log = logging.getLogger("radar.reclassify")
@@ -186,8 +187,29 @@ async def _stage_l3(db, messages, verdicts, *, limit, report, cancelled,
 
 
 async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
+    """Привести очередь лидов в соответствие со свежими вердиктами.
+
+    Лид, переставший проходить каскад, из очереди убирается — держать в ней то, что
+    система больше не считает лидом, значит тратить время оператора на заведомый мусор.
+    Но убрать его можно **только пока за него никто не брался**, и «взялся» здесь
+    означает две разные вещи.
+
+    Первая — статус лида: всё, кроме `new`, поставил человек, и переписывать чужое
+    решение задним числом нельзя.
+
+    Вторая — черновик. `drafts.lead_id` объявлен `NOT NULL` и без `ondelete`, то есть
+    база физически запрещает удалить лид, у которого есть черновик. Это не досадное
+    ограничение, а ровно то поведение, которое здесь нужно: черновик означает, что лид
+    дошёл до человека. Раньше про это не знали, и `reclassify --scope all` падал
+    нарушением ключа на первом же таком лиде, откатывая весь прогон целиком.
+
+    Поэтому: неразобранный черновик (`pending`) удаляется вместе с лидом — решения в
+    нём нет, терять нечего; разобранный оставляет лид на месте.
+    """
     leads = {row.message_id: row
              for row in (await db.execute(select(Lead))).scalars().all()}
+    drafts = {row.lead_id: row
+              for row in (await db.execute(select(Draft))).scalars().all()}
     created = removed = kept = 0
 
     for m in messages:
@@ -212,13 +234,24 @@ async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
             # просто не досчитали, а не признали мусором.
             if v["passed"] is None:
                 kept += 1
-            elif lead.status == "new":
-                await db.delete(lead)
-                removed += 1
-            else:
+            elif lead.status != "new":
                 log.warning("лид %s больше не проходит каскад, но статус «%s» — "
                             "оставлен как есть", lead.id, lead.status)
                 kept += 1
+            else:
+                draft = drafts.get(lead.id)
+                if draft is not None and draft.state != "pending":
+                    log.warning("лид %s больше не проходит каскад, но по нему уже есть "
+                                "решение по черновику («%s») — оставлен как есть",
+                                lead.id, draft.state)
+                    kept += 1
+                else:
+                    # Порядок важен: сначала черновик, потом лид. Обратный порядок —
+                    # это то самое нарушение внешнего ключа, ради которого всё писалось.
+                    if draft is not None:
+                        await db.delete(draft)
+                    await db.delete(lead)
+                    removed += 1
 
     return created, removed, kept
 
