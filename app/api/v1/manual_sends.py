@@ -21,7 +21,8 @@ from sqlalchemy import select
 
 from app.api.deps import GetDB, permits, requires
 from app.core.access import Capability, Role, Section
-from app.db.models import AuditLog, EngageInstance, ManualSend, Message, WfTarget, Workflow
+from app.db.models import (AuditLog, Channel, EngageInstance, ManualSend, Message,
+                           WfTarget, Workflow)
 from app.services import engage, manual_sends, workflows
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,10 @@ async def _describe(db, entry: ManualSend) -> dict:
     message = (await db.execute(
         select(Message).where(Message.id == entry.message_id))).scalar_one_or_none() \
         if entry.message_id else None
-    return manual_sends.describe(entry, target=target, message=message)
+    channel = (await db.execute(
+        select(Channel).where(Channel.id == target.channel_id))).scalar_one_or_none() \
+        if target is not None and target.channel_id else None
+    return manual_sends.describe(entry, target=target, message=message, channel=channel)
 
 
 async def _workflow(db, workflow_id: int) -> Workflow:

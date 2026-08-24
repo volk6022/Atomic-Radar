@@ -283,6 +283,25 @@ async def test_history_shows_records_without_a_target(db):
     assert out["rows"][0]["target_id"] is None
 
 
+async def test_history_names_the_channel_and_leaves_it_empty_without_a_target(db):
+    """Канал — колонка экрана, и добирать его построчно значило бы N+1 запрос.
+
+    У записи без наводки канала нет: подставить туда что-нибудь ради непустой ячейки
+    значило бы придумать источник, которого не было.
+    """
+    s = await seed(db)
+    await manual_sends.record(db, workflow=s["dm"], text="по наводке",
+                              recorded_by="a@b.c", target_id=s["target"].id)
+    await manual_sends.record(db, workflow=s["dm"], text="мимо радара",
+                              recorded_by="a@b.c")
+    await db.commit()
+
+    by_text = {r["text"]: r for r in
+               (await manual_sends.history(db, workflow_id=s["dm"].id))["rows"]}
+    assert by_text["по наводке"]["channel"] == "Канал про VPS"
+    assert by_text["мимо радара"]["channel"] is None
+
+
 async def test_correcting_a_record_survives_a_reread(db):
     s = await seed(db)
     entry = await manual_sends.record(db, workflow=s["dm"], text="с опечаткай",

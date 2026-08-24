@@ -9,7 +9,16 @@ import pytest
 
 from app.core.access import ACCESS, Role, Section, can, sections_for
 
-# Дословно из `ACCESS` в `Atomic Radar.dc.html` (см. contract/Atomic-Radar.md).
+# Дословно из `ACCESS` в `Atomic Radar.dc.html` (см. contract/Atomic-Radar.md),
+# сверено 2026-08-24 после подключения раздела ручных отправок.
+#
+# Одно расхождение остаётся намеренно: в оболочке есть маршрут `draftsTable` —
+# второй вид того же раздела черновиков, у которого нет и не должно быть отдельного
+# `Section` на сервере. Права он наследует от `drafts`.
+#
+# Этот список — третья копия матрицы, и сверяется он руками. Пока `/auth/me` не
+# станет для оболочки источником прав (карточка T3 в `GUI-SPEC-agents.md`), тест
+# ловит расхождение только тогда, когда кто-то не забыл его сюда перенести.
 EXPECTED = {
     "dashboard": {"owner", "customer", "reviewer", "viewer"},
     "fleet": {"owner"},
@@ -18,9 +27,6 @@ EXPECTED = {
     "leads": {"owner", "customer", "reviewer"},
     "drafts": {"owner", "customer", "reviewer"},
     "conversations": {"owner", "customer", "reviewer"},
-    # ВНИМАНИЕ: раздела ручных отправок в `Atomic Radar.dc.html` ещё НЕТ — бэкенд
-    # опережает оболочку. Пока в GUI не появится соответствующий пункт, эта строка
-    # описывает намерение, а не зеркало. Как только пункт добавят — свериться дословно.
     "manual_sends": {"owner", "customer", "reviewer"},
     "profile": {"owner", "customer", "reviewer"},
     "runs": {"owner", "customer", "reviewer"},

@@ -220,7 +220,7 @@ def correct(entry: ManualSend, fields: dict) -> list[str]:
 
 
 def describe(entry: ManualSend, *, target: WfTarget | None = None,
-             message: Message | None = None) -> dict:
+             message: Message | None = None, channel: Channel | None = None) -> dict:
     """Запись для экрана. Пара «предложено → отправлено» рядом, а не в разных местах —
     ради неё всё и затевалось."""
     return {
@@ -241,6 +241,9 @@ def describe(entry: ManualSend, *, target: WfTarget | None = None,
         "author_username": (("@" + target.author_username)
                             if target is not None and target.author_username else None),
         "pain": target.pain if target is not None else None,
+        # Канал приходит из справочника, а не из наводки: у записи без наводки его нет
+        # и быть не может, и подставлять сюда что-либо значило бы придумывать источник.
+        "channel": channel.title if channel is not None else None,
         "quote": (target.quote if target is not None
                   else (message.text if message is not None else None)),
     }
@@ -248,9 +251,12 @@ def describe(entry: ManualSend, *, target: WfTarget | None = None,
 
 async def history(db, *, workflow_id: int | None = None, limit: int = 50,
                   offset: int = 0) -> dict:
-    stmt = (select(ManualSend, WfTarget, Message)
+    # Канал подтягивается тем же запросом: экран показывает его колонкой, а добирать
+    # его построчно значило бы N+1 обращений там, где хватает внешнего соединения.
+    stmt = (select(ManualSend, WfTarget, Message, Channel)
             .outerjoin(WfTarget, ManualSend.target_id == WfTarget.id)
-            .outerjoin(Message, ManualSend.message_id == Message.id))
+            .outerjoin(Message, ManualSend.message_id == Message.id)
+            .outerjoin(Channel, WfTarget.channel_id == Channel.id))
     count_stmt = select(func.count(ManualSend.id))
     if workflow_id is not None:
         stmt = stmt.where(ManualSend.workflow_id == workflow_id)
@@ -269,6 +275,6 @@ async def history(db, *, workflow_id: int | None = None, limit: int = 50,
 
     return {
         "total": total, "limit": limit, "offset": offset,
-        "rows": [describe(entry, target=target, message=message)
-                 for entry, target, message in rows],
+        "rows": [describe(entry, target=target, message=message, channel=channel)
+                 for entry, target, message, channel in rows],
     }
