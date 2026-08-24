@@ -15,6 +15,7 @@ import logging
 
 from sqlalchemy import select
 
+from app.core import cascade
 from app.db.models import EngageInstance, Workflow
 from app.services import engage_registry
 
@@ -56,6 +57,7 @@ def describe(wf: Workflow) -> dict:
         "target_kind": wf.target_kind,
         "action": wf.action,
         "visibility": wf.visibility,
+        "cascade_profile": wf.cascade_profile,
         "is_active": wf.is_active,
         "sort_order": wf.sort_order,
         "sections": [{"key": s, "title": SECTION_TITLES[s]} for s in sections_for(wf)],
@@ -88,6 +90,12 @@ def validate(wf: Workflow) -> list[str]:
                         "цель такого действия — сообщение, а не человек")
     if wf.action == "dm" and wf.visibility != "private":
         problems.append("action='dm' не может быть публичным")
+    # Профиль каскада — ключ в код, а не свободная строка. В базе на него нет и не
+    # может быть внешнего ключа: профили живут в коде и меняются вместе с правилами.
+    # Значит единственное место, где опечатку видно до первого отбора, — здесь.
+    if wf.cascade_profile not in cascade.PROFILES:
+        problems.append(f"cascade_profile={wf.cascade_profile!r} — в коде нет такого "
+                        f"профиля; известны: {', '.join(sorted(cascade.PROFILES))}")
     return problems
 
 
@@ -135,7 +143,7 @@ async def ensure_bootstrap(db) -> bool:
         visibility="private",
         engage_instance_id=instance.id,
         engage_use_case="cold_dm",
-        cascade_profile="dm_v1",
+        cascade_profile=cascade.DEFAULT_PROFILE,
         sort_order=10,
         is_active=True,
         description="Найти человека с болью в канале и написать ему в личные сообщения.",

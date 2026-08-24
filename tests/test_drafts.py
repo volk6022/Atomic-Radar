@@ -65,10 +65,16 @@ def test_reject_validates_reason_before_touching_anything(client):
 # ── сборка вариантов ──────────────────────────────────────────────────────────
 
 def test_variants_exist_for_every_pain_the_cascade_can_emit():
-    """Каждая боль из каскада должна иметь заготовки, иначе лид приедет с заглушкой."""
+    """Каждая боль из каскада должна иметь заготовки, иначе лид приедет с заглушкой.
+
+    Перебираются все профили, а не только `dm_v1`: профиль с новой болью и без
+    шаблонов под неё — это лид с пустой карточкой, и узнать об этом лучше здесь.
+    """
     from app.core import cascade
-    for pain in cascade.PAIN_ANCHORS:
-        assert pain in drafting.TEMPLATES, f"нет шаблонов под боль «{pain}»"
+    for rules in cascade.PROFILES.values():
+        for pain in rules.pain_anchors:
+            assert pain in drafting.TEMPLATES, \
+                f"нет шаблонов под боль «{pain}» (профиль {rules.key})"
 
 
 def test_variants_never_claim_a_critic_ran():

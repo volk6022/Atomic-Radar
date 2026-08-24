@@ -467,7 +467,11 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
     Боли отдаются не из отдельной таблицы, а из самого каскада: это ровно тот список,
     по которому сейчас принимаются решения. Держать рядом «профиль для показа» и
     «правила для работы» — верный способ разойтись между экраном и поведением.
+
+    Профиль каскада назван явно. Пока workflow один, и это `dm_v1`; когда их станет
+    несколько, экран получит выбор, а не молча продолжит показывать правила первого.
     """
+    rules = cascade.profile(cascade.DEFAULT_PROFILE)
     version = (await db.execute(
         select(ProfileVersion).where(ProfileVersion.is_active.is_(True))
         .order_by(ProfileVersion.id.desc()).limit(1))).scalar_one_or_none()
@@ -478,7 +482,7 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
     pains = [{"key": pain, "label": pain, "anchors": list(anchors)[:6],
               "anchors_total": len(anchors),
               "prototypes": list(prototypes.POSITIVE.get(pain, ()))}
-             for pain, anchors in cascade.PAIN_ANCHORS.items()]
+             for pain, anchors in rules.pain_anchors.items()]
 
     return {
         "version": version.version if version else "не сохранён",
@@ -488,15 +492,17 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
                                  "под ключ, перенос без простоя."),
         "pains": pains,
         "disqualifiers": [{"key": k, "markers": list(v)[:6]}
-                          for k, v in cascade.DISQUALIFIERS.items()],
+                          for k, v in rules.disqualifier_markers.items()],
         # Отрицательные эталоны L2 — половина работы ступени, и без них список
         # «на кого охотимся» выглядел бы так, будто система только соглашается.
         "noise_prototypes": [{"key": k, "examples": list(v)[:4]}
                              for k, v in prototypes.NEGATIVE.items()],
         "cascade": {
+            "profile": rules.key,
+            "profile_title": rules.title,
             "l2_enabled": embeddings.enabled(),
             "l2_model": get_settings().EMBED_MODEL if embeddings.enabled() else None,
-            "l2_min_margin": cascade.L2_MIN_MARGIN,
+            "l2_min_margin": rules.l2_min_margin,
             "l3_enabled": llm.enabled(),
             "l3_model": get_settings().LLM_MODEL if llm.enabled() else None,
             "l3_prompt_version": llm.PROMPT_VERSION,

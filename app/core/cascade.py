@@ -21,6 +21,18 @@
 смысл, а не подстроку. Обратный порядок (жёсткий L1 перед умным L2) означал бы, что
 L2 разбирает только то, что и так нашли словами, и ничего не добавляет.
 
+**Правила параметризованы профилем** (`CascadeProfile`). Ступени одни и те же, а вот
+что считать мусором — зависит от того, что мы собираемся с сообщением делать. Для
+личных сообщений автопересылка поста канала — шум, для публичного ответа она же
+корень ветки комментариев; без username в ЛС не написать, а ответить в треде можно.
+Развилок ровно столько, и разводить ради них второй каскад значило бы завести второе
+место, где живёт одна и та же логика.
+
+Профиль передаётся явно, но у всех функций есть значение по умолчанию — `DM_V1`,
+профиль личных сообщений. Так вызывающий код, которому профиль безразличен (тесты
+правил, калибровка), остаётся прежним, а код, работающий от конкретного workflow,
+обязан назвать профиль сам: молчаливого «профиля по контексту» не бывает.
+
 Модуль намеренно без БД и без сети: одни и те же функции зовут ингест и тесты, иначе
 правило, живущее только в тестах, в проде не соблюдается. Сетевые вызовы к эмбеддеру
 и LLM живут в `app/services/`, сюда приезжают уже посчитанные числа.
@@ -28,7 +40,10 @@ L2 разбирает только то, что и так нашли слова�
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 
 MIN_TEXT_LENGTH = 15
 
@@ -43,6 +58,11 @@ MIN_TEXT_LENGTH = 15
 #
 # Решение о том, лид это или нет, принимает условие на L1. Скор остаётся оценкой
 # качества и определяет очерёдность в очереди, а не факт попадания в неё.
+
+# Дальше идут словари профиля `dm_v1` — те самые правила, по которым система работает
+# сегодня. Имена оставлены публичными: это данные, и на них смотрят экран профиля и
+# тесты. Но код, который работает от конкретного workflow, обязан брать их из профиля
+# (`profile.pain_anchors`), а не отсюда: у второго профиля они другие.
 
 # Якоря боли под профиль заказчика: хостинг, VPS, VPN, self-hosted инфраструктура.
 # Ключ — короткое имя боли, оно же попадёт в карточку лида.
@@ -92,6 +112,121 @@ DECISION_MAKER_MARKERS = ("у нас в компании", "наша коман�
                           "мой проект", "мои клиенты", "у меня бизнес", "наш сервер",
                           "у нас сервер", "клиенты жалуются")
 
+# Насколько ближайший «положительный» эталон должен опережать ближайший
+# «отрицательный», чтобы решение L2 считалось состоявшимся.
+#
+# Число маленькое не по недосмотру: у bge-m3 сжатая шкала косинусов — два чужих друг
+# другу текста дают около 0.75, и разрывы между классами живут в сотых. Порог на
+# абсолютной близости («похоже сильнее 0.8») здесь бессмыслен, работает только
+# сравнение классов между собой.
+#
+# Значение выбрано по прогону `scripts/calibrate_l2.py` на 12 000 живых сообщений из
+# шести чатов (2026-08-12). До L2 дошло 562 сообщения, из них 299 оказались ближе к
+# боли, 263 — к шуму; медианный отрыв у «боли» 0.033. Порог 0.01 пропускает 249
+# сообщений — это 2 % всего потока, ровно тот масштаб, который выдерживает L3 на
+# домашней карте.
+#
+# Порог намеренно щадящий, потому что **L2 не последняя ступень**. Его работа —
+# сузить поток до величины, которую осилит модель, а не выносить приговор; за
+# приговор отвечает L3, и он видит текст целиком, а не косинус. Ужесточать этот порог
+# имеет смысл только если L3 захлебнётся, и тогда в калибровке видно, чем именно
+# придётся заплатить: на 0.05 остаётся 88 сообщений, но вместе с мусором уходят и
+# живые жалобы вроде «что то сегодня не vless не wg3 не работают».
+L2_MIN_MARGIN = 0.01
+
+
+# ── профиль ───────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ScoreWeights:
+    """Потолки слагаемых оценки — они же веса.
+
+    Слагаемое считается по своей формуле и обрезается потолком, поэтому ноль здесь
+    означает «эта компонента в данном профиле не участвует», а не «формулу надо
+    переписать». Так профиль выключает достижимость в ЛС одним числом, а не веткой
+    в коде подсчёта.
+
+    Сумма потолков `dm_v1` — 87, а не 100. Шкала называется «0-100» с запасом на
+    слагаемые, которых пока нет; выдавать 87 за сотню подгонкой коэффициентов было бы
+    красивее в интерфейсе и лживее по существу.
+    """
+
+    pain: int = 32
+    intent: int = 24
+    lpr: int = 15
+    fresh: int = 10
+    reach: int = 6
+
+
+@dataclass(frozen=True)
+class CascadeProfile:
+    """Набор правил каскада для одного способа работы с сообщением.
+
+    Профиль — это не «настройки», которые крутит оператор, а часть кода: он меняется
+    вместе с правилами и покрывается тестами. В базе у workflow лежит только его ключ
+    (`workflows.cascade_profile`), а сам профиль ищется здесь. Иначе правила отбора
+    редактировались бы в интерфейсе без единого прогона переклассификации.
+    """
+
+    key: str
+    title: str
+
+    # L0. Обе развилки — про то, что считать «репликой человека». Для публичного
+    # ответа граница проходит иначе, чем для личного сообщения.
+    drop_automatic_forward: bool = True
+    require_author: bool = True
+    min_text_length: int = MIN_TEXT_LENGTH
+
+    # L1 и разбор текста.
+    pain_anchors: Mapping[str, tuple[str, ...]] = MappingProxyType(PAIN_ANCHORS)
+    disqualifier_markers: Mapping[str, tuple[str, ...]] = MappingProxyType(DISQUALIFIERS)
+    problem_markers: tuple[str, ...] = PROBLEM_MARKERS
+    intent_markers: tuple[str, ...] = INTENT_MARKERS
+    urgency_markers: tuple[str, ...] = URGENCY_MARKERS
+    decision_maker_markers: tuple[str, ...] = DECISION_MAKER_MARKERS
+
+    # L2.
+    l2_min_margin: float = L2_MIN_MARGIN
+
+    # L3. Здесь только политика: какие наблюдения модели профиль считает основанием
+    # для отказа. Сам вопрос к модели живёт в `services/llm.py` и пока один на всех —
+    # выбор промпта по профилю появится вместе со вторым промптом, а не раньше:
+    # поле, которое ничего не выбирает, хуже его отсутствия.
+    l3_reject_seller: bool = True
+    l3_reject_answering_someone_else: bool = True
+
+    weights: ScoreWeights = ScoreWeights()
+
+
+DM_V1 = CascadeProfile(key="dm_v1", title="Личные сообщения")
+
+PROFILES: Mapping[str, CascadeProfile] = MappingProxyType({DM_V1.key: DM_V1})
+
+DEFAULT_PROFILE = DM_V1.key
+
+
+class UnknownProfileError(ValueError):
+    """В базе стоит ключ профиля, которого в коде нет."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(
+            f"профиль каскада «{key}» не найден; известны: {', '.join(sorted(PROFILES))}")
+        self.key = key
+
+
+def profile(key: str) -> CascadeProfile:
+    """Профиль по ключу из `workflows.cascade_profile`.
+
+    Падаем, а не подставляем `dm_v1` молча: workflow с чужим профилем отбирал бы
+    цели по правилам личных сообщений, и заметили бы это по странным результатам
+    через неделю, а не по ошибке при запуске.
+    """
+    try:
+        return PROFILES[key]
+    except KeyError:
+        raise UnknownProfileError(key) from None
+
+
 # Матчится ссылка целиком, а не только её начало: вырезать один «https://» и мерить
 # остаток бессмысленно — длинный путь URL сам по себе перевалит любой порог.
 _URL = re.compile(r"(?:https?://|t\.me/|www\.)\S*")
@@ -105,24 +240,32 @@ def _norm(text: str | None) -> str:
 # ── L0: структура ─────────────────────────────────────────────────────────────
 
 def level0(*, text: str | None, is_automatic_forward: bool, author_is_bot: bool,
-           author_peer_id: int | None) -> tuple[bool, str]:
-    """Это вообще реплика живого человека? Возвращает (прошло, причина)."""
-    if is_automatic_forward:
+           author_peer_id: int | None,
+           profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
+    """Это вообще реплика живого человека? Возвращает (прошло, причина).
+
+    Две проверки профиль умеет отключать, и обе — не про качество текста, а про то,
+    к кому мы собираемся обращаться. Автопересылка и пост без автора бесполезны, если
+    цель — написать человеку в личку, и совершенно нормальны, если цель — ответить
+    в ветке комментариев под этим самым постом.
+    """
+    if is_automatic_forward and profile.drop_automatic_forward:
         return False, "автопересылка поста канала — это не реплика человека"
     if author_is_bot:
         return False, "автор — бот"
-    if author_peer_id is None:
+    if author_peer_id is None and profile.require_author:
         return False, "у сообщения нет автора (анонимный админ или пост канала)"
 
+    minimum = profile.min_text_length
     body = (text or "").strip()
     if not body:
         return False, "пустой текст (медиа без подписи)"
     if _COMMAND.match(body):
         return False, "команда боту"
-    if len(body) < MIN_TEXT_LENGTH:
-        return False, f"длина {len(body)} < {MIN_TEXT_LENGTH}"
+    if len(body) < minimum:
+        return False, f"длина {len(body)} < {minimum}"
     # Голая ссылка без слов — почти всегда репост или реклама.
-    if _URL.search(body) and len(_URL.sub("", body).strip()) < MIN_TEXT_LENGTH:
+    if _URL.search(body) and len(_URL.sub("", body).strip()) < minimum:
         return False, "только ссылка без текста"
 
     return True, f"не пост канала, длина {len(body)}, автор не бот"
@@ -130,7 +273,8 @@ def level0(*, text: str | None, is_automatic_forward: bool, author_is_bot: bool,
 
 # ── L1: слова ─────────────────────────────────────────────────────────────────
 
-def level1(text: str | None, *, strict: bool = True) -> tuple[bool, str, str | None, list[str]]:
+def level1(text: str | None, *, strict: bool = True,
+           profile: CascadeProfile = DM_V1) -> tuple[bool, str, str | None, list[str]]:
     """Тема, а при `strict` — ещё и признак проблемы.
 
     Возвращает (прошло, причина, имя боли, сработавшие якоря).
@@ -144,13 +288,13 @@ def level1(text: str | None, *, strict: bool = True) -> tuple[bool, str, str | N
     а перенос решения туда, где оно принимается лучше.
     """
     body = _norm(text)
-    for pain, anchors in PAIN_ANCHORS.items():
+    for pain, anchors in profile.pain_anchors.items():
         hits = [a for a in anchors if a in body]
         if not hits:
             continue
 
-        problems = [m for m in PROBLEM_MARKERS if m in body]
-        intents = [m for m in INTENT_MARKERS if m in body]
+        problems = [m for m in profile.problem_markers if m in body]
+        intents = [m for m in profile.intent_markers if m in body]
         if strict and not problems and not intents:
             return (False,
                     f"тема совпала ({', '.join('«' + h + '»' for h in hits[:2])}), "
@@ -174,30 +318,8 @@ def level1(text: str | None, *, strict: bool = True) -> tuple[bool, str, str | N
 
 # ── L2: эмбеддинги ────────────────────────────────────────────────────────────
 
-# Насколько ближайший «положительный» эталон должен опережать ближайший
-# «отрицательный», чтобы решение считалось состоявшимся.
-#
-# Число маленькое не по недосмотру: у bge-m3 сжатая шкала косинусов — два чужих друг
-# другу текста дают около 0.75, и разрывы между классами живут в сотых. Порог на
-# абсолютной близости («похоже сильнее 0.8») здесь бессмыслен, работает только
-# сравнение классов между собой.
-#
-# Значение выбрано по прогону `scripts/calibrate_l2.py` на 12 000 живых сообщений из
-# шести чатов (2026-08-12). До L2 дошло 562 сообщения, из них 299 оказались ближе к
-# боли, 263 — к шуму; медианный отрыв у «боли» 0.033. Порог 0.01 пропускает 249
-# сообщений — это 2 % всего потока, ровно тот масштаб, который выдерживает L3 на
-# домашней карте.
-#
-# Порог намеренно щадящий, потому что **L2 не последняя ступень**. Его работа —
-# сузить поток до величины, которую осилит модель, а не выносить приговор; за
-# приговор отвечает L3, и он видит текст целиком, а не косинус. Ужесточать этот порог
-# имеет смысл только если L3 захлебнётся, и тогда в калибровке видно, чем именно
-# придётся заплатить: на 0.05 остаётся 88 сообщений, но вместе с мусором уходят и
-# живые жалобы вроде «что то сегодня не vless не wg3 не работают».
-L2_MIN_MARGIN = 0.01
-
-
-def level2(ranked: list[tuple[str, str, float]]) -> tuple[bool, str, str | None, float]:
+def level2(ranked: list[tuple[str, str, float]],
+           *, profile: CascadeProfile = DM_V1) -> tuple[bool, str, str | None, float]:
     """Решение по отранжированным эталонам `(kind, label, similarity)`.
 
     Возвращает (прошло, причина, имя боли, отрыв). Ранжирование и косинусы считает
@@ -208,7 +330,7 @@ def level2(ranked: list[tuple[str, str, float]]) -> tuple[bool, str, str | None,
         return False, "нет ни одного эталона для сравнения", None, 0.0
 
     top_kind, top_label, top_sim = ranked[0]
-    other = next(((k, l, s) for k, l, s in ranked if k != top_kind), None)
+    other = next(((k, name, s) for k, name, s in ranked if k != top_kind), None)
     margin = top_sim - other[2] if other else top_sim
 
     if top_kind == "neg":
@@ -217,11 +339,11 @@ def level2(ranked: list[tuple[str, str, float]]) -> tuple[bool, str, str | None,
                 f"а не к какой-либо боли (отрыв {margin:.3f})",
                 None, margin)
 
-    if margin < L2_MIN_MARGIN:
+    if margin < profile.l2_min_margin:
         near = f", почти столько же до «{other[1]}» ({other[2]:.3f})" if other else ""
         return (False,
                 f"похоже на «{top_label}» ({top_sim:.3f}){near} — "
-                f"отрыв {margin:.3f} меньше {L2_MIN_MARGIN}, решение неуверенное",
+                f"отрыв {margin:.3f} меньше {profile.l2_min_margin}, решение неуверенное",
                 None, margin)
 
     return (True,
@@ -230,19 +352,20 @@ def level2(ranked: list[tuple[str, str, float]]) -> tuple[bool, str, str | None,
             top_label, margin)
 
 
-def disqualifiers(text: str | None) -> list[str]:
+def disqualifiers(text: str | None, *, profile: CascadeProfile = DM_V1) -> list[str]:
     """Признаки, из-за которых писать не стоит, даже если боль совпала.
 
     Не отсев, а пометка: решение остаётся за человеком, но он должен увидеть, что
     автор сам продаёт такие же услуги, — писать ему предложение бессмысленно.
     """
     body = _norm(text)
-    return [name for name, words in DISQUALIFIERS.items() if any(w in body for w in words)]
+    return [name for name, words in profile.disqualifier_markers.items()
+            if any(w in body for w in words)]
 
 
 # ── L3: LLM ───────────────────────────────────────────────────────────────────
 
-def level3(llm: dict) -> tuple[bool, str]:
+def level3(llm: dict, *, profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
     """Решение по разобранному ответу модели.
 
     На вход — уже распарсенный JSON от `services/llm.py`. Правило здесь, а не в
@@ -253,6 +376,11 @@ def level3(llm: dict) -> tuple[bool, str]:
     Смысл в том, чтобы отделить наблюдение от политики: «у человека проблема» —
     наблюдение, которое модель делает хорошо; «стоит ли ему писать» — политика,
     которая меняется без переобучения и обязана быть видна в коде.
+
+    Ровно поэтому два из трёх отказов профиль умеет снимать. Наблюдения те же, а
+    политика другая: продавцу бессмысленно писать в личку, но публично поправить его
+    по существу — нормально; «отвечает другому» в ветке комментариев вообще описывает
+    половину полезных реплик.
     """
     if llm.get("error"):
         return False, f"модель не ответила: {llm['error']}"
@@ -265,9 +393,9 @@ def level3(llm: dict) -> tuple[bool, str]:
 
     if not problem:
         return False, f"модель: проблемы нет{tail}"
-    if seller:
+    if seller and profile.l3_reject_seller:
         return False, f"модель: автор сам оказывает такие услуги{tail}"
-    if answering:
+    if answering and profile.l3_reject_answering_someone_else:
         return False, f"модель: автор помогает другому, проблема не его{tail}"
     return True, f"модель: настоящая проблема автора{tail}"
 
@@ -279,7 +407,8 @@ def _hits(body: str, markers: tuple[str, ...]) -> int:
 
 
 def score(*, text: str | None, anchors: list[str], tg_date: datetime,
-          now: datetime, has_username: bool) -> tuple[int, list[dict]]:
+          now: datetime, has_username: bool,
+          profile: CascadeProfile = DM_V1) -> tuple[int, list[dict]]:
     """Оценка 0-100 с разбором по слагаемым.
 
     Слагаемые те же, что нарисованы в интерфейсе, и считаются здесь, а не на клиенте:
@@ -287,28 +416,37 @@ def score(*, text: str | None, anchors: list[str], tg_date: datetime,
 
     Пока это арифметика по словам, без модели. Числа получаются грубые — и это
     честнее, чем выдать эвристику за вывод LLM.
+
+    Формулы общие, разводятся только потолки (`profile.weights`). Свежесть внутри
+    своего потолка распределена долями, а не абсолютными числами: иначе профиль с
+    другим весом свежести пришлось бы описывать четвёркой чисел вместо одного.
     """
     body = _norm(text)
+    weights = profile.weights
 
-    pain = min(32, 12 + 10 * len(anchors))
+    pain = min(weights.pain, 12 + 10 * len(anchors))
     # Прямая просьба о помощи («подскажите») — это и есть главный сигнал, ради
     # которого всё затевалось, поэтому одно такое слово весит заметно.
-    intent = min(24, 8 * _hits(body, INTENT_MARKERS) + 8 * _hits(body, PROBLEM_MARKERS)
-                 + 7 * _hits(body, URGENCY_MARKERS))
-    lpr = min(15, 8 * _hits(body, DECISION_MAKER_MARKERS))
+    intent = min(weights.intent,
+                 8 * _hits(body, profile.intent_markers)
+                 + 8 * _hits(body, profile.problem_markers)
+                 + 7 * _hits(body, profile.urgency_markers))
+    lpr = min(weights.lpr, 8 * _hits(body, profile.decision_maker_markers))
 
     age = now - tg_date
     if age < timedelta(hours=6):
-        fresh = 10
+        share = 1.0
     elif age < timedelta(days=1):
-        fresh = 7
+        share = 0.7
     elif age < timedelta(days=7):
-        fresh = 3
+        share = 0.3
     else:
-        fresh = 0
+        share = 0.0
+    fresh = round(weights.fresh * share)
 
-    # Без username в личку не написать — Engage резолвит пира по нему.
-    reach = 6 if has_username else 0
+    # Без username в личку не написать — Engage резолвит пира по нему. Для ответа
+    # в треде он не нужен, и там эта компонента у профиля весит ноль.
+    reach = weights.reach if has_username else 0
 
     breakdown = [
         {"label": "совпадение с болью", "value": pain},
@@ -327,7 +465,8 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
              tg_date: datetime, now: datetime | None = None,
              l2_enabled: bool = False, l3_enabled: bool = False,
              ranked: list[tuple[str, str, float]] | None = None,
-             llm: dict | None = None) -> dict:
+             llm: dict | None = None,
+             profile: CascadeProfile = DM_V1) -> dict:
     """Прогнать сообщение по каскаду и вернуть всё, что о нём стало известно.
 
     Ответ одной формы независимо от того, на какой ступени сообщение остановилось:
@@ -345,7 +484,8 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         tg_date = tg_date.replace(tzinfo=timezone.utc)
 
     ok0, why0 = level0(text=text, is_automatic_forward=is_automatic_forward,
-                       author_is_bot=author_is_bot, author_peer_id=author_peer_id)
+                       author_is_bot=author_is_bot, author_peer_id=author_peer_id,
+                       profile=profile)
     detail = {"l0": why0, "l1": None, "l2": None, "l3": None}
     if not ok0:
         for stage in ("l1", "l2", "l3"):
@@ -353,7 +493,7 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         return {"level": 0, "passed": False, "detail": detail, "pain": None,
                 "score": 0, "breakdown": [], "disqualifiers": []}
 
-    ok1, why1, pain, anchors = level1(text, strict=not l2_enabled)
+    ok1, why1, pain, anchors = level1(text, strict=not l2_enabled, profile=profile)
     detail["l1"] = why1
     if not ok1:
         detail["l2"] = "не запускался: отсеяно на L1"
@@ -363,10 +503,10 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
 
     def _scored(level: int, passed: bool | None, pain_name: str | None) -> dict:
         total, breakdown = score(text=text, anchors=anchors, tg_date=tg_date, now=now,
-                                 has_username=bool(author_username))
+                                 has_username=bool(author_username), profile=profile)
         return {"level": level, "passed": passed, "detail": detail, "pain": pain_name,
                 "score": total, "breakdown": breakdown,
-                "disqualifiers": disqualifiers(text)}
+                "disqualifiers": disqualifiers(text, profile=profile)}
 
     if not l2_enabled:
         detail["l2"] = "не запускался: эмбеддинги выключены"
@@ -378,7 +518,7 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         detail["l3"] = "ожидает: не дошло до L3"
         return _scored(1, None, pain)
 
-    ok2, why2, pain2, _margin = level2(ranked)
+    ok2, why2, pain2, _margin = level2(ranked, profile=profile)
     detail["l2"] = why2
     if not ok2:
         detail["l3"] = "не запускался: отсеяно на L2"
@@ -393,6 +533,6 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         detail["l3"] = "ожидает: модель ещё не отвечала"
         return _scored(2, None, pain)
 
-    ok3, why3 = level3(llm)
+    ok3, why3 = level3(llm, profile=profile)
     detail["l3"] = why3
     return _scored(3, ok3, pain)
