@@ -29,7 +29,7 @@ from app.db.session import get_engine, get_session_maker  # noqa: E402
 
 # Совпадает с USERS в оболочке GUI (contract/Atomic-Radar.md).
 SEED_USERS = [
-    {"email": "ivan@atomic-automation.net", "name": "Иван", "initials": "ИВ", "role": "owner"},
+    {"email": "volk6932v2@gmail.com", "name": "Иван", "initials": "ИВ", "role": "owner"},
     {"email": "andrey@vertsanov.ru", "name": "Андрей", "initials": "АВ", "role": "customer"},
 ]
 

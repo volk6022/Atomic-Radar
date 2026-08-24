@@ -1,4 +1,4 @@
-"""Каскад L0→L1: дешёвый отсев до того, как за сообщение возьмётся модель.
+"""Каскад L0→L3: дешёвый отсев до того, как за сообщение возьмётся модель.
 
 Порядок ступеней — не украшение, а способ уложиться в железо. Одна активная группа
 даёт около 9000 сообщений в сутки; прогонять их все через LLM невозможно ни по
@@ -7,13 +7,23 @@
 * **L0 — структура.** Автопересылка поста канала, бот, пустой или слишком короткий
   текст. Здесь нет ни одного слова про предметную область: это отсев того, что вообще
   не является репликой человека.
-* **L1 — слова.** Совпадение с якорями боли. Грубо, но именно этот шаг убирает 95 %
-  остатка и стоит микросекунды.
-* **L2 (эмбеддинги) и L3 (LLM)** появятся отдельно. Пока их нет, `cascade_level`
-  честно останавливается на 1, а не притворяется, что сообщение прошло всю цепочку.
+* **L1 — слова.** Совпадение с якорями боли. Грубо, но именно этот шаг убирает
+  основную массу остатка и стоит микросекунды.
+* **L2 — эмбеддинги.** Ближайший эталон среди «болей» и «шума» (bge-m3). Ловит то,
+  что сказано другими словами, и режет болтовню по теме.
+* **L3 — LLM.** Разбор конкретного сообщения с веткой обсуждения: настоящая ли это
+  проблема, того ли человека, стоит ли писать.
 
-Модуль намеренно без БД и без FastAPI: одни и те же функции зовут ингест и тесты,
-иначе правило, живущее только в тестах, в проде не соблюдается.
+**Строгость L1 зависит от того, есть ли что дальше.** Когда L2/L3 выключены, L1 —
+последний рубеж, и он требует И тему, И признак проблемы: иначе в лиды попадает
+половина болтовни (проверено на первом живом прогоне). Когда L2 включён, L1 работает
+на полноту: достаточно темы, а отсеивать болтовню — работа ступени, которая понимает
+смысл, а не подстроку. Обратный порядок (жёсткий L1 перед умным L2) означал бы, что
+L2 разбирает только то, что и так нашли словами, и ничего не добавляет.
+
+Модуль намеренно без БД и без сети: одни и те же функции зовут ингест и тесты, иначе
+правило, живущее только в тестах, в проде не соблюдается. Сетевые вызовы к эмбеддеру
+и LLM живут в `app/services/`, сюда приезжают уже посчитанные числа.
 """
 from __future__ import annotations
 
@@ -120,12 +130,18 @@ def level0(*, text: str | None, is_automatic_forward: bool, author_is_bot: bool,
 
 # ── L1: слова ─────────────────────────────────────────────────────────────────
 
-def level1(text: str | None) -> tuple[bool, str, str | None, list[str]]:
-    """Тема плюс признак проблемы.
+def level1(text: str | None, *, strict: bool = True) -> tuple[bool, str, str | None, list[str]]:
+    """Тема, а при `strict` — ещё и признак проблемы.
 
-    Возвращает (прошло, причина, имя боли, сработавшие якоря). Одного попадания в тему
-    мало: нужен ещё либо признак поломки, либо явная просьба о помощи. Проверено на
-    живых чатах — без этого условия в лиды попадала половина обычной болтовни.
+    Возвращает (прошло, причина, имя боли, сработавшие якоря).
+
+    `strict=True` — режим «L1 последний»: одного попадания в тему мало, нужен либо
+    признак поломки, либо явная просьба о помощи. Проверено на живых чатах: без этого
+    условия в лиды попадала половина обычной болтовни («Его через впн использовать ??»).
+
+    `strict=False` — режим «дальше есть L2»: пропускаем всё, что вообще про нашу тему,
+    и отдаём отсев смысла следующей ступени. Отказ от строгости здесь не послабление,
+    а перенос решения туда, где оно принимается лучше.
     """
     body = _norm(text)
     for pain, anchors in PAIN_ANCHORS.items():
@@ -135,7 +151,7 @@ def level1(text: str | None) -> tuple[bool, str, str | None, list[str]]:
 
         problems = [m for m in PROBLEM_MARKERS if m in body]
         intents = [m for m in INTENT_MARKERS if m in body]
-        if not problems and not intents:
+        if strict and not problems and not intents:
             return (False,
                     f"тема совпала ({', '.join('«' + h + '»' for h in hits[:2])}), "
                     f"но нет ни признака проблемы, ни просьбы о помощи",
@@ -146,12 +162,72 @@ def level1(text: str | None) -> tuple[bool, str, str | None, list[str]]:
             why += " + проблема «" + problems[0] + "»"
         elif intents:
             why += " + просьба «" + intents[0] + "»"
+        elif not strict:
+            why += " (без признака проблемы — решает L2)"
         # Наружу отдаём только тематические попадания: слагаемые «интент» и
         # «срочность» считаются отдельно, и складывать их в один список значило бы
         # засчитать одно и то же дважды.
         return True, why, pain, hits
 
     return False, "ни одного якоря боли", None, []
+
+
+# ── L2: эмбеддинги ────────────────────────────────────────────────────────────
+
+# Насколько ближайший «положительный» эталон должен опережать ближайший
+# «отрицательный», чтобы решение считалось состоявшимся.
+#
+# Число маленькое не по недосмотру: у bge-m3 сжатая шкала косинусов — два чужих друг
+# другу текста дают около 0.75, и разрывы между классами живут в сотых. Порог на
+# абсолютной близости («похоже сильнее 0.8») здесь бессмыслен, работает только
+# сравнение классов между собой.
+#
+# Значение выбрано по прогону `scripts/calibrate_l2.py` на 12 000 живых сообщений из
+# шести чатов (2026-08-12). До L2 дошло 562 сообщения, из них 299 оказались ближе к
+# боли, 263 — к шуму; медианный отрыв у «боли» 0.033. Порог 0.01 пропускает 249
+# сообщений — это 2 % всего потока, ровно тот масштаб, который выдерживает L3 на
+# домашней карте.
+#
+# Порог намеренно щадящий, потому что **L2 не последняя ступень**. Его работа —
+# сузить поток до величины, которую осилит модель, а не выносить приговор; за
+# приговор отвечает L3, и он видит текст целиком, а не косинус. Ужесточать этот порог
+# имеет смысл только если L3 захлебнётся, и тогда в калибровке видно, чем именно
+# придётся заплатить: на 0.05 остаётся 88 сообщений, но вместе с мусором уходят и
+# живые жалобы вроде «что то сегодня не vless не wg3 не работают».
+L2_MIN_MARGIN = 0.01
+
+
+def level2(ranked: list[tuple[str, str, float]]) -> tuple[bool, str, str | None, float]:
+    """Решение по отранжированным эталонам `(kind, label, similarity)`.
+
+    Возвращает (прошло, причина, имя боли, отрыв). Ранжирование и косинусы считает
+    `services/embeddings.py` — сюда приезжают готовые числа, чтобы правило можно было
+    проверить тестом без сети и без модели.
+    """
+    if not ranked:
+        return False, "нет ни одного эталона для сравнения", None, 0.0
+
+    top_kind, top_label, top_sim = ranked[0]
+    other = next(((k, l, s) for k, l, s in ranked if k != top_kind), None)
+    margin = top_sim - other[2] if other else top_sim
+
+    if top_kind == "neg":
+        return (False,
+                f"ближе всего к «{top_label}» ({top_sim:.3f}), "
+                f"а не к какой-либо боли (отрыв {margin:.3f})",
+                None, margin)
+
+    if margin < L2_MIN_MARGIN:
+        near = f", почти столько же до «{other[1]}» ({other[2]:.3f})" if other else ""
+        return (False,
+                f"похоже на «{top_label}» ({top_sim:.3f}){near} — "
+                f"отрыв {margin:.3f} меньше {L2_MIN_MARGIN}, решение неуверенное",
+                None, margin)
+
+    return (True,
+            f"ближе всего к боли «{top_label}» ({top_sim:.3f}), "
+            f"отрыв от шума {margin:.3f}",
+            top_label, margin)
 
 
 def disqualifiers(text: str | None) -> list[str]:
@@ -162,6 +238,38 @@ def disqualifiers(text: str | None) -> list[str]:
     """
     body = _norm(text)
     return [name for name, words in DISQUALIFIERS.items() if any(w in body for w in words)]
+
+
+# ── L3: LLM ───────────────────────────────────────────────────────────────────
+
+def level3(llm: dict) -> tuple[bool, str]:
+    """Решение по разобранному ответу модели.
+
+    На вход — уже распарсенный JSON от `services/llm.py`. Правило здесь, а не в
+    промпте, по той же причине, что и везде в этом модуле: словами в промпте нельзя
+    покрыть тестом, а условием на словаре — можно.
+
+    Модель отвечает на три вопроса и **не решает сама**, писать человеку или нет.
+    Смысл в том, чтобы отделить наблюдение от политики: «у человека проблема» —
+    наблюдение, которое модель делает хорошо; «стоит ли ему писать» — политика,
+    которая меняется без переобучения и обязана быть видна в коде.
+    """
+    if llm.get("error"):
+        return False, f"модель не ответила: {llm['error']}"
+
+    problem = bool(llm.get("real_problem"))
+    seller = bool(llm.get("is_seller"))
+    answering = bool(llm.get("answering_someone_else"))
+    why = (llm.get("why") or "").strip()
+    tail = f" — «{why}»" if why else ""
+
+    if not problem:
+        return False, f"модель: проблемы нет{tail}"
+    if seller:
+        return False, f"модель: автор сам оказывает такие услуги{tail}"
+    if answering:
+        return False, f"модель: автор помогает другому, проблема не его{tail}"
+    return True, f"модель: настоящая проблема автора{tail}"
 
 
 # ── скоринг ───────────────────────────────────────────────────────────────────
@@ -216,12 +324,21 @@ def score(*, text: str | None, anchors: list[str], tg_date: datetime,
 
 def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: bool,
              author_peer_id: int | None, author_username: str | None,
-             tg_date: datetime, now: datetime | None = None) -> dict:
+             tg_date: datetime, now: datetime | None = None,
+             l2_enabled: bool = False, l3_enabled: bool = False,
+             ranked: list[tuple[str, str, float]] | None = None,
+             llm: dict | None = None) -> dict:
     """Прогнать сообщение по каскаду и вернуть всё, что о нём стало известно.
 
     Ответ одной формы независимо от того, на какой ступени сообщение остановилось:
     экран потока показывает по каждой ступени либо вердикт, либо «не запускалась», и
     разница между «не прошло» и «не дошло» должна быть видна в данных, а не додумываться.
+
+    `passed` имеет три состояния, и третье здесь принципиально. `True` — дошло до
+    конца включённых ступеней, `False` — отсеяно, **`None` — ещё в пути**: ступень
+    включена, но её вход (вектор, ответ модели) пока не посчитан. Ингест пишет такие
+    сообщения с `NULL`, фоновый проход их дозабирает. Записать «не прошло» вместо
+    «не досчитали» значило бы навсегда потерять лид на ровном месте.
     """
     now = now or datetime.now(timezone.utc)
     if tg_date.tzinfo is None:
@@ -231,13 +348,12 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
                        author_is_bot=author_is_bot, author_peer_id=author_peer_id)
     detail = {"l0": why0, "l1": None, "l2": None, "l3": None}
     if not ok0:
-        detail["l1"] = "не запускался: отсеяно на L0"
-        detail["l2"] = "не запускался: отсеяно на L0"
-        detail["l3"] = "не запускался: отсеяно на L0"
+        for stage in ("l1", "l2", "l3"):
+            detail[stage] = "не запускался: отсеяно на L0"
         return {"level": 0, "passed": False, "detail": detail, "pain": None,
                 "score": 0, "breakdown": [], "disqualifiers": []}
 
-    ok1, why1, pain, anchors = level1(text)
+    ok1, why1, pain, anchors = level1(text, strict=not l2_enabled)
     detail["l1"] = why1
     if not ok1:
         detail["l2"] = "не запускался: отсеяно на L1"
@@ -245,14 +361,38 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         return {"level": 1, "passed": False, "detail": detail, "pain": None,
                 "score": 0, "breakdown": [], "disqualifiers": []}
 
-    total, breakdown = score(text=text, anchors=anchors, tg_date=tg_date, now=now,
-                             has_username=bool(author_username))
+    def _scored(level: int, passed: bool | None, pain_name: str | None) -> dict:
+        total, breakdown = score(text=text, anchors=anchors, tg_date=tg_date, now=now,
+                                 has_username=bool(author_username))
+        return {"level": level, "passed": passed, "detail": detail, "pain": pain_name,
+                "score": total, "breakdown": breakdown,
+                "disqualifiers": disqualifiers(text)}
 
-    # L2/L3 ещё не построены. Пишем это прямым текстом: пустая строка на экране
-    # читалась бы как «ступень пройдена».
-    detail["l2"] = "не запускался: эмбеддинги ещё не подключены"
-    detail["l3"] = "не запускался: LLM ещё не подключена"
+    if not l2_enabled:
+        detail["l2"] = "не запускался: эмбеддинги выключены"
+        detail["l3"] = "не запускался: выключен вместе с L2"
+        return _scored(1, True, pain)
 
-    return {"level": 1, "passed": True, "detail": detail, "pain": pain,
-            "score": total, "breakdown": breakdown,
-            "disqualifiers": disqualifiers(text)}
+    if ranked is None:
+        detail["l2"] = "ожидает: вектор ещё не посчитан"
+        detail["l3"] = "ожидает: не дошло до L3"
+        return _scored(1, None, pain)
+
+    ok2, why2, pain2, _margin = level2(ranked)
+    detail["l2"] = why2
+    if not ok2:
+        detail["l3"] = "не запускался: отсеяно на L2"
+        return _scored(2, False, None)
+    pain = pain2 or pain
+
+    if not l3_enabled:
+        detail["l3"] = "не запускался: LLM выключена"
+        return _scored(2, True, pain)
+
+    if llm is None:
+        detail["l3"] = "ожидает: модель ещё не отвечала"
+        return _scored(2, None, pain)
+
+    ok3, why3 = level3(llm)
+    detail["l3"] = why3
+    return _scored(3, ok3, pain)

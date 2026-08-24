@@ -12,7 +12,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.access import Section, can
+from app.core.access import Capability, Section, allows, can
 from app.core.config import get_settings
 from app.core.security import SessionSigner
 from app.db.models import User
@@ -64,6 +64,34 @@ def requires(section: Section | str) -> Callable:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 f"role '{user.role}' has no access to '{Section(section).value}'",
+            )
+        return user
+
+    return Depends(_guard)
+
+
+def permits(section: Section | str, capability: Capability | str) -> Callable:
+    """Ограничить ручку разделом И действием.
+
+    Две проверки, а не одна, потому что «видит» и «может» — разные вопросы.
+    Заказчик открывает Safety, чтобы убедиться, что система в сухом прогоне, но
+    включать LIVE ему нельзя; разборщик открывает Runs, чтобы понять, почему
+    замерла очередь, но запускать переклассификацию — не его дело.
+
+    Раздел проверяется первым: 403 «нет доступа к разделу» точнее, чем «нет права
+    на действие» там, куда человек вообще не должен был попасть.
+    """
+    async def _guard(user: CurrentUser) -> User:
+        if not can(user.role, section):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"role '{user.role}' has no access to '{Section(section).value}'",
+            )
+        if not allows(user.role, capability):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"role '{user.role}' is not allowed to "
+                f"'{Capability(capability).value}'",
             )
         return user
 

@@ -7,11 +7,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import auth, drafts, ingest, screens, system
+from app.api.v1 import (alerts, auth, drafts, ingest, leads, runs, screens,
+                        system)
 from app.core.config import get_settings
+from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
 from app.db.session import get_engine
-from app.services import engage
+from app.services import engage, jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -27,7 +29,16 @@ async def lifespan(app: FastAPI):
     try:
         async with get_engine().begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Колонки, появившиеся после первой накатки: create_all их не добавит.
+            await apply_migrations(conn)
         app.state.db_ready = True
+
+        # Задачи, пережившие смерть процесса, честно помечаем прерванными: иначе
+        # строка навсегда останется в «выполняется» с прогрессом, который уже
+        # никогда не сдвинется.
+        stale = await jobs.mark_interrupted()
+        if stale:
+            logger.warning("jobs_interrupted_on_start count=%s", stale)
     except Exception as e:  # noqa: BLE001 — без БД отдаём 503, но поднимаемся
         app.state.db_ready = False
         logger.warning("db_not_ready: %s", e)
@@ -58,6 +69,9 @@ def create_app() -> FastAPI:
     app.include_router(drafts.router)
     app.include_router(ingest.router)
     app.include_router(ingest.operator_router)
+    app.include_router(alerts.router)
+    app.include_router(leads.router)
+    app.include_router(runs.router)
     app.include_router(screens.router)
 
     @app.get("/api/v1/health")

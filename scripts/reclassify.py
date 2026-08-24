@@ -1,90 +1,54 @@
-"""Прогнать сохранённые сообщения по каскаду заново.
+"""Переклассификация из консоли.
 
-Нужен каждый раз, когда меняются правила L0/L1: сообщения уже лежат в базе с прежним
-вердиктом, и без переклассификации экран потока продолжит объяснять решения, которых
-код больше не принимает.
+Ядро переехало в `app/services/reclassify.py`: тем же кодом пользуется задача,
+запускаемая из интерфейса. Здесь остался разбор аргументов и вывод в лог — держать
+две реализации одного прогона значило бы однажды получить разные результаты в
+зависимости от того, откуда его запустили.
 
-Лиды, по которым человек уже принял решение, не трогаются — переписывать чужое
-решение задним числом нельзя. Лиды в статусе `new`, переставшие проходить каскад,
-удаляются: держать в очереди то, что система больше не считает лидом, значит тратить
-время оператора на заведомый мусор.
-
-    docker exec api-radar python -m scripts.reclassify
+    docker exec api-radar python -m scripts.reclassify                 # всё, все ступени
+    docker exec api-radar python -m scripts.reclassify --scope pending # только недосчитанное
+    docker exec api-radar python -m scripts.reclassify --no-l3
+    docker exec api-radar python -m scripts.reclassify --l3-limit 100
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 
-from sqlalchemy import select
-
-from app.core import cascade
-from app.db.models import Channel, Lead, Message
 from app.db.session import get_session_maker
+from app.services import embeddings, llm, reclassify
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("reclassify")
 
 
 async def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-l2", action="store_true", help="не трогать эмбеддинги")
+    ap.add_argument("--no-l3", action="store_true", help="не ходить в модель")
+    ap.add_argument("--l3-limit", type=int, default=None,
+                    help="разобрать моделью не больше N сообщений за прогон")
+    ap.add_argument("--scope", choices=reclassify.SCOPES, default="all",
+                    help="all — все сообщения, pending — только недосчитанные")
+    args = ap.parse_args()
+
+    l2_enabled = embeddings.enabled() and not args.no_l2
+    l3_enabled = llm.enabled() and not args.no_l3
+    log.info("охват: %s; ступени: L0/L1 всегда, L2 %s, L3 %s", args.scope,
+             "вкл" if l2_enabled else "выкл", "вкл" if l3_enabled else "выкл")
+
+    async def report(pct, note):
+        log.info("%s%s", f"[{pct:.0f}%] " if pct is not None else "", note)
+
     async with get_session_maker()() as db:
-        messages = (await db.execute(select(Message))).scalars().all()
-        titles = {c.id: c.title for c in
-                  (await db.execute(select(Channel))).scalars().all()}
-        leads = {l.message_id: l for l in
-                 (await db.execute(select(Lead))).scalars().all()}
+        summary = await reclassify.run(
+            db, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
+            l3_limit=args.l3_limit, scope=args.scope, report=report)
 
-        changed = created = removed = kept = 0
-
-        for m in messages:
-            v = cascade.classify(
-                text=m.text, is_automatic_forward=m.is_automatic_forward,
-                author_is_bot=m.author_is_bot, author_peer_id=m.author_peer_id,
-                author_username=m.author_username, tg_date=m.tg_date)
-
-            was = m.cascade_passed
-            m.cascade_level, m.cascade_passed = v["level"], v["passed"]
-            m.cascade_detail = v["detail"]
-            if was != v["passed"]:
-                changed += 1
-
-            lead = leads.get(m.id)
-
-            if v["passed"] and lead is None:
-                db.add(Lead(
-                    message_id=m.id, channel_id=m.channel_id,
-                    author_peer_id=m.author_peer_id, author_username=m.author_username,
-                    author_name=m.author_name, pain=v["pain"],
-                    quote=(m.text or "")[:500], score=v["score"],
-                    score_breakdown=v["breakdown"], disqualifiers=v["disqualifiers"],
-                    status="new"))
-                created += 1
-            elif v["passed"] and lead is not None:
-                lead.score, lead.score_breakdown = v["score"], v["breakdown"]
-                lead.pain, lead.disqualifiers = v["pain"], v["disqualifiers"]
-                kept += 1
-            elif not v["passed"] and lead is not None:
-                if lead.status == "new":
-                    await db.delete(lead)
-                    removed += 1
-                else:
-                    # По лиду уже работали. Оставляем как есть и говорим об этом вслух.
-                    log.warning("лид %s больше не проходит каскад, но статус «%s» — "
-                                "оставлен как есть", lead.id, lead.status)
-                    kept += 1
-
-        # Счётчик лидов в канале — производная величина, пересчитываем целиком.
-        for channel_id, title in titles.items():
-            total = len([m for m in messages
-                         if m.channel_id == channel_id and m.cascade_passed])
-            channel = (await db.execute(
-                select(Channel).where(Channel.id == channel_id))).scalar_one()
-            channel.leads_total = total
-
-        await db.commit()
-
-    log.info("сообщений %s · вердикт изменился у %s · лидов создано %s, удалено %s, "
-             "обновлено %s", len(messages), changed, created, removed, kept)
+    await embeddings.close()
+    await llm.close()
+    log.info("итог: %s", summary)
 
 
 if __name__ == "__main__":

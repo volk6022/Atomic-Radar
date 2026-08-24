@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import CurrentUser, GetDB
-from app.core.access import sections_for
+from app.core.access import capabilities_for, sections_for
 from app.core.clock import utcnow
 from app.core.config import get_settings
 from app.core.security import SessionSigner, verify_password, verify_totp
@@ -122,4 +122,8 @@ def _me(user: User) -> dict:
         "email": user.email,
         "role": user.role,
         "sections": sections_for(user.role),
+        # Рядом с разделами — список разрешённых действий: по нему оболочка прячет
+        # кнопки, которые роль всё равно не сможет нажать. Держать эту таблицу
+        # второй копией во фронтенде значит однажды показать кнопку, отдающую 403.
+        "capabilities": capabilities_for(user.role),
     }

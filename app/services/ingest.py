@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core import cascade
 from app.db.models import Channel, Lead, Message
+from app.services import embeddings, llm
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,21 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
                          author_name: str | None, author_is_bot: bool,
                          is_automatic_forward: bool, reply_to_message_id: int | None,
                          thread_id: int | None, now: datetime | None = None) -> tuple[Message, bool]:
-    """Записать сообщение и прогнать его по каскаду. Возвращает (сообщение, новое ли)."""
+    """Записать сообщение и прогнать его по дешёвым ступеням каскада.
+
+    На приёме считаются только L0 и L1: они стоят микросекунды. L2 требует похода к
+    эмбеддеру, L3 — к модели, и делать это по одному сообщению внутри вебхука значит
+    держать Engage в ожидании ради работы, которая пачками идёт в разы быстрее.
+    Поэтому сообщение ложится со статусом «ещё в пути» (`cascade_passed = NULL`), а
+    `scripts/reclassify.py` дозабирает такие пачкой.
+
+    Возвращает (сообщение, новое ли).
+    """
     verdict = cascade.classify(
         text=text, is_automatic_forward=is_automatic_forward, author_is_bot=author_is_bot,
         author_peer_id=author_peer_id, author_username=author_username,
         tg_date=tg_date, now=now,
+        l2_enabled=embeddings.enabled(), l3_enabled=llm.enabled(),
     )
 
     values = {

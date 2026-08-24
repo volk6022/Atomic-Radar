@@ -51,7 +51,9 @@ ACCESS: dict[Section, frozenset[Role]] = {
     Section.DRAFTS: _STAFF,
     Section.CONVERSATIONS: _STAFF,
     Section.PROFILE: _STAFF,
-    Section.RUNS: _OWNER,
+    # Разборщик должен видеть, что идёт пересчёт: иначе замершая очередь выглядит
+    # поломкой. Запускать задачи он при этом не может — см. CAPABILITIES.
+    Section.RUNS: _STAFF,
     Section.EVALS: _STAFF,
     # Заказчик видит свою экономику, гость — только её (это витрина для инвестора).
     Section.ATTRIBUTION: frozenset({Role.OWNER, Role.CUSTOMER, Role.VIEWER}),
@@ -61,6 +63,129 @@ ACCESS: dict[Section, frozenset[Role]] = {
     Section.SAFETY: frozenset({Role.OWNER, Role.CUSTOMER}),
     Section.ADMIN: _OWNER,
 }
+
+
+class Capability(StrEnum):
+    """Что можно сделать, в отличие от `Section` — что можно увидеть.
+
+    Раздела на это не хватает. Заказчик обязан видеть Safety: там переключатель
+    сухого прогона, и по договорённости без его ведома наружу ничего не уходит.
+    Включать LIVE он при этом не должен. Одна таблица «раздел → роли» такого
+    различия не выражает, поэтому их две.
+
+    Правило, по которому расставлены роли: **ужесточение доступно шире, чем
+    ослабление**. Остановить, отклонить, выключить может любой из штата; запустить,
+    одобрить, включить LIVE — только владелец. Цена ошибочной остановки — потерянный
+    час, цена ошибочного запуска — сообщения живым людям от имени заказчика.
+    """
+    # конвейер лидов
+    DRAFT_DECIDE = "draft.decide"
+    DRAFT_REOPEN = "draft.reopen"
+    LEAD_STATUS = "lead.status"
+    BULK_DECIDE = "bulk.decide"
+    # конфигурация классификации
+    CONFIG_EDIT = "config.edit"
+    CONFIG_PROPOSE = "config.propose"
+    CONFIG_PREVIEW = "config.preview"
+    CONFIG_ACTIVATE = "config.activate"
+    # тексты ответов — отдельная сущность с другими правами
+    TEMPLATES_EDIT = "templates.edit"
+    TEMPLATES_ACTIVATE = "templates.activate"
+    # источники
+    CHANNEL_ADD = "channel.add"
+    CHANNEL_EDIT = "channel.edit"
+    CHANNEL_ASSIGN = "channel.assign"
+    CHANNEL_JOIN = "channel.join"
+    CHANNEL_ARCHIVE = "channel.archive"
+    ACCOUNT_MANAGE = "account.manage"
+    # задачи
+    RUN_BACKFILL = "run.backfill"
+    RUN_HEAVY = "run.heavy"
+    RUN_EVAL = "run.eval"
+    RUN_EXPORT = "run.export"
+    RUN_CANCEL = "run.cancel"
+    # режим и безопасность
+    MODE_LIVE = "mode.live"
+    MODE_DRY_RUN = "mode.dry_run"
+    SYSTEM_KILL = "system.kill"
+    SYSTEM_RESUME = "system.resume"
+    LIMITS_TIGHTEN = "limits.tighten"
+    LIMITS_LOOSEN = "limits.loosen"
+    BLOCKLIST_EDIT = "blocklist.edit"
+    # администрирование
+    USER_MANAGE = "user.manage"
+    ALERT_ACK = "alert.ack"
+    ALERT_RULES = "alert.rules"
+
+
+_OWNER_CUSTOMER = frozenset({Role.OWNER, Role.CUSTOMER})
+
+CAPABILITIES: dict[Capability, frozenset[Role]] = {
+    Capability.DRAFT_DECIDE: _STAFF,
+    Capability.DRAFT_REOPEN: _STAFF,
+    Capability.LEAD_STATUS: _STAFF,
+    # Наёмный разборщик решает по одному. Одна ошибка в фильтре — и триста лидов
+    # отклонены одним нажатием; владельцу такой инструмент нужен, ему — нет.
+    # Ограничение по количеству строк проверяется в ручке (см. BULK_LIMIT_REVIEWER).
+    Capability.BULK_DECIDE: _STAFF,
+
+    Capability.CONFIG_EDIT: _OWNER,
+    # Заказчик может предложить правку болей: черновик создаётся, но не включается.
+    Capability.CONFIG_PROPOSE: _OWNER_CUSTOMER,
+    Capability.CONFIG_PREVIEW: _OWNER,
+    Capability.CONFIG_ACTIVATE: _OWNER,
+
+    # Тексты правят трое — они уходят от имени заказчика, и ему виднее, как звучит.
+    # Пускает в работу владелец: путь «написал → сразу в проде» тут неуместен.
+    Capability.TEMPLATES_EDIT: _STAFF,
+    Capability.TEMPLATES_ACTIVATE: _OWNER,
+
+    Capability.CHANNEL_ADD: _OWNER_CUSTOMER,
+    Capability.CHANNEL_EDIT: _OWNER_CUSTOMER,
+    # Распоряжение флотом — только владелец: там номера, прокси и лимиты.
+    Capability.CHANNEL_ASSIGN: _OWNER,
+    Capability.CHANNEL_JOIN: _OWNER,
+    Capability.CHANNEL_ARCHIVE: _OWNER,
+    Capability.ACCOUNT_MANAGE: _OWNER,
+
+    # Дочитать историю дорого по лимитам чтения, но не опасно.
+    Capability.RUN_BACKFILL: _OWNER_CUSTOMER,
+    # Переклассификация и примерка — рычаги качества, они за владельцем.
+    Capability.RUN_HEAVY: _OWNER,
+    Capability.RUN_EVAL: _OWNER_CUSTOMER,
+    Capability.RUN_EXPORT: _STAFF,
+    Capability.RUN_CANCEL: _OWNER_CUSTOMER,
+
+    Capability.MODE_LIVE: _OWNER,
+    Capability.MODE_DRY_RUN: _OWNER_CUSTOMER,
+    Capability.SYSTEM_KILL: _OWNER_CUSTOMER,
+    Capability.SYSTEM_RESUME: _OWNER,
+    Capability.LIMITS_TIGHTEN: _OWNER_CUSTOMER,
+    Capability.LIMITS_LOOSEN: _OWNER,
+    Capability.BLOCKLIST_EDIT: _OWNER_CUSTOMER,
+
+    Capability.USER_MANAGE: _OWNER,
+    Capability.ALERT_ACK: _STAFF,
+    Capability.ALERT_RULES: _OWNER,
+}
+
+# Сколько строк разборщик может решить одним действием.
+BULK_LIMIT_REVIEWER = 25
+
+
+def allows(role: Role | str, capability: Capability | str) -> bool:
+    """Разрешено ли действие этой роли. Неизвестная роль или действие → нет."""
+    try:
+        return Role(role) in CAPABILITIES[Capability(capability)]
+    except (ValueError, KeyError):
+        return False
+
+
+def capabilities_for(role: Role | str) -> list[str]:
+    """Действия, доступные роли. Оболочка получает список вместе с разделами и
+    прячет по нему кнопки — ровно с той же оговоркой, что и про меню: это
+    удобство, а решение принимается на сервере."""
+    return [c.value for c in Capability if allows(role, c)]
 
 
 def can(role: Role | str, section: Section | str) -> bool:

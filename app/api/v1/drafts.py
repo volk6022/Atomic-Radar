@@ -25,12 +25,13 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 
-from app.api.deps import GetDB, requires
+from app.api.deps import GetDB, permits, requires
 from app.api.v1.system import current_mode
 from app.core import clock
-from app.core.access import Section
+from app.core.access import Capability, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import AuditLog, Channel, Draft, Lead, Message
+from app.db.models import (AuditLog, Channel, Draft, Lead, Message,
+                           OutboundAttempt)
 from app.services import drafting
 
 logger = logging.getLogger(__name__)
@@ -248,15 +249,39 @@ class RejectRequest(BaseModel):
     reason_n: int = Field(ge=1, le=9)
 
 
+async def _sent_attempt(db, draft_id: int) -> OutboundAttempt | None:
+    """Была ли по черновику фактическая доставка.
+
+    `allowed` значит «гейт пропустил», а не «Telegram принял», поэтому смотрим на
+    `delivered_message_id`: только он означает, что сообщение увидел живой человек.
+    """
+    return (await db.execute(
+        select(OutboundAttempt)
+        .where(OutboundAttempt.draft_id == draft_id,
+               OutboundAttempt.delivered_message_id.isnot(None))
+        .limit(1))).scalar_one_or_none()
+
+
 async def _draft_for_decision(db, draft_id: int) -> Draft:
+    """Черновик, по которому ещё можно принять или изменить решение.
+
+    Раньше здесь стояла проверка `state != "pending"`, и решение оказывалось
+    необратимым в момент нажатия кнопки. Это неверно: пока система в сухом прогоне
+    (а она в нём с самого начала), одобрение — всего лишь запись в базе, и человек,
+    ошибившийся в очереди из сотни черновиков, не должен идти за этим в psql.
+
+    Настоящая точка невозврата одна — отправленное сообщение. Её и проверяем.
+    """
     draft = (await db.execute(
         select(Draft).where(Draft.id == draft_id))).scalar_one_or_none()
     if draft is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"черновик {draft_id} не найден")
-    if draft.state != "pending":
+    sent = await _sent_attempt(db, draft_id)
+    if sent is not None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"по черновику {draft_id} уже принято решение «{draft.state}»")
+            f"по черновику {draft_id} сообщение уже отправлено "
+            f"({sent.created_at:%d.%m.%Y %H:%M}) — решение изменить нельзя")
     return draft
 
 
@@ -282,9 +307,47 @@ async def _evaluate(db, draft: Draft, lead: Lead, text: str) -> dict:
     return {"allowed": verdict.allowed, "reasons": verdict.reasons}
 
 
+@router.post("/{draft_id}/reopen")
+async def reopen(draft_id: int, request: Request, db: GetDB,
+                 user=permits(Section.DRAFTS, Capability.DRAFT_REOPEN)):
+    """Вернуть разобранный черновик в очередь.
+
+    Отдельно от смены решения: «передумал, посмотрю ещё раз» и «решил иначе» — разные
+    действия, и второе не должно быть единственным способом выполнить первое.
+
+    Лид возвращается в `in_review`, а не в `new`: черновик по нему уже существует,
+    и «новый» означало бы, что до лида ещё не доходили руки.
+    """
+    draft = await _draft_for_decision(db, draft_id)
+    if draft.state == "pending":
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"черновик {draft_id} и так в очереди")
+
+    previous = draft.state
+    lead = (await db.execute(select(Lead).where(Lead.id == draft.lead_id))).scalar_one()
+    draft.state = "pending"
+    draft.reject_reason = None
+    draft.decided_by = None
+    draft.decided_at = None
+    lead.status = "in_review"
+    lead.reject_reason = None
+
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="draft_reopen",
+        detail={"draft_id": draft_id, "lead_id": lead.id, "from": previous},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("draft_reopened draft=%s by=%s from=%s", draft_id, user.email, previous)
+
+    remaining = (await db.execute(
+        select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
+    return {"draft_id": draft_id, "state": "pending", "previous": previous,
+            "remaining": remaining}
+
+
 @router.post("/{draft_id}/approve")
 async def approve(draft_id: int, body: ApproveRequest, request: Request, db: GetDB,
-                  user=requires(Section.DRAFTS)):
+                  user=permits(Section.DRAFTS, Capability.DRAFT_DECIDE)):
     """Одобрить вариант — при необходимости с правкой текста.
 
     Правка и одобрение — одна ручка, потому что в интерфейсе это одно действие.
@@ -310,6 +373,7 @@ async def approve(draft_id: int, body: ApproveRequest, request: Request, db: Get
     lead = (await db.execute(select(Lead).where(Lead.id == draft.lead_id))).scalar_one()
     send = await _evaluate(db, draft, lead, text)
 
+    previous = draft.state
     draft.state = "approved"
     draft.chosen_variant = body.variant_index
     draft.final_text = text
@@ -319,7 +383,7 @@ async def approve(draft_id: int, body: ApproveRequest, request: Request, db: Get
 
     db.add(AuditLog(
         user_id=user.id, user_email=user.email, action="draft_approve",
-        detail={"draft_id": draft_id, "lead_id": lead.id,
+        detail={"draft_id": draft_id, "lead_id": lead.id, "from": previous,
                 "variant_index": body.variant_index, "edited": edited,
                 "send_allowed": send["allowed"], "send_reasons": send["reasons"]},
         ip=request.client.host if request.client else None))
@@ -341,7 +405,7 @@ class EditRequest(BaseModel):
 
 @router.post("/{draft_id}/edit")
 async def edit(draft_id: int, body: EditRequest, request: Request, db: GetDB,
-               user=requires(Section.DRAFTS)):
+               user=permits(Section.DRAFTS, Capability.DRAFT_DECIDE)):
     """Сохранить правку, НЕ принимая решения.
 
     Отдельно от одобрения, потому что это разные действия: «текст поправлен, ещё
@@ -381,7 +445,7 @@ async def edit(draft_id: int, body: EditRequest, request: Request, db: GetDB,
 
 @router.post("/{draft_id}/reject")
 async def reject(draft_id: int, body: RejectRequest, request: Request, db: GetDB,
-                 user=requires(Section.DRAFTS)):
+                 user=permits(Section.DRAFTS, Capability.DRAFT_DECIDE)):
     """Отклонить с типизированной причиной из закрытого справочника."""
     draft = await _draft_for_decision(db, draft_id)
     label = _REASON_BY_N.get(body.reason_n)
@@ -390,6 +454,7 @@ async def reject(draft_id: int, body: RejectRequest, request: Request, db: GetDB
                             f"причина {body.reason_n} отсутствует в справочнике")
 
     lead = (await db.execute(select(Lead).where(Lead.id == draft.lead_id))).scalar_one()
+    previous = draft.state
     draft.state = "rejected"
     draft.reject_reason = label
     draft.decided_by = user.email
@@ -399,7 +464,7 @@ async def reject(draft_id: int, body: RejectRequest, request: Request, db: GetDB
 
     db.add(AuditLog(
         user_id=user.id, user_email=user.email, action="draft_reject",
-        detail={"draft_id": draft_id, "lead_id": lead.id,
+        detail={"draft_id": draft_id, "lead_id": lead.id, "from": previous,
                 "reason_n": body.reason_n, "reason": label},
         ip=request.client.host if request.client else None))
     await db.commit()

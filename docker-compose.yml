@@ -31,6 +31,14 @@ services:
       RADAR_ENGAGE_BASE_URL: ${RADAR_ENGAGE_BASE_URL}
       RADAR_ENGAGE_API_KEY: ${RADAR_ENGAGE_API_KEY}
       RADAR_CORS_ORIGINS: ${RADAR_CORS_ORIGINS}
+      RADAR_INGEST_TOKEN: ${RADAR_INGEST_TOKEN}
+      RADAR_SELF_BASE_URL: ${RADAR_SELF_BASE_URL}
+      # Домашние модели Ивана, проброшенные туннелями tuna. Пустое значение —
+      # это «ступень выключена», а не поломка: каскад тогда честно пишет, что L2/L3
+      # не запускались, вместо того чтобы пропускать сообщения молча.
+      RADAR_EMBED_BASE_URL: ${RADAR_EMBED_BASE_URL:-}
+      RADAR_LLM_BASE_URL: ${RADAR_LLM_BASE_URL:-}
+      RADAR_LLM_MODEL: ${RADAR_LLM_MODEL:-qwen-local}
       RADAR_DEBUG: "false"
     ports:
       # Только петля. Наружу — исключительно через Caddy по TLS: сервис держит

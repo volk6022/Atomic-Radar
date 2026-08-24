@@ -19,7 +19,7 @@ EXPECTED = {
     "drafts": {"owner", "customer", "reviewer"},
     "conversations": {"owner", "customer", "reviewer"},
     "profile": {"owner", "customer", "reviewer"},
-    "runs": {"owner"},
+    "runs": {"owner", "customer", "reviewer"},
     "evals": {"owner", "customer", "reviewer"},
     "attribution": {"owner", "customer", "viewer"},
     "observability": {"owner"},
@@ -38,11 +38,20 @@ def test_every_section_is_covered():
     assert {s.value for s in Section} == set(EXPECTED)
 
 
-@pytest.mark.parametrize("section", ["fleet", "runs", "observability", "admin"])
+@pytest.mark.parametrize("section", ["fleet", "observability", "admin"])
 def test_owner_only_sections(section):
     assert can(Role.OWNER, section)
     for role in (Role.CUSTOMER, Role.REVIEWER, Role.VIEWER):
         assert not can(role, section), f"{role} не должен видеть {section}"
+
+
+def test_staff_sees_runs_but_cannot_start_them():
+    """Раздел задач открыт штату: замершая очередь иначе читается как поломка, а
+    причина — идущий пересчёт — видна только владельцу. Право на запуск при этом
+    остаётся у владельца, оно проверяется отдельно (см. test_capabilities)."""
+    for role in (Role.OWNER, Role.CUSTOMER, Role.REVIEWER):
+        assert can(role, "runs"), role
+    assert not can(Role.VIEWER, "runs")
 
 
 def test_customer_sees_safety():

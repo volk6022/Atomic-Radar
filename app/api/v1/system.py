@@ -15,6 +15,7 @@ from sqlalchemy import select
 from app.api.deps import GetDB, requires
 from app.core.access import Section
 from app.db.models import AuditLog, SystemState
+from app.services import alerts
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
@@ -82,6 +83,12 @@ async def set_mode(body: ModeRequest, request: Request, db: GetDB,
         detail={"from": previous, "to": body.mode},
         ip=request.client.host if request.client else None,
     ))
+    # Переключение режима — событие, а не состояние: «сейчас LIVE» видно и так, а
+    # «кто и когда включил» иначе остаётся только в журнале аудита, куда не смотрят.
+    await alerts.emit(
+        db, key="mode_changed", severity="error" if body.mode == "LIVE" else "info",
+        text=(f"Режим переключён {previous} → {body.mode} ({user.email})"
+              + (". Сообщения уходят живым людям" if body.mode == "LIVE" else "")))
     await db.commit()
     logger.warning("system_mode_changed %s -> %s by %s", previous, body.mode, user.email)
     return {"mode": state.mode, "previous": previous}
@@ -101,6 +108,8 @@ async def kill(body: KillRequest, request: Request, db: GetDB,
         detail={"reason": state.killed_reason},
         ip=request.client.host if request.client else None,
     ))
+    await alerts.emit(db, key="system_kill", severity="error",
+                      text=f"Аварийная остановка ({user.email}): {state.killed_reason}")
     await db.commit()
     logger.error("KILL SWITCH by %s: %s", user.email, state.killed_reason)
     return {"killed": True, "effective_mode": "DRY_RUN"}
@@ -119,5 +128,8 @@ async def resume(request: Request, db: GetDB, user=requires(Section.SAFETY)):
         user_id=user.id, user_email=user.email, action="system_resume",
         ip=request.client.host if request.client else None,
     ))
+    await alerts.emit(db, key="system_resume", severity="info",
+                      text=f"Аварийная остановка снята ({user.email}); "
+                           f"режим остался DRY_RUN")
     await db.commit()
     return {"killed": False, "mode": "DRY_RUN"}

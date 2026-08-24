@@ -99,13 +99,23 @@ class Limit(Base):
 
 
 class Alert(Base):
+    """Событие, о котором оператор обязан узнать.
+
+    Именно событие, а не состояние: сухой прогон видно и так, а «задача упала» или
+    «включили LIVE» происходит один раз, и без записи исчезает бесследно.
+    """
     __tablename__ = "alerts"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Ключ повторяемости: модель недоступна десять минут — это одна тревога, а не
+    # двести. Повтор с тем же ключом обновляет непрочитанную запись.
+    key: Mapped[str | None] = mapped_column(String(80))
     text: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_alert_unread", "read_at", "created_at"),)
 
 
 # ── флот и источники ──────────────────────────────────────────────────────────
@@ -345,6 +355,13 @@ class ProfileVersion(Base):
 
 
 class Run(Base):
+    """Длинная операция: бэкфилл, переклассификация, выгрузка.
+
+    Строка здесь — источник истины, а не отражение переменной в памяти. От этого
+    зависит и отмена (флаг ставит ручка, читает исполнитель), и честность экрана
+    после перезапуска контейнера: процесс умирает, строка остаётся, и на старте её
+    помечают прерванной вместо вечного «выполняется, 43%».
+    """
     __tablename__ = "runs"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -356,9 +373,24 @@ class Run(Base):
     eta_seconds: Mapped[int | None] = mapped_column(Integer)
     gpu_hours: Mapped[float | None] = mapped_column(Numeric(8, 3))
     error: Mapped[str | None] = mapped_column(Text)
+
+    # Просьба остановиться. Отдельным полем, а не статусом: пока задача не увидела
+    # флаг и не дописала посчитанное, она всё ещё выполняется, и статус обязан
+    # говорить именно это.
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False,
+                                                   default=False)
+    # Последние строки хода работы — чтобы понять, на чём задача стоит, не заходя
+    # в логи контейнера. Полный вывод остаётся там.
+    log: Mapped[list | None] = mapped_column(JSONB)
+    # Сводка по завершении: сколько посчитано, сколько лидов создано и удалено.
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_run_kind_status", "kind", "status"),)
 
 
 class LlmTrace(Base):

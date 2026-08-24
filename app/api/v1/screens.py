@@ -17,33 +17,28 @@ from __future__ import annotations
 
 # `status` из fastapi здесь не импортируется намеренно: у ручки лидов есть параметр
 # с таким же именем, и одноимённый модуль рядом читался бы как ошибка.
-from fastapi import APIRouter, HTTPException, Query
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from app.api.deps import GetDB, requires
+from app.api.v1.listing import ListParams, apply_search, apply_sort, list_params
 from app.core import cascade
 from app.core import invariants as inv
+from app.core import prototypes
 from app.core.access import Section
+from app.core.config import get_settings
 from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
                            Lead, LlmTrace, Message, OutboundAttempt,
-                           ProfileVersion, Run, User)
-from app.services import drafting, engage
+                           ProfileVersion, User)
+from app.services import drafting, embeddings, engage, llm
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
-
-
-def _page(rows: list[dict], limit: int, offset: int) -> dict:
-    """Единая обёртка для листингов.
-
-    `total` отдаётся всегда: на реальных объёмах (одна активная группа даёт ~9000
-    сообщений в сутки) экран обязан знать размер выборки, не получая её целиком.
-    """
-    return {"total": len(rows), "limit": limit, "offset": offset,
-            "rows": rows[offset:offset + limit]}
 
 
 # ── шапка и общее ─────────────────────────────────────────────────────────────
@@ -56,10 +51,20 @@ async def _counts(db) -> dict:
     total_msgs = (await db.execute(select(func.count(Message.id)))).scalar_one()
     msgs_24h = (await db.execute(
         select(func.count(Message.id)).where(Message.tg_date >= day_ago))).scalar_one()
-    l0_passed = (await db.execute(
-        select(func.count(Message.id)).where(Message.cascade_level > 0))).scalar_one()
-    l1_passed = (await db.execute(
-        select(func.count(Message.id)).where(Message.cascade_passed.is_(True)))).scalar_one()
+
+    # Воронка: сколько сообщений пережило каждую ступень. «Пережило ступень k» — это
+    # `level > k` (дошло дальше) плюс те, кто на ней и остановился, но прошёл её
+    # (`level == k and passed`). Считать по одному `cascade_passed` нельзя: он говорит
+    # только про последнюю ступень, и сообщение, отсеянное на L2, тогда выглядело бы
+    # так, будто оно не прошло и L0.
+    async def survived(stage: int) -> int:
+        return (await db.execute(select(func.count(Message.id)).where(
+            or_(Message.cascade_level > stage,
+                and_(Message.cascade_level == stage,
+                     Message.cascade_passed.isnot(False)))))).scalar_one()
+
+    l0_passed, l1_passed = await survived(0), await survived(1)
+    l2_passed, l3_passed = await survived(2), await survived(3)
     leads = (await db.execute(select(func.count(Lead.id)))).scalar_one()
     leads_new = (await db.execute(
         select(func.count(Lead.id)).where(Lead.status == "new"))).scalar_one()
@@ -67,30 +72,14 @@ async def _counts(db) -> dict:
     drafts_pending = (await db.execute(
         select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
 
-    return {"total_msgs": total_msgs, "msgs_24h": msgs_24h, "l0": l0_passed,
-            "l1": l1_passed, "leads": leads, "leads_new": leads_new,
+    return {"total_msgs": total_msgs, "msgs_24h": msgs_24h,
+            "l0": l0_passed, "l1": l1_passed, "l2": l2_passed, "l3": l3_passed,
+            "leads": leads, "leads_new": leads_new,
             "channels": channels, "drafts": drafts_pending}
 
 
-@router.get("/alerts")
-async def alerts(db: GetDB, user=requires(Section.DASHBOARD)):
-    """Тревоги. Пока система в сухом прогоне, самая важная новость — что она в нём
-    и находится: оператор должен видеть это, не заходя в Safety."""
-    state = await get_state(db)
-    out = [{"id": 1, "severity": "info" if state.mode == "DRY_RUN" else "error",
-            "text": ("Сухой прогон: ни одно сообщение не уходит наружу"
-                     if state.mode == "DRY_RUN" else
-                     "ВНИМАНИЕ: режим LIVE — сообщения уходят людям"),
-            "created_at": None}]
-    if state.killed:
-        out.insert(0, {"id": 0, "severity": "error", "created_at": None,
-                       "text": "Аварийная остановка: " + (state.killed_reason or "")})
-
-    c = await _counts(db)
-    if c["channels"] and not c["total_msgs"]:
-        out.append({"id": 2, "severity": "warn", "created_at": None,
-                    "text": "Каналы заведены, но сообщений нет — бэкфилл не запускался"})
-    return out
+# Тревоги переехали в `app/api/v1/alerts.py`: у них появилась отметка «прочитано»,
+# то есть побочный эффект, и настоящая таблица вместо трёх условий в коде.
 
 
 @router.get("/counters")
@@ -119,12 +108,18 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
                                 .where(OutboundAttempt.allowed.is_(False)))).scalar_one()
     conversations = (await db.execute(select(func.count(Conversation.id)))).scalar_one()
 
-    # Здоровье Engage спрашиваем у самого Engage, а не рисуем зелёный кружок по вере.
-    try:
-        await engage.fleet_health()
-        engage_status = "ok"
-    except engage.EngageUnavailable:
-        engage_status = "down"
+    # Здоровье внешних сервисов спрашиваем у них самих, а не рисуем зелёный кружок по
+    # вере. Три опроса параллельно: модели живут на машине Ивана за туннелем, и
+    # последовательно это было бы полторы секунды на ровном месте.
+    async def _engage_status() -> str:
+        try:
+            await engage.fleet_health()
+            return "ok"
+        except engage.EngageUnavailable:
+            return "down"
+
+    engage_status, embed_status, llm_status = await asyncio.gather(
+        _engage_status(), embeddings.ping(), llm.ping())
 
     return {
         "tiles": [
@@ -152,13 +147,16 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
         ],
         "errors": [],
         # Воронка — это те же сообщения, просто разрезанные по ступеням каскада.
-        # L2/L3 показываем прочерком: их ещё нет, и ноль читался бы как «всё отсеяно».
+        # Выключенная ступень идёт прочерком, а не нулём: ноль читался бы как
+        # «всё отсеяно», хотя на самом деле её просто не запускали.
         "funnel": [
             {"step": "Сообщений", "count": c["total_msgs"], "go": "stream"},
             {"step": "L0 структура", "count": c["l0"], "go": "stream"},
             {"step": "L1 слова", "count": c["l1"], "go": "stream"},
-            {"step": "L2 эмбеддинги", "count": None, "go": "stream"},
-            {"step": "L3 LLM", "count": None, "go": "stream"},
+            {"step": "L2 эмбеддинги",
+             "count": c["l2"] if embeddings.enabled() else None, "go": "stream"},
+            {"step": "L3 LLM",
+             "count": c["l3"] if llm.enabled() else None, "go": "stream"},
             {"step": "Лиды", "count": c["leads"], "go": "leads"},
         ],
         "mode": "DRY_RUN" if state.killed else state.mode,
@@ -166,7 +164,8 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
         "services": [
             {"name": "engage", "status": engage_status},
             {"name": "postgres", "status": "ok"},
-            {"name": "llm", "status": "not_connected"},
+            {"name": "embeddings", "status": embed_status},
+            {"name": "llm", "status": llm_status},
         ],
     }
 
@@ -231,13 +230,27 @@ async def accounts(user=requires(Section.FLEET)):
     return rows
 
 
+CHANNEL_SORTS = {"title": Channel.title, "members": Channel.members,
+                 "leads_total": Channel.leads_total}
+
+
 @router.get("/channels")
-async def channels(db: GetDB, user=requires(Section.CHANNELS)):
+async def channels(db: GetDB, user=requires(Section.CHANNELS),
+                   p: ListParams = Depends(list_params)):
     """Реестр групп. Заводятся сами при первом сообщении из группы — просить оператора
     зарегистрировать канал заранее значило бы терять то, про что он ещё не знает."""
-    rows = (await db.execute(
-        select(Channel).order_by(Channel.leads_total.desc(), Channel.id)
-    )).scalars().all()
+    q = select(Channel)
+    count_q = select(func.count(Channel.id))
+
+    # Поиск по названию и username канала. У каждого канала одна строка в БД, поэтому
+    # счётчик не нужен отдельно: JOIN есть только в запросе строк.
+    search = [Channel.title, Channel.username]
+    q = apply_search(q, p, search)
+    count_q = apply_search(count_q, p, search)
+
+    total = (await db.execute(count_q)).scalar_one()
+    q = apply_sort(q, p, CHANNEL_SORTS, default="leads_total", tiebreak=Channel.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
 
     out = []
     for c in rows:
@@ -260,39 +273,82 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS)):
             "ingest_enabled": c.ingest_enabled, "is_junk": c.is_junk,
             "linked_chat_username": c.linked_chat_username,
         })
-    return out
+    return {**p.page(total), "rows": out}
+
+
+def _stage_flags(level: int | None, passed: bool | None) -> dict[str, bool | None]:
+    """Вердикт по каждой ступени отдельно из пары (уровень, итог).
+
+    В базе лежат два поля на весь каскад, а экран рисует четыре галочки, и правило
+    перевода одно на всё приложение:
+
+    * `passed is None` — сообщение **в пути**: все ступени до `level` включительно
+      пройдены, следующая ещё не отвечала;
+    * `passed is False` — ступень `level` отбраковала, всё до неё пройдено;
+    * `passed is True` — пройдено всё по `level` включительно.
+
+    Ступени выше `level` во всех случаях `None` — «не дошло». Разница между «не
+    дошло» и «не прошло» и есть то, ради чего экран потока существует, поэтому она
+    считается здесь один раз, а не додумывается на клиенте.
+    """
+    if level is None:
+        return {f"l{k}": None for k in range(4)}
+    decided_through = level if passed is not False else level - 1
+    return {f"l{k}": True if k <= decided_through
+            else (False if k == level else None)
+            for k in range(4)}
+
+
+# Колонки, по которым разрешено сортировать поток. Белый список, а не «любое поле
+# модели»: имя приходит из браузера и попадает в SQL.
+MESSAGE_SORTS = {"date": Message.tg_date, "channel": Channel.title,
+                 "author": Message.author_name, "level": Message.cascade_level}
 
 
 @router.get("/messages")
 async def messages(db: GetDB, user=requires(Section.STREAM),
-                   limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
-                   channel: str | None = None, passed: str | None = None):
+                   p: ListParams = Depends(list_params),
+                   channel_id: int | None = None, channel: str | None = None,
+                   passed: str | None = None):
     """Поток сообщений с результатом каскада L0→L3.
 
     У каждой ступени рядом с вердиктом лежит причина. Экран потока существует ради
     вопроса «почему это не стало лидом», и голое `false` на него не отвечает.
 
-    Пагинация и фильтры считаются в SQL, а не в питоне: одна активная группа даёт
-    около 9000 сообщений в сутки, и выбирать их целиком, чтобы показать пятьдесят,
-    перестанет работать в первый же день реального ингеста.
+    Пагинация, сортировка и фильтры считаются в SQL, а не в питоне: одна активная
+    группа даёт около 9000 сообщений в сутки, и выбирать их целиком, чтобы показать
+    пятьдесят, перестанет работать в первый же день реального ингеста.
+
+    Канал выбирается по `channel_id`. Параметр `channel` (по заголовку) оставлен
+    ради старых ссылок, но помечен устаревшим: заголовок в Telegram меняют, и
+    фильтр по нему тихо перестаёт находить группу, которую до этого находил.
     """
     q = select(Message, Channel).join(Channel, Message.channel_id == Channel.id)
     count_q = select(func.count(Message.id)).join(Channel, Message.channel_id == Channel.id)
 
-    if channel:
+    if channel_id is not None:
+        q = q.where(Message.channel_id == channel_id)
+        count_q = count_q.where(Message.channel_id == channel_id)
+    elif channel:
         q = q.where(Channel.title == channel)
         count_q = count_q.where(Channel.title == channel)
-    if passed == "true":
-        q = q.where(Message.cascade_passed.is_(True))
-        count_q = count_q.where(Message.cascade_passed.is_(True))
-    elif passed == "false":
-        q = q.where(or_(Message.cascade_passed.is_(False), Message.cascade_passed.is_(None)))
-        count_q = count_q.where(or_(Message.cascade_passed.is_(False),
-                                    Message.cascade_passed.is_(None)))
+    # Три значения фильтра, потому что у сообщения три состояния. Сваливать «ещё в
+    # пути» в «не прошло», как было до появления L2/L3, значило бы прятать очередь
+    # необработанного: на экране всё выглядит разобранным, а половина ждёт модель.
+    where = {"true": Message.cascade_passed.is_(True),
+             "false": Message.cascade_passed.is_(False),
+             "pending": Message.cascade_passed.is_(None)}.get(passed or "")
+    if where is not None:
+        q = q.where(where)
+        count_q = count_q.where(where)
+
+    search = [Message.text, Message.author_name, Message.author_username]
+    q = apply_search(q, p, search)
+    count_q = apply_search(count_q, p, search)
 
     total = (await db.execute(count_q)).scalar_one()
-    rows = (await db.execute(
-        q.order_by(Message.tg_date.desc()).limit(limit).offset(offset))).all()
+    q = apply_sort(q, p, MESSAGE_SORTS, default="date", tiebreak=Message.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).all()
 
     lead_by_message = {}
     if rows:
@@ -314,42 +370,33 @@ async def messages(db: GetDB, user=requires(Section.STREAM),
             "is_automatic_forward": m.is_automatic_forward,
             # Три состояния, а не два: `null` значит «до ступени не дошло», и это
             # не то же самое, что «не прошло».
-            "cascade": {
-                "l0": None if level is None else (level > 0 or bool(ok)),
-                "l1": None if level is None or level < 1 else bool(ok),
-                "l2": None, "l3": None,
-            },
+            "cascade": _stage_flags(level, ok),
             "cascade_notes": detail,
             "lead_id": lead_by_message.get(m.id),
         })
-    return {"total": total, "limit": limit, "offset": offset, "rows": out}
+    return {**p.page(total), "rows": out}
+
+
+@router.get("/channels/options")
+async def channel_options(db: GetDB, user=requires(Section.STREAM)):
+    """Справочник каналов для выпадающих списков на табличных экранах.
+
+    Отдельно от `/channels`: тот считает по каждому каналу количество сообщений и
+    долю прошедших, и дёргать его ради заполнения выпадающего списка — лишние
+    запросы на каждое открытие экрана.
+    """
+    rows = (await db.execute(
+        select(Channel.id, Channel.title, Channel.username)
+        .order_by(Channel.title))).all()
+    return [{"id": cid, "title": title, "username": username}
+            for cid, title, username in rows]
 
 
 # ── конвейер лидов ────────────────────────────────────────────────────────────
 
-@router.get("/leads")
-async def leads(db: GetDB, user=requires(Section.LEADS),
-                limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
-                status: str | None = None):
-    q = select(Lead, Channel).join(Channel, Lead.channel_id == Channel.id)
-    count_q = select(func.count(Lead.id))
-    if status:
-        q = q.where(Lead.status == status)
-        count_q = count_q.where(Lead.status == status)
-
-    total = (await db.execute(count_q)).scalar_one()
-    rows = (await db.execute(
-        q.order_by(Lead.score.desc(), Lead.id.desc()).limit(limit).offset(offset))).all()
-
-    out = [{
-        "id": lead.id, "author_name": lead.author_name or "—",
-        "author_username": ("@" + lead.author_username) if lead.author_username else None,
-        "channel": c.title, "pain": lead.pain, "score": lead.score,
-        "status": lead.status, "quote": lead.quote,
-        "score_breakdown": lead.score_breakdown or [],
-        "disqualifiers": lead.disqualifiers or [],
-    } for lead, c in rows]
-    return {"total": total, "limit": limit, "offset": offset, "rows": out}
+# Лиды переехали в `app/api/v1/leads.py`: у них появились правка статуса и массовые
+# решения, то есть побочные эффекты. Этот модуль остаётся чтением — свойство, которое
+# удобно проверять взглядом на список ручек, а не тестом.
 
 
 # Очередь черновиков живёт в `app/api/v1/drafts.py`: там появилось состояние
@@ -359,9 +406,13 @@ async def leads(db: GetDB, user=requires(Section.LEADS),
 
 CONVERSATION_STATES = ("new", "awaiting_reply", "replied", "handed_off", "closed")
 
+CONVERSATION_SORTS = {"created": Conversation.created_at, "sent": Conversation.sent_count,
+                      "last": Conversation.last_sent_at, "state": Conversation.state}
+
 
 @router.get("/conversations")
 async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
+                        p: ListParams = Depends(list_params),
                         state: str | None = None):
     """Диалоги. Пока система в сухом прогоне, их не будет ни одного — и это
     не поломка экрана, а главное свойство режима.
@@ -374,10 +425,15 @@ async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
         raise HTTPException(422, f"неизвестное состояние «{state}», ожидается одно из "
                                  f"{', '.join(CONVERSATION_STATES)}")
 
-    stmt = select(Conversation).order_by(Conversation.id.desc())
+    q = select(Conversation)
+    count_q = select(func.count(Conversation.id))
     if state:
-        stmt = stmt.where(Conversation.state == state)
-    rows = (await db.execute(stmt)).scalars().all()
+        q = q.where(Conversation.state == state)
+        count_q = count_q.where(Conversation.state == state)
+
+    total = (await db.execute(count_q)).scalar_one()
+    q = apply_sort(q, p, CONVERSATION_SORTS, default="created", tiebreak=Conversation.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
     out = []
     for c in rows:
         lead = (await db.execute(
@@ -394,7 +450,7 @@ async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
         select(Conversation.state, func.count(Conversation.id))
         .group_by(Conversation.state))).all())
 
-    return {"rows": out, "total": len(out), "state": state,
+    return {**p.page(total), "rows": out, "state": state,
             "states": [{"key": k, "count": by_state.get(k, 0)}
                        for k in CONVERSATION_STATES],
             "note": None if out else
@@ -416,8 +472,12 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
         select(ProfileVersion).where(ProfileVersion.is_active.is_(True))
         .order_by(ProfileVersion.id.desc()).limit(1))).scalar_one_or_none()
 
+    # Рядом с каждой болью — не только слова для L1, но и эталонные фразы для L2:
+    # это две разные механики отбора одной и той же боли, и человеку, который решает,
+    # «почему система на это среагировала», нужны обе.
     pains = [{"key": pain, "label": pain, "anchors": list(anchors)[:6],
-              "anchors_total": len(anchors)}
+              "anchors_total": len(anchors),
+              "prototypes": list(prototypes.POSITIVE.get(pain, ()))}
              for pain, anchors in cascade.PAIN_ANCHORS.items()]
 
     return {
@@ -429,25 +489,29 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
         "pains": pains,
         "disqualifiers": [{"key": k, "markers": list(v)[:6]}
                           for k, v in cascade.DISQUALIFIERS.items()],
+        # Отрицательные эталоны L2 — половина работы ступени, и без них список
+        # «на кого охотимся» выглядел бы так, будто система только соглашается.
+        "noise_prototypes": [{"key": k, "examples": list(v)[:4]}
+                             for k, v in prototypes.NEGATIVE.items()],
+        "cascade": {
+            "l2_enabled": embeddings.enabled(),
+            "l2_model": get_settings().EMBED_MODEL if embeddings.enabled() else None,
+            "l2_min_margin": cascade.L2_MIN_MARGIN,
+            "l3_enabled": llm.enabled(),
+            "l3_model": get_settings().LLM_MODEL if llm.enabled() else None,
+            "l3_prompt_version": llm.PROMPT_VERSION,
+            "l3_prompt": llm.SYSTEM,
+        },
         "generation": {
             "prompt_version": drafting.PROMPT_VERSION,
-            "note": "Черновики собираются по шаблонам: модель ещё не подключена",
+            "note": "Черновики собираются по шаблонам: текст ответа модель пока "
+                    "не пишет — L3 только выносит вердикт по сообщению",
         },
     }
 
 
-@router.get("/runs")
-async def runs(db: GetDB, user=requires(Section.RUNS)):
-    """Прогоны. Бэкфилл сейчас запускается точечно и в отдельный прогон не
-    оформляется — поэтому список пуст, и об этом сказано прямо."""
-    rows = (await db.execute(select(Run).order_by(Run.id.desc()).limit(50))).scalars().all()
-    return {"rows": [{"id": r.id, "name": r.name, "kind": r.kind, "status": r.status,
-                      "progress": float(r.progress or 0), "error": r.error,
-                      "created_at": r.created_at.isoformat() if r.created_at else None}
-                     for r in rows],
-            "note": None if rows else
-                    "Прогонов нет: бэкфилл запускается по кнопке в разделе Channels "
-                    "и пока не оформляется отдельной задачей"}
+# Задачи переехали в `app/api/v1/runs.py`: у них появились запуск и отмена, то есть
+# побочные эффекты. Этот модуль остаётся чтением.
 
 
 @router.get("/evaluations")
@@ -504,24 +568,59 @@ async def attribution(db: GetDB, user=requires(Section.ATTRIBUTION)):
     }
 
 
+TRACE_SORTS = {"created": LlmTrace.created_at, "latency": LlmTrace.latency_ms,
+               "tokens": LlmTrace.tokens_out, "stage": LlmTrace.stage}
+
+
 @router.get("/traces")
 async def traces(db: GetDB, user=requires(Section.OBSERVABILITY),
-                 limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
-    """LLM-трейсы. Модель ещё не подключена, поэтому список пуст — и это
-    единственное честное содержимое экрана наблюдаемости на текущем этапе."""
-    total = (await db.execute(select(func.count(LlmTrace.id)))).scalar_one()
-    rows = (await db.execute(select(LlmTrace).order_by(LlmTrace.id.desc())
-                             .limit(limit).offset(offset))).scalars().all()
+                 p: ListParams = Depends(list_params)):
+    """LLM-трейсы: по одному на каждый вопрос к модели на ступени L3.
+
+    Сводка считается по всей таблице, а не по показанной странице: средняя задержка
+    по последним пятидесяти строкам — это не средняя задержка, а средняя по тому, что
+    влезло на экран.
+    """
+    q = select(LlmTrace)
+    count_q = select(func.count(LlmTrace.id))
+
+    # Поиск по этапу и названию модели: помогает отладить, какая версия модели попала
+    # в конкретный трейс.
+    search = [LlmTrace.stage, LlmTrace.model]
+    q = apply_search(q, p, search)
+    count_q = apply_search(count_q, p, search)
+
+    total = (await db.execute(count_q)).scalar_one()
+    agg = (await db.execute(select(
+        func.avg(LlmTrace.latency_ms), func.max(LlmTrace.latency_ms),
+        func.sum(LlmTrace.tokens_in), func.sum(LlmTrace.tokens_out)))).one()
+
+    q = apply_sort(q, p, TRACE_SORTS, default="created", tiebreak=LlmTrace.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
     out = [{"id": t.id, "stage": t.stage, "model": t.model,
             "prompt_version": t.prompt_version,
             "tokens_in": t.tokens_in, "tokens_out": t.tokens_out,
             "latency_ms": t.latency_ms,
             "cost_usd": float(t.cost_usd) if t.cost_usd else 0.0,
+            "response": (t.response or "")[:400],
             "created_at": t.created_at.isoformat() if t.created_at else None}
            for t in rows]
-    return {"total": total, "limit": limit, "offset": offset, "rows": out,
-            "note": None if out else
-                    "Трейсов нет: L2/L3 ещё не построены, генерация идёт по шаблонам"}
+
+    return {
+        **p.page(total), "rows": out,
+        "summary": {
+            "avg_latency_ms": int(agg[0]) if agg[0] is not None else None,
+            "max_latency_ms": agg[1], "tokens_in": agg[2], "tokens_out": agg[3],
+            # Модель своя, на своей карте. Ноль здесь — это факт, а не пропуск:
+            # подставить прайс OpenAI значило бы испортить себестоимость лида.
+            "cost_usd": 0.0,
+            "model": get_settings().LLM_MODEL if llm.enabled() else None,
+        },
+        "note": None if out else (
+            "Трейсов нет: L3 выключена (не задан RADAR_LLM_BASE_URL)" if not llm.enabled()
+            else "Трейсов нет: модель включена, но её ещё ни разу не спрашивали — "
+                 "запустите scripts/reclassify"),
+    }
 
 
 @router.get("/limits")
@@ -587,15 +686,28 @@ async def users(db: GetDB, user=requires(Section.ADMIN)):
             for u in rows]
 
 
+AUDIT_SORTS = {"created": AuditLog.created_at, "user": AuditLog.user_email,
+               "action": AuditLog.action}
+
+
 @router.get("/audit")
 async def audit(db: GetDB, user=requires(Section.ADMIN),
-                limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
+                p: ListParams = Depends(list_params)):
     """Журнал аудита. Отвечает на вопрос «кто это сделал» — сюда пишутся решения
     по черновикам, переключения режима и аварийные остановки."""
-    total = (await db.execute(select(func.count(AuditLog.id)))).scalar_one()
-    rows = (await db.execute(select(AuditLog).order_by(AuditLog.id.desc())
-                             .limit(limit).offset(offset))).scalars().all()
-    return {"total": total, "limit": limit, "offset": offset,
+    q = select(AuditLog)
+    count_q = select(func.count(AuditLog.id))
+
+    # Поиск по email пользователя и типу действия: помогает найти конкретный акт
+    # и все действия конкретного человека.
+    search = [AuditLog.user_email, AuditLog.action]
+    q = apply_search(q, p, search)
+    count_q = apply_search(count_q, p, search)
+
+    total = (await db.execute(count_q)).scalar_one()
+    q = apply_sort(q, p, AUDIT_SORTS, default="created", tiebreak=AuditLog.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
+    return {**p.page(total),
             "rows": [{"id": a.id, "user_email": a.user_email, "action": a.action,
                       "detail": a.detail, "ip": a.ip,
                       "created_at": a.created_at.isoformat() if a.created_at else None}

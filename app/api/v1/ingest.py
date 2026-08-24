@@ -10,12 +10,19 @@
     get_chat_info(канал) → узнаём peer_id и username связанной группы обсуждения
         → get_chat_info(группа) → узнаём её peer_id
             → get_chat_history(группа) → сообщения падают в БД
+                → пока не набрали target, страница за страницей назад по истории
 
 Каждый шаг асинхронный: Engage отвечает `task_id`, а результат приносит вебхуком.
 Что именно приехало, определяется по параметрам запроса в `webhook_url` — так
 корреляция не требует ни таблицы ожидающих задач, ни памяти процесса, переживающей
 рестарт. Ответ `get_chat_history` не содержит идентификатора чата вовсе, поэтому
 без этого приёма привязать пачку сообщений было бы не к чему.
+
+**Пагинация — по `max_id`, и это не вкусовщина.** kurigram помечает `offset_id`
+устаревшим и безусловно перезатирает его внутри `get_chat_history`, поэтому листание
+по нему молча возвращает одну и ту же страницу — проверено живым прогоном на пяти
+страницах подряд. Обратный курсор — `max_id`, он инклюзивный на стороне kurigram,
+так что следующая страница запрашивается как `max_id = (самый старый id) - 1`.
 """
 from __future__ import annotations
 
@@ -25,15 +32,21 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import GetDB, requires
 from app.core.access import Section
 from app.core.config import get_settings
-from app.db.models import Channel
-from app.services import engage, ingest as ingest_service
+from app.db.models import Channel, Message
+from app.services import engage, ingest as ingest_service, jobs
 
 logger = logging.getLogger(__name__)
+
+# Сколько сообщений просить за один вызов. Потолок Engage — 1000, но каждая страница
+# приезжает одним вебхуком, и на тысяче постов это уже мегабайт JSON в одном запросе.
+# 500 — компромисс: страниц вдвое больше, зато ни один ответ не становится проблемой
+# сам по себе. Дневной бюджет чтений (2000 вызовов на аккаунт) при этом не жмёт.
+PAGE_LIMIT = 500
 
 # Две поверхности с разной аудиторией, поэтому и роутера два.
 #
@@ -104,6 +117,7 @@ async def receive(token: str, request: Request, db: GetDB):
             db, chat_id=int(peer_id), chat_username=q.get("username"),
             chat_title=q.get("title"), posts=result.get("posts") or [])
         await db.commit()
+        out["next"] = await _continue_backfill(db, out, q)
         return out
 
     logger.info("engage_task_complete_unknown_kind kind=%s", kind)
@@ -129,7 +143,9 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
     await db.commit()
 
     account_id = int(q.get("account_id") or 0) or None
-    limit = int(q.get("limit") or 200)
+    limit = int(q.get("limit") or PAGE_LIMIT)
+    target = int(q.get("target") or limit)
+    run_id = int(q.get("run_id") or 0)
     next_step = None
 
     if chat_type == "channel" and linked and account_id:
@@ -137,17 +153,29 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
         await engage.action(
             account_id=account_id, action="get_chat_info",
             payload={"username": linked},
-            webhook_url=_webhook_url(kind="chat_info", account_id=account_id, limit=limit))
+            webhook_url=_webhook_url(kind="chat_info", account_id=account_id,
+                                     limit=limit, target=target, run_id=run_id))
         next_step = f"запрошена карточка группы @{linked}"
-    elif chat_type in ("supergroup", "group") and account_id:
-        await engage.action(
-            account_id=account_id, action="get_chat_history",
-            payload={"username": username or str(peer_id), "limit": limit},
-            webhook_url=_webhook_url(kind="history", peer_id=peer_id,
-                                     username=username or "", title=title or ""))
-        next_step = f"запрошена история {limit} сообщений"
+    # "forum" — та же супергруппа, только с включёнными темами. Читается ровно так же;
+    # без неё в списке @amnezia_vpn молча не дал ни одного сообщения.
+    elif chat_type in ("supergroup", "group", "forum") and account_id:
+        # Продолжаем с того места, где остановились в прошлый раз. Без этого повторный
+        # запуск с большей целью сначала перечитывал бы уже лежащие в базе свежие
+        # страницы — идемпотентно, но это выброшенные вызовы к Telegram.
+        resume = channel.backfill_cursor
+        await _request_page(peer_id=peer_id, username=username, title=title,
+                            account_id=account_id, limit=limit, target=target,
+                            max_id=(resume - 1) if resume else 0, cursor=resume or 0,
+                            run_id=run_id)
+        next_step = (f"запрошена страница {'с ' + str(resume) if resume else 'с начала'}, "
+                     f"цель {target} сообщений")
+        if run_id:
+            await jobs.progress(run_id, None, f"канал «{channel.title}»: {next_step}")
     elif chat_type == "channel" and not linked:
         next_step = "у канала нет группы обсуждения — читать нечего"
+        if run_id:
+            await jobs.finish(run_id, status="done", note=next_step,
+                              result={"reason": "нет группы обсуждения"})
 
     logger.info("chat_info peer=%s type=%s linked=%s next=%s",
                 peer_id, chat_type, linked, next_step)
@@ -155,12 +183,108 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
             "linked_chat_username": linked, "next": next_step}
 
 
+async def _request_page(*, peer_id: int, username: str | None, title: str | None,
+                        account_id: int, limit: int, target: int,
+                        max_id: int, cursor: int, run_id: int = 0) -> None:
+    """Заказать одну страницу истории. `cursor` едет обратно для защиты от зацикливания.
+
+    `run_id` едет туда же: цепочку двигает Engage, а не наш процесс, и связать
+    приехавшую страницу с задачей в `runs` можно только через адрес вебхука.
+    """
+    payload = {"username": username or str(peer_id), "limit": limit}
+    if max_id:
+        payload["max_id"] = max_id
+    await engage.action(
+        account_id=account_id, action="get_chat_history", payload=payload,
+        webhook_url=_webhook_url(kind="history", peer_id=peer_id,
+                                 username=username or "", title=title or "",
+                                 account_id=account_id, limit=limit, target=target,
+                                 prev_cursor=cursor, run_id=run_id))
+
+
+async def _continue_backfill(db, out: dict, q) -> str:
+    """Решить, просить ли следующую страницу, и попросить.
+
+    Три причины остановиться, и все три должны быть различимы в логе, иначе
+    «бэкфилл встал» превращается в гадание:
+
+    * набрали target — работа сделана;
+    * страница пришла пустой — история кончилась;
+    * курсор не сдвинулся — Telegram отдал то же самое, и следующий запрос
+      отдаст то же ещё раз. Именно так выглядела бы старая грабля с `offset_id`,
+      поэтому проверка остаётся навсегда, а не «на время отладки».
+    """
+    account_id = int(q.get("account_id") or 0)
+    target = int(q.get("target") or 0)
+    run_id = int(q.get("run_id") or 0)
+
+    async def stop(reason: str, *, ok: bool = True) -> str:
+        """Закрыть задачу и вернуть причину остановки одним и тем же текстом.
+
+        Причина обязана быть видна и в логе задачи, и в ответе на вебхук: «бэкфилл
+        встал» без неё превращается в гадание, а причин ровно три и они разные.
+        """
+        if run_id:
+            total_now = (await db.execute(
+                select(func.count(Message.id))
+                .where(Message.channel_id == out.get("channel_id", 0)))).scalar_one()
+            await jobs.finish(run_id, status="done" if ok else "failed",
+                              result={"reason": reason, "messages": total_now,
+                                      "target": target},
+                              error=None if ok else reason, note=reason)
+        return reason
+
+    if not account_id or not target:
+        return "продолжение не запрошено (нет account_id/target)"
+
+    cursor = out.get("backfill_cursor")
+    prev_cursor = int(q.get("prev_cursor") or 0)
+
+    if not out.get("accepted"):
+        return await stop("история кончилась: страница пустая")
+    if cursor is None:
+        return await stop("нет курсора — продолжать не от чего")
+    if prev_cursor and cursor >= prev_cursor:
+        logger.warning("backfill_cursor_stuck channel=%s cursor=%s prev=%s",
+                       out.get("channel_id"), cursor, prev_cursor)
+        return await stop(
+            f"курсор не сдвинулся ({cursor}) — остановка, чтобы не крутиться впустую")
+
+    total = (await db.execute(
+        select(func.count(Message.id))
+        .where(Message.channel_id == out["channel_id"]))).scalar_one()
+    if total >= target:
+        return await stop(f"цель достигнута: {total} ≥ {target}")
+
+    if run_id:
+        await jobs.progress(run_id, 100 * total / target,
+                            f"прочитано {total} из {target}")
+
+    channel = (await db.execute(
+        select(Channel).where(Channel.id == out["channel_id"]))).scalar_one()
+    try:
+        await _request_page(
+            peer_id=channel.peer_id, username=channel.username, title=channel.title,
+            account_id=account_id, limit=int(q.get("limit") or PAGE_LIMIT),
+            target=target, max_id=cursor - 1, cursor=cursor, run_id=run_id)
+    except engage.EngageUnavailable as e:
+        # Отвечаем 200: сообщения этой страницы уже записаны, и переигрывать доставку
+        # вебхука незачем — повтор только заново попросил бы ту же страницу.
+        logger.warning("backfill_continue_failed channel=%s error=%s",
+                       out.get("channel_id"), e)
+        return await stop(f"страница записана, но продолжить не вышло: {e}", ok=False)
+    return f"запрошена следующая страница: {total}/{target}, max_id={cursor - 1}"
+
+
 # ── запуск ────────────────────────────────────────────────────────────────────
 
 class BackfillRequest(BaseModel):
     username: str
     account_id: int = Field(gt=0)
-    limit: int = Field(200, ge=1, le=1000)
+    limit: int = Field(PAGE_LIMIT, ge=1, le=1000)
+    # Сколько сообщений хочется набрать в этом канале всего. Страницы будут
+    # запрашиваться одна за другой, пока не наберётся или пока история не кончится.
+    target: int = Field(PAGE_LIMIT, ge=1, le=100_000)
 
 
 @operator_router.post("/backfill")
@@ -175,21 +299,42 @@ async def start_backfill(body: BackfillRequest, db: GetDB,
     if not username:
         raise HTTPException(422, "пустой username")
 
+    # Задача заводится ДО обращения к Engage: если он недоступен, строка со статусом
+    # «упала» и причиной честнее, чем молчание. Исполнителя внутри API у неё нет —
+    # цепочку двигают вебхуки, поэтому `create_external`.
+    try:
+        run = await jobs.create_external(
+            db, kind="backfill",
+            params={"username": username, "account_id": body.account_id,
+                    "target": body.target, "limit": body.limit},
+            name=f"Дочитать историю · @{username}", user_email=user.email)
+    except jobs.JobBusy as e:
+        raise HTTPException(409, str(e)) from e
+
     try:
         task = await engage.action(
             account_id=body.account_id, action="get_chat_info",
             payload={"username": username},
             webhook_url=_webhook_url(kind="chat_info", account_id=body.account_id,
-                                     limit=body.limit))
+                                     limit=body.limit, target=body.target,
+                                     run_id=run.id))
     except engage.EngageUnavailable as e:
+        await jobs.finish(run.id, status="failed", error=str(e),
+                          note=f"Engage недоступен: {e}")
         raise HTTPException(503, str(e)) from e
     except ValueError as e:  # закрытый список действий
+        await jobs.finish(run.id, status="failed", error=str(e), note=str(e))
         raise HTTPException(400, str(e)) from e
 
-    logger.info("backfill_started username=%s account=%s task=%s by=%s",
-                username, body.account_id, task.get("task_id"), user.email)
+    await jobs.progress(run.id, 0, f"запрошена карточка @{username}, "
+                                   f"цель {body.target} сообщений")
+    logger.info("backfill_started username=%s account=%s target=%s task=%s run=%s by=%s",
+                username, body.account_id, body.target, task.get("task_id"), run.id,
+                user.email)
     return {"started": True, "username": username, "task_id": task.get("task_id"),
-            "note": "результат придёт вебхуком; следите за каналом в разделе Channels"}
+            "target": body.target, "run_id": run.id,
+            "note": "результат придёт вебхуком; страницы дозапросятся сами, "
+                    "ход виден в разделе Runs"}
 
 
 @operator_router.get("/ingest-status")
