@@ -9,6 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, runs,
                         screens, system)
+# Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
+# первый, и `include_router` уходит в модуль сервисов.
+from app.api.v1 import workflows as workflows_api
 from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
@@ -84,6 +87,7 @@ def create_app() -> FastAPI:
     app.include_router(manual_sends.router)
     app.include_router(runs.router)
     app.include_router(screens.router)
+    app.include_router(workflows_api.router)
 
     @app.get("/api/v1/health")
     async def health():

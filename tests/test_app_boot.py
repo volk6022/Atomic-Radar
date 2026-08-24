@@ -40,6 +40,8 @@ def test_health_is_open(client):
 @pytest.mark.parametrize("path", [
     "/api/v1/dashboard", "/api/v1/leads", "/api/v1/drafts/next", "/api/v1/accounts",
     "/api/v1/limits", "/api/v1/users", "/api/v1/audit", "/api/v1/system/mode",
+    # Реестр сценариев открыт любой роли, но не анониму: «любой вошедшей» — не «любой».
+    "/api/v1/workflows", "/api/v1/workflows/cold_dm",
 ])
 def test_data_endpoints_require_auth(client, path):
     """Ни одна ручка с данными не отвечает анонимному запросу."""
@@ -72,5 +74,6 @@ def test_every_contract_endpoint_is_registered(app):
         "/api/v1/attribution", "/api/v1/traces", "/api/v1/limits", "/api/v1/users",
         "/api/v1/audit", "/api/v1/system/mode", "/api/v1/system/kill",
         "/api/v1/auth/login", "/api/v1/auth/totp", "/api/v1/auth/logout", "/api/v1/auth/me",
+        "/api/v1/workflows", "/api/v1/workflows/{key}", "/api/v1/workflows/{key}/sections",
     ):
         assert expected in paths, f"нет маршрута {expected}"
