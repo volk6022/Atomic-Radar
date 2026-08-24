@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON,
     Numeric, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -440,3 +440,316 @@ class Attribution(Base):
     converted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     amount: Mapped[float | None] = mapped_column(Numeric(12, 2))
     created_at: Mapped[datetime] = _created()
+
+
+# ── многопоточная архитектура (workflows) ─────────────────────────────────────
+#
+# Бэкенд был спроектирован под один сценарий, и на него навешана вся бизнес-логика
+# отбора и черновиков. Ниже — сущности, разводящие эту логику по независимым
+# конвейерам, чтобы третий и пятый сценарий добавлялись строкой в `workflows`,
+# а не переделкой.
+#
+# Разделение сделано колонкой `workflow_id`, а не отдельными таблицами на сценарий:
+# раздельность нужна в интерфейсе (у каждого workflow свои страницы), а в базе она
+# только мешала бы — одна схема означает один набор запросов и один шаблон экрана.
+
+
+class EngageInstance(Base):
+    """Инстанс Engage, в который ходит Radar.
+
+    Раньше адрес был один на весь сервис (`ENGAGE_BASE_URL`), и второй клиент со своим
+    инстансом подключить было физически некуда. `accounts.engage_instance` при этом
+    инстансы уже различал — не хватало только реестра.
+
+    Ключ API здесь НЕ хранится: лежит имя переменной окружения, значение читается из
+    окружения процесса. Иначе дамп базы становится связкой ключей от всех клиентов.
+    """
+    __tablename__ = "engage_instances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Совпадает с `accounts.engage_instance` — по нему аккаунты сходятся с инстансом.
+    key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # Метка для интерфейса, а НЕ тенант: изоляции данных по ней нет и не подразумевается.
+    # Когда в Radar появятся пользователи со стороны клиента, понадобится настоящая
+    # многотенантность, и вот тогда это станет внешним ключом.
+    client_label: Mapped[str] = mapped_column(String(80), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key_env: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Проставляется проверкой доступности. Нужно, чтобы «Engage недоступен» было видно
+    # на экране флота, а не только в логах.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class Workflow(Base):
+    """Сценарий работы: кого ищем, что с ним делаем, откуда берём аккаунты.
+
+    Описан не названием, а тремя осями — тогда новый сценарий не требует ветки в коде:
+
+    * `target_kind` — что является целью: `user` (человек) или `message` (сообщение);
+    * `action`      — что делаем: `dm`, `reply`, `react`;
+    * `visibility`  — `private` или `public`, видит ли результат кто-то кроме адресата.
+
+    Три известных сценария ложатся так::
+
+        ЛС               user    / dm    / private
+        публичный ответ  message / reply / public
+        реакции          message / react / public
+
+    Состав меню и форма экранов выводятся из осей, а не из `key`: `action='dm'` даёт
+    раздел «Переписки», `visibility='public'` — «Активность» вместо него.
+    """
+    __tablename__ = "workflows"
+
+    TARGET_KINDS = ("user", "message")
+    ACTIONS = ("dm", "reply", "react")
+    VISIBILITIES = ("private", "public")
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    engage_instance_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("engage_instances.id"), nullable=False)
+    # Пул аккаунтов на стороне Engage. Поле там NOT NULL, ровно одно на аккаунт и
+    # ручки смены нет — значит аккаунт закреплён за сценарием с заведения.
+    engage_use_case: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # Набор правил отбора: `dm_v1` пропускает только реплики людей, `public_v1` —
+    # ещё и посты канала, потому что для публичного ответа пост и есть цель.
+    cascade_profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+
+    # Настройки сценария лежат при нём, а не в общем окне «настроек вообще».
+    settings: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                           server_default="{}")
+
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (Index("ix_workflow_active_order", "is_active", "sort_order"),)
+
+
+class WfVerdict(Base):
+    """Вердикт каскада для пары (сообщение, workflow).
+
+    Раньше вердикт лежал прямо в `messages` одним набором колонок — то есть на
+    сообщение приходился ровно один результат. Два конвейера с разными критериями
+    затирали бы вердикты друг друга: одно и то же сообщение может не годиться для ЛС
+    и отлично годиться для публичного ответа, и это два независимых факта.
+
+    `passed` трёхзначно, и это существенно: `True` — прошло все включённые ступени,
+    `False` — отсеяно, `NULL` — «ещё в пути»: ступень включена, но её вход (вектор,
+    ответ модели) пока не посчитан.
+    """
+    __tablename__ = "wf_verdicts"
+
+    workflow_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("workflows.id"), primary_key=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+
+    level: Mapped[int | None] = mapped_column(Integer)
+    passed: Mapped[bool | None] = mapped_column(Boolean)
+    detail: Mapped[dict | None] = mapped_column(JSONB)
+
+    pain: Mapped[str | None] = mapped_column(String(255))
+    score: Mapped[int | None] = mapped_column(Integer)
+    score_breakdown: Mapped[list | None] = mapped_column(JSONB)
+    disqualifiers: Mapped[list | None] = mapped_column(JSONB)
+
+    computed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        Index("ix_verdict_wf_passed", "workflow_id", "passed"),
+        Index("ix_verdict_wf_level", "workflow_id", "level"),
+    )
+
+
+class WfTarget(Base):
+    """Цель: повод сделать действие сценария. Обобщение прежнего `leads`.
+
+    `leads` описывал ровно одну форму — «повод написать вот этому человеку в ЛС», и
+    требовал `author_peer_id NOT NULL`. Публичному ответу адресат-человек не нужен:
+    цель там — сообщение в треде, а автора может не быть вовсе (пост анонимного
+    админа комментировать можно).
+
+    Поэтому адресация разнесена по трём полям и заполняется по `target_kind`
+    сценария. Проверка — в `__table_args__`, чтобы недозаполненная цель не доехала
+    до отправки.
+    """
+    __tablename__ = "wf_targets"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("workflows.id"), nullable=False)
+    # Денормализовано с `workflows.target_kind`: CHECK не умеет ходить в другую
+    # таблицу, а проверка адресации нужна на уровне схемы.
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    message_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("messages.id"), nullable=False)
+    channel_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("channels.id"), nullable=False)
+
+    # ── адресация ─────────────────────────────────────────────────────────────
+    # target_kind='user': кому пишем в ЛС.
+    recipient_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    # target_kind='message': куда отвечаем. Комментарии живут в группе обсуждения
+    # канала, поэтому чат — это она, а не сам канал.
+    chat_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    reply_to_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    # ── витрина для оператора ─────────────────────────────────────────────────
+    # Автор здесь необязателен: у публичной цели его может не быть.
+    author_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    author_username: Mapped[str | None] = mapped_column(String(64))
+    author_name: Mapped[str | None] = mapped_column(String(160))
+
+    pain: Mapped[str | None] = mapped_column(String(255))
+    quote: Mapped[str | None] = mapped_column(Text)
+    score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    score_breakdown: Mapped[list | None] = mapped_column(JSONB)
+    disqualifiers: Mapped[list | None] = mapped_column(JSONB)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
+    reject_reason: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        # Одно сообщение даёт максимум одну цель в каждом сценарии, но может дать
+        # цель в каждом. Это и есть развязка, которой не хватало.
+        UniqueConstraint("workflow_id", "message_id", name="uq_target_wf_message"),
+        Index("ix_target_wf_status", "workflow_id", "status", "score"),
+        Index("ix_target_wf_created", "workflow_id", "created_at"),
+        Index("ix_target_recipient", "workflow_id", "recipient_peer_id"),
+        CheckConstraint(
+            "(target_kind = 'user' AND recipient_peer_id IS NOT NULL)"
+            " OR (target_kind = 'message' AND chat_peer_id IS NOT NULL"
+            "     AND reply_to_message_id IS NOT NULL)",
+            name="ck_target_addressing",
+        ),
+    )
+
+
+class WfDraft(Base):
+    """Черновик действия по цели. Обобщение прежнего `drafts`.
+
+    Для `action='react'` текста нет — в `final_text` лежит выбранное эмодзи. Отдельная
+    сущность под реакции не заводится: решение оператора устроено одинаково («вот
+    заготовка, одобри или отклони»), и разделять его значит дублировать весь экран.
+    """
+    __tablename__ = "wf_drafts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("workflows.id"), nullable=False)
+    target_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("wf_targets.id"), nullable=False)
+
+    variants: Mapped[list] = mapped_column(JSONB, nullable=False)
+    thread_context: Mapped[list | None] = mapped_column(JSONB)
+    chosen_variant: Mapped[int | None] = mapped_column(Integer)
+    final_text: Mapped[str | None] = mapped_column(Text)
+
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    reject_reason: Mapped[str | None] = mapped_column(String(120))
+    decided_by: Mapped[str | None] = mapped_column(String(255))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+    source_message_link: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        # Одна цель — один черновик. Раньше это подразумевалось молча.
+        UniqueConstraint("target_id", name="uq_draft_target"),
+        Index("ix_wfdraft_wf_state", "workflow_id", "state", "created_at"),
+    )
+
+
+class WfOutbound(Base):
+    """Журнал исходящих попыток. Обобщение прежнего `outbound_attempts`.
+
+    `conversation_id` необязателен: у публичного ответа переписки нет — есть
+    сообщение в треде, на которое ответили. Адрес доставки продублирован здесь
+    снимком, потому что цель со временем может быть переоценена, а журнал обязан
+    показывать, что происходило на самом деле.
+    """
+    __tablename__ = "wf_outbound"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("workflows.id"), nullable=False)
+    target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
+    draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
+    conversation_id: Mapped[int | None] = mapped_column(BigInteger)
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Куда фактически уходило.
+    recipient_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    chat_peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    reply_to_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasons: Mapped[list | None] = mapped_column(JSONB)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    delivered_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    text_snapshot: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        Index("ix_wfoutbound_wf_created", "workflow_id", "created_at"),
+        Index("ix_wfoutbound_recipient", "workflow_id", "recipient_peer_id"),
+        Index("ix_wfoutbound_reply", "workflow_id", "chat_peer_id", "reply_to_message_id"),
+    )
+
+
+class ManualSend(Base):
+    """Что человек отправил руками.
+
+    Автоотправки нет, и Андрей пишет сам — а значит единственное место, где живёт
+    правда о том, как надо отвечать, это его голова. Форма переносит её в базу.
+
+    Пара «что предложил Radar» → «что человек написал на самом деле» стоит дороже,
+    чем каждая половина по отдельности: на ней потом можно будет что-то мерить.
+    Сейчас `evaluations` пустая ровно потому, что сравнивать не с чем.
+    """
+    __tablename__ = "manual_sends"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("workflows.id"), nullable=False)
+    # Необязательны: Андрей мог написать тому, кого Radar не находил, и это тоже
+    # ценные данные — отказаться их принять значит потерять их совсем.
+    target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
+    draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
+    message_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("messages.id"))
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Снимок того, что предлагал Radar на момент отправки. Черновик потом могут
+    # переписать, а сравнивать надо с тем, что человек видел перед глазами.
+    suggested_text: Mapped[str | None] = mapped_column(Text)
+
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recorded_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    recorded_at: Mapped[datetime] = _created()
+    note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_manual_wf_sent", "workflow_id", "sent_at"),
+        Index("ix_manual_target", "target_id"),
+    )

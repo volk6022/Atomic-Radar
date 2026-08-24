@@ -12,8 +12,8 @@ from app.api.v1 import (alerts, auth, drafts, ingest, leads, runs, screens,
 from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
-from app.db.session import get_engine
-from app.services import engage, jobs
+from app.db.session import get_engine, get_session_maker
+from app.services import engage, engage_registry, jobs, workflows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -39,6 +39,16 @@ async def lifespan(app: FastAPI):
         stale = await jobs.mark_interrupted()
         if stale:
             logger.warning("jobs_interrupted_on_start count=%s", stale)
+
+        # Реестр инстансов Engage. Заводим строку из настроек процесса, если реестр
+        # пуст, — так уже работающая установка переживает выкатку без ручного шага.
+        engage_registry.install()
+        async with get_session_maker()() as db:
+            await engage_registry.ensure_bootstrap(db)
+            await engage_registry.reload(db)
+            # Сценарий ЛС существовал молча — установка работает ровно по нему.
+            # Заводим его строкой, чтобы накопленным данным было к чему привязаться.
+            await workflows.ensure_bootstrap(db)
     except Exception as e:  # noqa: BLE001 — без БД отдаём 503, но поднимаемся
         app.state.db_ready = False
         logger.warning("db_not_ready: %s", e)

@@ -4,17 +4,26 @@ Engage держит аккаунты, прокси и лимиты; Radar ход
 API-ключу. Здесь только чтение: всё, что отправляет сообщения, обязано идти через
 `OutboundGate`, и отдельная дырка в обход него не появляется даже случайно.
 
-Два решения, которые видно в коде:
+Три решения, которые видно в коде:
 
 * **Короткий таймаут.** Экран флота не должен зависать вместе с Engage. Пять секунд —
   это «сервис жив, но задумался»; всё, что дольше, для интерфейса неотличимо от отказа.
 * **Отказ не подменяется заглушкой.** Если Engage недоступен, наверх летит
   `EngageUnavailable`, а ручка отдаёт 503. Показать вместо живых аккаунтов мок —
   худшее, что можно сделать на экране, по которому судят о здоровье флота.
+* **Инстансов несколько.** Раньше адрес был один на весь сервис, и второй клиент со
+  своим инстансом Engage подключить было физически некуда: каждый заказчик получает
+  свой инстанс на своём сервере. Теперь клиенты живут в пуле по ключу инстанса.
+
+Про кэш клиентов. Он ключуется не только именем инстанса, но и его адресом с ключом
+API: смена настроек обязана дать новый клиент, а не молча продолжить ходить по старому
+адресу. Это не паранойя — в Engage ровно такой кэш пула в модульной глобали привёл к
+тому, что доставка вебхуков вставала намертво и никто этого не замечал.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import httpx
 
@@ -24,61 +33,110 @@ logger = logging.getLogger(__name__)
 
 TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 
-_client: httpx.AsyncClient | None = None
+# Ключ инстанса, который используется, когда вызов не указал никакого. Совпадает со
+# значением, которым заполняется реестр при первом запуске (см. `engage_registry`).
+DEFAULT_INSTANCE = "default"
 
 
 class EngageUnavailable(RuntimeError):
     """Engage не ответил или ответил ошибкой. Текст уходит оператору как есть."""
 
 
-def _get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        s = get_settings()
-        _client = httpx.AsyncClient(
-            base_url=s.ENGAGE_BASE_URL.rstrip("/"),
-            headers={"X-API-Key": s.ENGAGE_API_KEY},
-            timeout=TIMEOUT,
-        )
-    return _client
+@dataclass(frozen=True)
+class Endpoint:
+    """Куда и с каким ключом ходить. Значение ключа, а не имя переменной окружения:
+    разрешение имени в значение — забота реестра, сюда приезжает уже готовое."""
+    key: str
+    base_url: str
+    api_key: str
+
+
+# {ключ инстанса: (отпечаток настроек, клиент)}
+_clients: dict[str, tuple[tuple[str, str], httpx.AsyncClient]] = {}
+
+# Как разрешить ключ инстанса в endpoint. Проставляется на старте приложения
+# (`engage_registry.install`), чтобы этот модуль не лез в базу сам.
+_resolver = None
+
+
+def set_resolver(fn) -> None:
+    """Задать функцию `key -> Endpoint`. Вызывается один раз при старте."""
+    global _resolver
+    _resolver = fn
+
+
+def _resolve(key: str | None) -> Endpoint:
+    key = key or DEFAULT_INSTANCE
+    if _resolver is not None:
+        ep = _resolver(key)
+        if ep is not None:
+            return ep
+    # Реестр ещё не поднят или инстанс в нём не найден — берём настройки процесса.
+    # Это путь первого запуска, когда таблица реестра пуста, и он же страховка:
+    # молча вернуть None значило бы уронить экран флота на ровном месте.
+    s = get_settings()
+    return Endpoint(key=key, base_url=s.ENGAGE_BASE_URL, api_key=s.ENGAGE_API_KEY)
+
+
+def _get_client(instance: str | None = None) -> httpx.AsyncClient:
+    ep = _resolve(instance)
+    fingerprint = (ep.base_url, ep.api_key)
+    cached = _clients.get(ep.key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    if cached is not None:
+        # Настройки инстанса изменились. Старого клиента закрыть отсюда нельзя —
+        # мы не в асинхронном контексте, — но убрать из пула обязаны, иначе запросы
+        # продолжат уходить по прежнему адресу.
+        logger.info("engage_endpoint_changed instance=%s", ep.key)
+    client = httpx.AsyncClient(
+        base_url=ep.base_url.rstrip("/"),
+        headers={"X-API-Key": ep.api_key},
+        timeout=TIMEOUT,
+    )
+    _clients[ep.key] = (fingerprint, client)
+    return client
 
 
 async def close() -> None:
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    """Закрыть всех клиентов. Вызывается на остановке приложения."""
+    global _clients
+    for _, client in _clients.values():
+        await client.aclose()
+    _clients = {}
 
 
-async def _get(path: str) -> dict:
+async def _get(path: str, *, instance: str | None = None) -> dict:
     try:
-        r = await _get_client().get(path)
+        r = await _get_client(instance).get(path)
     except httpx.HTTPError as e:
-        logger.warning("engage_unreachable path=%s error=%s", path, e)
+        logger.warning("engage_unreachable instance=%s path=%s error=%s",
+                       instance or DEFAULT_INSTANCE, path, e)
         raise EngageUnavailable(f"Engage недоступен: {type(e).__name__}") from e
 
     if r.status_code >= 400:
-        logger.warning("engage_error path=%s status=%s", path, r.status_code)
+        logger.warning("engage_error instance=%s path=%s status=%s",
+                       instance or DEFAULT_INSTANCE, path, r.status_code)
         raise EngageUnavailable(f"Engage ответил {r.status_code} на {path}")
     return r.json()
 
 
-async def list_accounts() -> list[dict]:
+async def list_accounts(*, instance: str | None = None) -> list[dict]:
     """Флот целиком. Engage отдаёт `{count, accounts:[...]}`."""
-    return (await _get("/v1/accounts/")).get("accounts", [])
+    return (await _get("/v1/accounts/", instance=instance)).get("accounts", [])
 
 
-async def safety_config() -> dict:
+async def safety_config(*, instance: str | None = None) -> dict:
     """Конфиг безопасности: из него берутся дневные потолки прогрева по сценариям."""
-    return await _get("/v1/admin/safety")
+    return await _get("/v1/admin/safety", instance=instance)
 
 
-async def fleet_health() -> dict:
-    return await _get("/v1/fleet/health")
+async def fleet_health(*, instance: str | None = None) -> dict:
+    return await _get("/v1/fleet/health", instance=instance)
 
 
 async def action(*, account_id: int, action: str, payload: dict, webhook_url: str,
-                 priority: int = 5) -> dict:
+                 priority: int = 5, instance: str | None = None) -> dict:
     """Поставить задачу в Engage. Отсюда доступны ТОЛЬКО read-действия.
 
     Список закрытый и проверяется здесь, а не по договорённости: `send_message` из
@@ -97,9 +155,10 @@ async def action(*, account_id: int, action: str, payload: dict, webhook_url: st
     body = {"account_id": account_id, "action": action, "payload": payload,
             "webhook_url": webhook_url, "priority": priority}
     try:
-        r = await _get_client().post("/v1/action", json=body)
+        r = await _get_client(instance).post("/v1/action", json=body)
     except httpx.HTTPError as e:
-        logger.warning("engage_action_unreachable action=%s error=%s", action, e)
+        logger.warning("engage_action_unreachable instance=%s action=%s error=%s",
+                       instance or DEFAULT_INSTANCE, action, e)
         raise EngageUnavailable(f"Engage недоступен: {type(e).__name__}") from e
 
     if r.status_code >= 400:

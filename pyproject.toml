@@ -24,6 +24,10 @@ dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.7"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# В контейнере корень проекта и так рабочая директория, а локально `import app` без
+# этого не находится, и все тесты падают на сборе. Ловушка ровно того сорта, из-за
+# которой люди перестают гонять тесты на своей машине.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
