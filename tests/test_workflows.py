@@ -23,16 +23,63 @@ def test_dm_to_user_is_valid():
     assert workflows.validate(wf()) == []
 
 
+PUBLIC_REPLY = dict(key="public_reply", target_kind="message", action="reply",
+                    visibility="public")
+REACTIONS = dict(key="reactions", target_kind="message", action="react",
+                 visibility="public")
+
+
+def axis_problems(w) -> list[str]:
+    """Претензии к тройке осей — без претензий к профилю каскада.
+
+    Разделено потому, что это два разных вопроса. «Можно ли отвечать в треде на
+    сообщение» — свойство конструкции и от кода не зависит. «Годится ли для этого
+    профиль `dm_v1`» — свойство сегодняшнего кода, в котором `public_v1` ещё нет.
+    """
+    return [p for p in workflows.validate(w) if not p.startswith("профиль")]
+
+
 def test_public_reply_to_message_is_valid():
-    assert workflows.validate(wf(key="public_reply", target_kind="message",
-                                 action="reply", visibility="public")) == []
+    assert axis_problems(wf(**PUBLIC_REPLY)) == []
 
 
 def test_reaction_to_message_is_valid():
     """Третий сценарий из разговора — реакции. Конструкция обязана его принять
     без единой правки в коде, иначе расширяемость только на словах."""
-    assert workflows.validate(wf(key="reactions", target_kind="message",
-                                 action="react", visibility="public")) == []
+    assert axis_problems(wf(**REACTIONS)) == []
+
+
+# ── профиль обязан не противоречить осям ──────────────────────────────────────
+
+def test_public_workflow_on_dm_profile_is_reported():
+    """Сегодня в коде один профиль каскада — `dm_v1`, и он отсеивает на L0 всё, у чего
+    нет автора-человека: пост канала и анонимного админа. Для публичного ответа это
+    ровно те сообщения, ради которых сценарий и заводится.
+
+    Такой сценарий работает молча и почти впустую: цели даёт, но только по репликам.
+    Пустой раздел выглядит как «пока никого не нашли», и разница видна только тому,
+    кто пойдёт читать профиль. Поэтому — названная проблема, а не тишина.
+    """
+    problems = workflows.validate(wf(**PUBLIC_REPLY))
+    assert any("автора" in p for p in problems)
+    assert any("автопересылку" in p for p in problems)
+
+
+def test_reaction_workflow_on_dm_profile_is_reported():
+    problems = workflows.validate(wf(**REACTIONS))
+    assert any("автора" in p for p in problems)
+
+
+def test_dm_workflow_on_dm_profile_has_no_profile_complaints():
+    """Обратная проверка: жалоба не должна срабатывать на том, ради чего профиль писан."""
+    assert workflows.validate(wf()) == []
+
+
+def test_unknown_profile_stops_before_comparing_it_with_the_axes():
+    """У ненайденного профиля нечего сравнивать с осями. Одна внятная претензия лучше,
+    чем она же плюс две производные от неё."""
+    problems = workflows.validate(wf(**PUBLIC_REPLY, cascade_profile="нет-такого"))
+    assert len(problems) == 1 and "нет такого" in problems[0]
 
 
 def test_dm_to_message_is_rejected():

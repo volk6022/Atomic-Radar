@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from app.core import cascade
 from app.db.models import EngageInstance, Workflow
-from app.services import engage_registry
+from app.services import engage_registry, llm
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,18 @@ def sections_for(wf: Workflow) -> tuple[str, ...]:
 
 
 def describe(wf: Workflow) -> dict:
-    """Форма сценария для интерфейса: по ней рисуется блок в боковом меню."""
+    """Форма сценария для интерфейса: по ней рисуется блок в боковом меню.
+
+    `problems` отдаётся вместе с формой, а не прячется в логах: блок сценария,
+    настроенного неверно, всё равно нарисуется и будет выглядеть работающим — просто
+    целей в нём почти не появится. Пусть интерфейс имеет возможность сказать об этом
+    словами, вместо того чтобы оператор неделю смотрел на пустой раздел.
+    """
     return {
         "id": wf.id,
         "key": wf.key,
         "title": wf.title,
+        "problems": validate(wf),
         "target_kind": wf.target_kind,
         "action": wf.action,
         "visibility": wf.visibility,
@@ -96,6 +103,29 @@ def validate(wf: Workflow) -> list[str]:
     if wf.cascade_profile not in cascade.PROFILES:
         problems.append(f"cascade_profile={wf.cascade_profile!r} — в коде нет такого "
                         f"профиля; известны: {', '.join(sorted(cascade.PROFILES))}")
+        return problems
+
+    # Профиль обязан не противоречить осям. Сегодня в коде один профиль — `dm_v1`, и
+    # он отсеивает на L0 всё, у чего нет автора-человека: автопересылку поста канала
+    # и анонимного админа. Для публичного ответа это ровно те сообщения, ради которых
+    # сценарий и заводится, — цель там сообщение, а не человек. Такой сценарий, если
+    # его завести сейчас, работал бы молча и почти впустую: цели он давал бы, но
+    # только по репликам, то есть по случайному подмножеству своего смысла.
+    prof = cascade.profile(wf.cascade_profile)
+    # Вопрос к модели у контура свой, и профиль называет его ключом. Опечатка здесь
+    # роняла бы прогон на ступени L3 — то есть через десятки минут после старта.
+    if prof.l3_prompt_key not in llm.PROMPTS:
+        problems.append(f"профиль «{prof.key}» ссылается на промпт L3 "
+                        f"«{prof.l3_prompt_key}», которого в коде нет; известны: "
+                        f"{', '.join(sorted(llm.PROMPTS))}")
+    if wf.target_kind == "message" and prof.require_author:
+        problems.append(
+            f"профиль «{prof.key}» требует автора у сообщения, а цель сценария — само "
+            "сообщение: посты и анонимные админы будут отсеяны на L0")
+    if wf.visibility == "public" and prof.drop_automatic_forward:
+        problems.append(
+            f"профиль «{prof.key}» отбрасывает автопересылку поста канала, а публичный "
+            "ответ пишется как раз под такой пост")
     return problems
 
 

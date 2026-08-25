@@ -20,14 +20,15 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
 
 import httpx
 
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
-
-PROMPT_VERSION = "l3-verdict-v1"
 
 _client: httpx.AsyncClient | None = None
 
@@ -73,7 +74,27 @@ async def ping() -> str:
     return "ok" if r.status_code < 400 else f"ответ {r.status_code}"
 
 
-SYSTEM = (
+@dataclass(frozen=True)
+class Prompt:
+    """Вопрос к модели на L3 — свой у каждого контура.
+
+    Раньше промпт был один на всё (`SYSTEM`), и ответ по одному сообщению годился
+    для любого сценария. Это решение отменено осознанно, 25.08: контуры должны быть
+    независимы в своих шагах, и в первую очередь именно здесь. Мы на стадии
+    разработки, и поведение модели при таком совмещении не измерено — а цена ошибки
+    в том, что вопрос, заданный про личное сообщение, молча определял бы отбор для
+    публичного ответа. Лишнее время карты дешевле.
+
+    `version` попадает в `llm_traces.prompt_version`: по нему видно, каким вопросом
+    получен конкретный вердикт, и правка текста не смешивается со старыми ответами.
+    """
+
+    key: str
+    version: str
+    system: str
+
+
+DM_SYSTEM = (
     "Ты помогаешь отбирать людей, которым нужна помощь с хостингом, VPS, VPN и "
     "настройкой серверов. Тебе дают одно сообщение из публичного чата Telegram и "
     "соседние сообщения для контекста.\n\n"
@@ -90,6 +111,34 @@ SYSTEM = (
     "тогда проблема не его.\n"
     "why — почему ты так решил, одним предложением, по-русски."
 )
+
+DM_V1 = Prompt(key="dm_v1", version="l3-verdict-v1", system=DM_SYSTEM)
+
+PROMPTS: Mapping[str, Prompt] = MappingProxyType({DM_V1.key: DM_V1})
+
+DEFAULT_PROMPT = DM_V1.key
+
+
+class UnknownPromptError(ValueError):
+    """В профиле каскада стоит ключ промпта, которого в коде нет."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"промпт L3 «{key}» не найден; известны: "
+                         f"{', '.join(sorted(PROMPTS))}")
+        self.key = key
+
+
+def prompt(key: str) -> Prompt:
+    """Промпт по ключу из профиля каскада.
+
+    Падаем, а не подставляем вопрос по умолчанию: контур с чужим промптом спрашивал
+    бы модель не о том, и заметили бы это по странному отбору через неделю, а не по
+    ошибке при запуске.
+    """
+    try:
+        return PROMPTS[key]
+    except KeyError:
+        raise UnknownPromptError(key) from None
 
 
 def build_prompt(*, text: str, context: list[str]) -> str:
@@ -123,14 +172,19 @@ def parse_verdict(raw: str) -> dict:
     return data
 
 
-async def verdict(*, text: str, context: list[str]) -> tuple[dict, dict]:
-    """Вердикт модели по одному сообщению. Возвращает (разобранный ответ, трейс)."""
+async def verdict(*, text: str, context: list[str],
+                  prompt_key: str = DEFAULT_PROMPT) -> tuple[dict, dict]:
+    """Вердикт модели по одному сообщению в вопросе одного контура.
+
+    Возвращает (разобранный ответ, трейс).
+    """
     s = get_settings()
-    prompt = build_prompt(text=text, context=context)
+    asked = prompt(prompt_key)
+    user_text = build_prompt(text=text, context=context)
     body = {
         "model": s.LLM_MODEL,
-        "messages": [{"role": "system", "content": SYSTEM},
-                     {"role": "user", "content": prompt}],
+        "messages": [{"role": "system", "content": asked.system},
+                     {"role": "user", "content": user_text}],
         # Ноль, а не «поменьше»: одно и то же сообщение обязано получать один и тот же
         # вердикт, иначе перезапуск разметки меняет выборку и калибровать нечего.
         "temperature": 0.0,
@@ -153,8 +207,8 @@ async def verdict(*, text: str, context: list[str]) -> tuple[dict, dict]:
     usage = payload.get("usage") or {}
 
     trace = {
-        "stage": "l3", "model": s.LLM_MODEL, "prompt_version": PROMPT_VERSION,
-        "temperature": 0.0, "prompt": prompt, "response": raw[:4000],
+        "stage": "l3", "model": s.LLM_MODEL, "prompt_version": asked.version,
+        "temperature": 0.0, "prompt": user_text, "response": raw[:4000],
         "tokens_in": usage.get("prompt_tokens"), "tokens_out": usage.get("completion_tokens"),
         "latency_ms": latency_ms,
         # Своя модель на своей карте: денежной стоимости у вызова нет, и писать сюда

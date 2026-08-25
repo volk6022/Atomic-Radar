@@ -505,8 +505,12 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
             "l2_min_margin": rules.l2_min_margin,
             "l3_enabled": llm.enabled(),
             "l3_model": get_settings().LLM_MODEL if llm.enabled() else None,
-            "l3_prompt_version": llm.PROMPT_VERSION,
-            "l3_prompt": llm.SYSTEM,
+            # Промпт берётся у профиля, а не из глобальной константы: с 25.08 у
+            # каждого контура свой вопрос к модели, и показывать здесь «вопрос вообще»
+            # значило бы показывать чужой ровно в тот момент, когда контуров станет два.
+            "l3_prompt_key": rules.l3_prompt_key,
+            "l3_prompt_version": llm.prompt(rules.l3_prompt_key).version,
+            "l3_prompt": llm.prompt(rules.l3_prompt_key).system,
         },
         "generation": {
             "prompt_version": drafting.PROMPT_VERSION,

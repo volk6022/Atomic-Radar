@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core import cascade
 from app.db.models import Channel, Lead, Message
-from app.services import embeddings, llm
+from app.services import embeddings, llm, targeting
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,9 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
                          author_peer_id: int | None, author_username: str | None,
                          author_name: str | None, author_is_bot: bool,
                          is_automatic_forward: bool, reply_to_message_id: int | None,
-                         thread_id: int | None, now: datetime | None = None) -> tuple[Message, bool]:
+                         thread_id: int | None, now: datetime | None = None,
+                         bound: list[targeting.Bound] | None = None,
+                         summary: dict | None = None) -> tuple[Message, bool]:
     """Записать сообщение и прогнать его по дешёвым ступеням каскада.
 
     На приёме считаются только L0 и L1: они стоят микросекунды. L2 требует похода к
@@ -77,6 +79,11 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
     держать Engage в ожидании ради работы, которая пачками идёт в разы быстрее.
     Поэтому сообщение ложится со статусом «ещё в пути» (`cascade_passed = NULL`), а
     `scripts/reclassify.py` дозабирает такие пачкой.
+
+    `bound` — действующие сценарии со своими профилями. Список приходит снаружи, а не
+    выбирается здесь: пачка бэкфилла — это двести сообщений, и запрос за реестром на
+    каждое означал бы двести одинаковых запросов вместо одного. `None` — «сценариями
+    не заниматься», это путь для тестов старого поведения.
 
     Возвращает (сообщение, новое ли).
     """
@@ -115,6 +122,16 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
 
     if verdict["passed"]:
         await _ensure_lead(db, channel=channel, message=message, verdict=verdict)
+
+    # Сценарии считаются отдельным проходом и в свои таблицы. Вердикт выше при этом
+    # не переиспользуется, хотя для ЛС он совпадёт слово в слово: он посчитан по
+    # профилю по умолчанию, а не по профилю конкретного сценария, и подсунуть его
+    # второму конвейеру значило бы отобрать цели чужими правилами.
+    if bound:
+        await targeting.sync_message(
+            db, bound, message=message, channel=channel,
+            l2_enabled=embeddings.enabled(), l3_enabled=llm.enabled(),
+            now=now, summary=summary)
 
     return message, created
 
@@ -165,6 +182,7 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
                                 payload.get("from_last_name")) if x) or None
     tg_date = parse_dt(payload.get("date")) or datetime.now(timezone.utc)
 
+    summary: dict = {}
     _, created = await upsert_message(
         db, channel=channel, tg_message_id=payload.get("message_id"),
         tg_date=tg_date, text=payload.get("message"),
@@ -174,8 +192,9 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
         is_automatic_forward=bool(payload.get("is_automatic_forward")),
         reply_to_message_id=payload.get("reply_to_message_id"),
         thread_id=payload.get("message_thread_id"),
+        bound=await targeting.bind_active(db), summary=summary,
     )
-    return {"accepted": 1, "created": int(created)}
+    return {"accepted": 1, "created": int(created), "workflows": summary}
 
 
 async def ingest_history(db, *, chat_id: int, chat_username: str | None,
@@ -183,6 +202,10 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
     """Результат `get_chat_history`: пачка сообщений одной группы."""
     channel = await get_or_create_channel(
         db, peer_id=chat_id, username=chat_username, title=chat_title)
+
+    # Реестр сценариев выбирается один раз на пачку, а не на сообщение.
+    bound = await targeting.bind_active(db)
+    summary: dict = {}
 
     accepted = 0
     for p in posts:
@@ -199,6 +222,7 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
             is_automatic_forward=bool(p.get("is_automatic_forward")),
             reply_to_message_id=p.get("reply_to_message_id"),
             thread_id=p.get("message_thread_id"),
+            bound=bound, summary=summary,
         )
         accepted += 1
 
@@ -209,6 +233,7 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
         if channel.backfill_cursor is None or oldest < channel.backfill_cursor:
             channel.backfill_cursor = oldest
 
-    logger.info("history_ingested channel=%s accepted=%s", channel.title, accepted)
+    logger.info("history_ingested channel=%s accepted=%s workflows=%s",
+                channel.title, accepted, summary)
     return {"accepted": accepted, "channel_id": channel.id,
-            "backfill_cursor": channel.backfill_cursor}
+            "backfill_cursor": channel.backfill_cursor, "workflows": summary}
