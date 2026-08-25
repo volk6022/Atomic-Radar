@@ -215,6 +215,24 @@ async def _stage_l2(db, waiting, verdicts, *, l3_enabled, report, cancelled,
     return passed
 
 
+# Сколько соседних сообщений показываем модели: столько же до цели и после неё.
+# Раньше брались «первые шесть» из окна ±12 сообщений — то есть в живой ветке почти
+# всегда шесть реплик ДО цели, и то, что ответили после, модель не видела никогда.
+# Для вопроса «на это уже ответили по существу» такой контекст бесполезен, а для
+# личных сообщений просто беднее, чем мог бы быть.
+L3_CONTEXT_BEFORE = 3
+L3_CONTEXT_AFTER = 3
+
+
+async def _context_for(db, m: Message) -> list[str]:
+    """Соседи цели по ветке, поровну с двух сторон, в хронологическом порядке."""
+    rows = await drafting.thread_context(db, m, around=2)
+    at = next((i for i, c in enumerate(rows) if c["target"]), len(rows))
+    before = [c["text"] for c in rows[:at]][-L3_CONTEXT_BEFORE:]
+    after = [c["text"] for c in rows[at + 1:]][:L3_CONTEXT_AFTER]
+    return before + after
+
+
 async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
                     llm_out: dict[int, dict[str, dict]],
                     llm_errors: dict[int, dict[str, str]]) -> int:
@@ -244,9 +262,7 @@ async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
     contexts: dict[int, list[str]] = {}
     for m, _ in jobs:
         if m.id not in contexts:
-            contexts[m.id] = [c["text"]
-                              for c in await drafting.thread_context(db, m, around=2)
-                              if not c["target"]][:6]
+            contexts[m.id] = await _context_for(db, m)
 
     sem = asyncio.Semaphore(L3_CONCURRENCY)
     done = {"n": 0}

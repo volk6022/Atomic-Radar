@@ -194,8 +194,11 @@ def test_workflow_pointing_at_a_missing_profile_is_rejected():
                         engage_use_case="cold_dm", cascade_profile=profile_key)
 
     assert workflows.validate(wf("dm_v1")) == []
-    problems = workflows.validate(wf("public_v1"))
-    assert len(problems) == 1 and "public_v1" in problems[0]
+    # Раньше здесь стоял `public_v1` как заведомо отсутствующий. С 25.08 он есть, и
+    # пример пришлось заменить: тест на «профиля нет» обязан ссылаться на то, чего
+    # нет, иначе он однажды начинает проверять обратное самому себе.
+    problems = workflows.validate(wf("particle_v9"))
+    assert len(problems) == 1 and "particle_v9" in problems[0]
 
 
 def test_minimum_length_belongs_to_the_profile():

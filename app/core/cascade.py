@@ -202,12 +202,48 @@ class CascadeProfile:
     l3_reject_seller: bool = True
     l3_reject_answering_someone_else: bool = True
 
+    # Наблюдения, которые делает только публичный промпт. Все три выключены по
+    # умолчанию, и это не осторожность, а точность: профиль не должен судить по
+    # наблюдению, которого его собственный вопрос не запрашивал. Промпт ЛС этих полей
+    # не возвращает вовсе, и молча отсутствующее поле не должно однажды начать что-то
+    # решать оттого, что кто-то поменял значение по умолчанию.
+    l3_reject_already_answered: bool = False
+    l3_reject_fight: bool = False
+    l3_reject_unanswerable: bool = False
+
     weights: ScoreWeights = ScoreWeights()
 
 
 DM_V1 = CascadeProfile(key="dm_v1", title="Личные сообщения")
 
-PROFILES: Mapping[str, CascadeProfile] = MappingProxyType({DM_V1.key: DM_V1})
+# Публичный ответ в ветке комментариев. Отличается от ЛС на обоих концах каскада.
+#
+# **L0.** Обе проверки сняты, и это главное различие. Цель здесь — сообщение, а не
+# человек, поэтому автопересылка поста канала и пост анонимного админа перестают быть
+# мусором: под ними как раз и отвечают. Для ЛС они бесполезны — писать некому.
+#
+# **L3.** Продавец и «отвечает другому» перестают быть отказом: публично поправить
+# продавца по существу нормально, а реплика в адрес чужого ответа описывает половину
+# полезных комментариев. Взамен включены три наблюдения, которых у ЛС нет вовсе —
+# уже отвеченный вопрос, ссора в ветке и вопрос, на который коротко не ответить.
+#
+# **Что осталось общим.** Боли, эталоны L2 и пороги: бизнес один, и ищем мы тех же
+# людей с теми же проблемами. Разное — что мы с ними делаем.
+PUBLIC_V1 = CascadeProfile(
+    key="public_v1",
+    title="Публичные ответы",
+    drop_automatic_forward=False,
+    require_author=False,
+    l3_prompt_key="public_v1",
+    l3_reject_seller=False,
+    l3_reject_answering_someone_else=False,
+    l3_reject_already_answered=True,
+    l3_reject_fight=True,
+    l3_reject_unanswerable=True,
+)
+
+PROFILES: Mapping[str, CascadeProfile] = MappingProxyType({DM_V1.key: DM_V1,
+                                                           PUBLIC_V1.key: PUBLIC_V1})
 
 DEFAULT_PROFILE = DM_V1.key
 
@@ -404,6 +440,19 @@ def level3(llm: dict, *, profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
         return False, f"модель: автор сам оказывает такие услуги{tail}"
     if answering and profile.l3_reject_answering_someone_else:
         return False, f"модель: автор помогает другому, проблема не его{tail}"
+
+    # Наблюдения публичного контура. У личного сообщения таких способов промахнуться
+    # нет: неудачное ЛС игнорируют, неудачный публичный ответ удаляют.
+    if llm.get("already_answered") and profile.l3_reject_already_answered:
+        return False, f"модель: в ветке уже дан верный ответ{tail}"
+    if llm.get("thread_is_a_fight") and profile.l3_reject_fight:
+        return False, f"модель: в ветке ссора, входить в неё не стоит{tail}"
+    # Сравнение именно с `False`, а не «ложное значение»: отсутствие ключа означает,
+    # что вопрос такого наблюдения не запрашивал, и это не то же самое, что «ответить
+    # коротко нельзя». Иначе профиль отсеивал бы всё, что пришло из чужого промпта.
+    if llm.get("answerable_briefly") is False and profile.l3_reject_unanswerable:
+        return False, f"модель: коротко и по существу не ответить{tail}"
+
     return True, f"модель: настоящая проблема автора{tail}"
 
 
