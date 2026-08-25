@@ -67,9 +67,14 @@ CRITIC_NOTE = ("Проверки моделью не было: вариант с
                "(prompt_version=template-v0). Читайте текст сами.")
 
 
-def _spam_score(text: str) -> float:
+def spam_score(text: str) -> float:
     """Грубая оценка «похоже на рекламу». Считается по признакам, которые видно
-    глазом, — иначе число выглядело бы как вывод модели, которой здесь нет."""
+    глазом, — иначе число выглядело бы как вывод модели, которой здесь нет.
+
+    Имя публичное: той же оценкой пользуется генератор черновиков по целям сценариев
+    (`wf_drafting`). Своя копия этой арифметики означала бы, что один и тот же текст
+    получает разные оценки в двух очередях.
+    """
     score = 0.10
     lowered = text.lower()
     if any(w in lowered for w in ("гарантия", "под ключ", "недорого", "прямо сейчас")):
@@ -87,7 +92,7 @@ def build_variants(pain: str | None) -> list[dict]:
     texts = TEMPLATES.get(pain or "", FALLBACK)
     out = []
     for t in texts:
-        spam = _spam_score(t)
+        spam = spam_score(t)
         out.append({
             "text": t, "spam_score": spam, "prompt_version": PROMPT_VERSION,
             # Линтер политики — настоящая проверка, в отличие от «критика»:
@@ -124,6 +129,24 @@ async def thread_context(db, message: Message, *, around: int = 2) -> list[dict]
     return out
 
 
+def message_link(channel: Channel, message: Message) -> str | None:
+    """Ссылка на исходное сообщение — чтобы ревьюер открыл ветку, а не верил цитате.
+
+    Вынесено из `ensure_draft`, потому что тем же самым занят генератор черновиков
+    по целям сценариев (`wf_drafting`). Две копии этой арифметики разошлись бы на
+    первой же правке, и разошлись бы молча: ссылка ведёт «куда-то», и что она ведёт
+    не туда, видно только человеку, который по ней пошёл.
+    """
+    if channel.username:
+        return f"https://t.me/{channel.username}/{message.tg_message_id}"
+    if channel.peer_id:
+        # Внутренняя ссылка для приватных супергрупп: -100 в начале peer_id — префикс
+        # канала, в t.me-ссылке его нет.
+        return (f"https://t.me/c/{str(channel.peer_id).replace('-100', '', 1)}"
+                f"/{message.tg_message_id}")
+    return None
+
+
 async def ensure_draft(db, lead: Lead) -> Draft:
     """Черновик по лиду — ровно один, создаётся при первом обращении к очереди."""
     draft = (await db.execute(
@@ -136,13 +159,7 @@ async def ensure_draft(db, lead: Lead) -> Draft:
     channel = (await db.execute(
         select(Channel).where(Channel.id == lead.channel_id))).scalar_one()
 
-    link = None
-    if channel.username:
-        link = f"https://t.me/{channel.username}/{message.tg_message_id}"
-    elif channel.peer_id:
-        # Внутренняя ссылка для приватных супергрупп: -100 в начале peer_id — префикс
-        # канала, в t.me-ссылке его нет.
-        link = f"https://t.me/c/{str(channel.peer_id).replace('-100', '', 1)}/{message.tg_message_id}"
+    link = message_link(channel, message)
 
     draft = Draft(
         lead_id=lead.id, variants=build_variants(lead.pain),

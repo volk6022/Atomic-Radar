@@ -28,7 +28,9 @@ async def main() -> None:
     ap.add_argument("--no-l2", action="store_true", help="не трогать эмбеддинги")
     ap.add_argument("--no-l3", action="store_true", help="не ходить в модель")
     ap.add_argument("--l3-limit", type=int, default=None,
-                    help="разобрать моделью не больше N сообщений за прогон")
+                    help="задать модели не больше N вопросов за прогон; вопросов, а не "
+                         "сообщений — у каждого сценария на L3 свой промпт, и при двух "
+                         "контурах N вопросов покрывают вдвое меньше сообщений")
     ap.add_argument("--scope", choices=reclassify.SCOPES, default="all",
                     help="all — все сообщения, pending — только недосчитанные")
     args = ap.parse_args()
