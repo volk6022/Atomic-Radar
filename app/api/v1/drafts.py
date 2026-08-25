@@ -48,7 +48,12 @@ REASONS = [
     {"n": 8, "label": "Ссылка в первом сообщении"},
     {"n": 9, "label": "Другое"},
 ]
-_REASON_BY_N = {r["n"]: r["label"] for r in REASONS}
+# Публичное имя: справочник причин один на все сценарии, и контур публичных ответов
+# берёт его отсюда же (`wf_queues`). Формулировки написаны под личные сообщения —
+# «не тот человек» у публичной цели читается натянуто. Оставлены как есть намеренно:
+# менять справочник до первых живых публичных ответов значит гадать, а старые причины
+# уже проставлены у разобранных черновиков и переименование сделало бы их нечитаемыми.
+REASON_BY_N = {r["n"]: r["label"] for r in REASONS}
 
 
 async def _ensure_queue(db) -> int:
@@ -447,7 +452,7 @@ async def reject(draft_id: int, body: RejectRequest, request: Request, db: GetDB
                  user=permits(Section.DRAFTS, Capability.DRAFT_DECIDE)):
     """Отклонить с типизированной причиной из закрытого справочника."""
     draft = await _draft_for_decision(db, draft_id)
-    label = _REASON_BY_N.get(body.reason_n)
+    label = REASON_BY_N.get(body.reason_n)
     if label is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             f"причина {body.reason_n} отсутствует в справочнике")

@@ -107,6 +107,12 @@ async def _seed() -> dict:
                       passed=True, detail={"l3": "модель: вопрос по теме"},
                       pain="не может настроить сам", score=55, score_breakdown=[],
                       disqualifiers=[], computed_at=NOW),
+            # Вердикт «в пути»: ступень включена, вход ещё не посчитан. Нужен, чтобы
+            # «ждёт обработки» было чем отличить от «сценарий сюда не доходил» —
+            # у `msg_none` в этом же сценарии вердикта нет вовсе.
+            WfVerdict(workflow_id=public.id, message_id=neither.id, level=2,
+                      passed=None, detail={}, pain=None, score=None,
+                      score_breakdown=[], disqualifiers=[], computed_at=None),
         ])
 
         db.add_all([
@@ -335,6 +341,40 @@ def test_stream_filter_by_verdict(authed):
     assert rejected["total"] == 1
 
 
+def test_waiting_is_not_the_same_as_never_reached(authed, seeded):
+    """Разница, ради которой заведено четвёртое состояние, — и место, где она стёрлась.
+
+    После внешнего соединения у сообщения без вердикта все колонки `wf_verdicts`
+    равны NULL, поэтому голое `passed IS NULL` ловит оба состояния разом. Пока фильтр
+    был написан так, «ждёт обработки» показывал очередь вместе со всем нетронутым
+    остатком — то есть отвечал «конвейер стоит» там, где конвейер просто не начинал.
+
+    В контуре ЛС очереди нет ни одной, зато есть сообщение, до которого он не дошёл;
+    в публичном — ровно наоборот. Один сценарий такую подмену не поймал бы.
+    """
+    dm_waiting = authed.get("/api/v1/workflows/cold_dm/stream?passed=pending").json()
+    assert dm_waiting["total"] == 0
+
+    dm_untouched = authed.get(
+        "/api/v1/workflows/cold_dm/stream?passed=uncomputed").json()
+    assert dm_untouched["total"] == 1
+    assert dm_untouched["rows"][0]["id"] == seeded["msg_none_tg"]
+    assert dm_untouched["rows"][0]["computed"] is False
+
+    pub_waiting = authed.get(
+        "/api/v1/workflows/public_reply/stream?passed=pending").json()
+    assert pub_waiting["total"] == 1
+    assert pub_waiting["rows"][0]["computed"] is True
+
+    assert authed.get(
+        "/api/v1/workflows/public_reply/stream?passed=uncomputed").json()["total"] == 0
+
+
+def test_unknown_stream_filter_is_rejected_not_ignored(authed):
+    r = authed.get("/api/v1/workflows/cold_dm/stream?passed=maybe")
+    assert r.status_code == 422
+
+
 # ── черновики ─────────────────────────────────────────────────────────────────
 
 def test_drafts_queue_is_built_lazily_on_first_read(authed):
@@ -374,8 +414,8 @@ def test_public_and_dm_drafts_differ_in_substance(authed):
 def test_draft_by_id_carries_the_thread(authed):
     listed = authed.get("/api/v1/workflows/public_reply/drafts").json()["rows"][0]
     one = authed.get(
-        f"/api/v1/workflows/public_reply/drafts/{listed['id']}").json()
-    assert one["thread_context"]
+        f"/api/v1/workflows/public_reply/drafts/{listed['id']}").json()["draft"]
+    assert one["thread"]
     assert one["action"] == "reply"
     assert one["addressing"]["kind"] == "message"
 
@@ -398,3 +438,89 @@ def test_reading_the_queue_moves_targets_into_review(authed):
               authed.get("/api/v1/workflows/public_reply/targets").json()["states"]}
     assert states["new"] == 0
     assert states["in_review"] == 2
+
+
+# ── курсор очереди ────────────────────────────────────────────────────────────
+
+def test_next_is_a_route_and_not_a_draft_id(authed):
+    """Литеральный путь после параметризованного перехватывается им и начинает
+    отвечать «422, это не число». В старой очереди так уже уезжал `/reasons`."""
+    r = authed.get("/api/v1/workflows/public_reply/drafts/next")
+    assert r.status_code == 200
+    assert "draft" in r.json()
+
+
+def test_next_builds_the_queue_the_same_way_the_list_does(authed):
+    """Курсор — второй вход в ту же очередь, и заготовки он обязан заводить так же.
+    Иначе экран, открытый сразу карточкой, показал бы пустоту там, где список
+    показывает работу."""
+    first = authed.get("/api/v1/workflows/public_reply/drafts/next").json()
+    assert first["remaining"] == 2
+    assert first["draft"] is not None
+    assert first["draft"]["action"] == "reply"
+
+
+def test_next_walks_forward_and_wraps_around(authed):
+    """Дойдя до конца, курсор заворачивается на начало — так же ведёт себя стрелка
+    в старой очереди."""
+    first = authed.get("/api/v1/workflows/public_reply/drafts/next").json()["draft"]
+    second = authed.get(
+        f"/api/v1/workflows/public_reply/drafts/next?after={first['id']}"
+    ).json()["draft"]
+    assert second["id"] != first["id"]
+
+    wrapped = authed.get(
+        f"/api/v1/workflows/public_reply/drafts/next?after={second['id']}"
+    ).json()["draft"]
+    assert wrapped["id"] == first["id"]
+
+
+def test_next_counts_only_this_workflow(authed):
+    """«Осталось» в блоке сценария — про этот блок. Сумма по всем конвейерам
+    означала бы, что разбор чужой очереди уменьшает твою."""
+    authed.get("/api/v1/workflows/public_reply/drafts")
+    assert authed.get(
+        "/api/v1/workflows/cold_dm/drafts/next").json()["remaining"] == 1
+
+
+def test_next_of_another_workflow_never_leaks_across(authed):
+    authed.get("/api/v1/workflows/public_reply/drafts")
+    dm_ids = {r["id"] for r in
+              authed.get("/api/v1/workflows/cold_dm/drafts").json()["rows"]}
+    seen = set()
+    after = None
+    for _ in range(4):
+        q = "" if after is None else f"?after={after}"
+        d = authed.get(f"/api/v1/workflows/public_reply/drafts/next{q}").json()["draft"]
+        seen.add(d["id"])
+        after = d["id"]
+    assert seen & dm_ids == set()
+
+
+def test_next_returns_null_not_404_when_the_slice_is_empty(authed):
+    """Разобранная очередь — нормальное состояние экрана, а не ошибка запроса."""
+    r = authed.get("/api/v1/workflows/public_reply/drafts/next?state=approved")
+    assert r.status_code == 200
+    assert r.json()["draft"] is None
+    assert r.json()["remaining"] == 0
+
+
+def test_next_accepts_all_and_rejects_nonsense(authed):
+    assert authed.get(
+        "/api/v1/workflows/public_reply/drafts/next?state=all").status_code == 200
+    assert authed.get(
+        "/api/v1/workflows/public_reply/drafts/next?state=что-нибудь").status_code == 422
+
+
+def test_next_of_an_unknown_workflow_is_404(authed):
+    assert authed.get(
+        "/api/v1/workflows/нет-такого/drafts/next").status_code == 404
+
+
+def test_next_and_direct_link_describe_the_draft_identically(authed):
+    """Одна форма на оба входа: иначе карточка, открытая из таблицы, отличалась бы
+    от той же карточки, до которой дошли стрелкой."""
+    cursor = authed.get("/api/v1/workflows/public_reply/drafts/next").json()["draft"]
+    direct = authed.get(
+        f"/api/v1/workflows/public_reply/drafts/{cursor['id']}").json()["draft"]
+    assert cursor == direct

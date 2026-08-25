@@ -250,7 +250,11 @@ async def seed() -> None:
             engage_instance_id=instance.id,
             engage_use_case="public_reply",
             cascade_profile="public_v1",
-            sort_order=5,
+            # Строго больше, чем у `cold_dm`. Из этого поля строится порядок блоков
+            # в сайдбаре (SPEC §9.1), и меньшее значение поднимало публичный контур
+            # над личным — контур, который ещё ни разу не отправлял, оказывался
+            # первым, что человек видит при входе.
+            sort_order=20,
             is_active=True,
         )
         db.add(wf_public_reply)
