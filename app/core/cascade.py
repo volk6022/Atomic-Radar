@@ -592,3 +592,31 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
     ok3, why3 = level3(llm, profile=profile)
     detail["l3"] = why3
     return _scored(3, ok3, pain)
+
+
+def stage_flags(level: int | None, passed: bool | None) -> dict[str, bool | None]:
+    """Вердикт по каждой ступени отдельно из пары (уровень, итог).
+
+    В базе лежат два поля на весь каскад, а экран рисует четыре галочки, и правило
+    перевода одно на всё приложение:
+
+    * `passed is None` — сообщение **в пути**: все ступени до `level` включительно
+      пройдены, следующая ещё не отвечала;
+    * `passed is False` — ступень `level` отбраковала, всё до неё пройдено;
+    * `passed is True` — пройдено всё по `level` включительно.
+
+    Ступени выше `level` во всех случаях `None` — «не дошло». Разница между «не
+    дошло» и «не прошло» и есть то, ради чего экран потока существует, поэтому она
+    считается здесь один раз, а не додумывается на клиенте.
+
+    Живёт в ядре каскада, а не в модуле экранов, с тех пор как экранов потока стало
+    два: общий по старым колонкам и по каждому сценарию из `wf_verdicts`. Трёхзначный
+    `passed` — инвариант каскада, и две копии его толкования разошлись бы молча:
+    расхождение видно только как галочка не того цвета.
+    """
+    if level is None:
+        return {f"l{k}": None for k in range(4)}
+    decided_through = level if passed is not False else level - 1
+    return {f"l{k}": True if k <= decided_through
+            else (False if k == level else None)
+            for k in range(4)}

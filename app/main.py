@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, runs,
-                        screens, system)
+                        screens, system, wf_queues)
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
 # первый, и `include_router` уходит в модуль сервисов.
 from app.api.v1 import workflows as workflows_api
@@ -88,6 +88,9 @@ def create_app() -> FastAPI:
     app.include_router(runs.router)
     app.include_router(screens.router)
     app.include_router(workflows_api.router)
+    # Данные сценария отдельным роутером: у реестра выше права намеренно слабые
+    # (меню рисуется до входа в раздел), а здесь — матрица на каждой ручке.
+    app.include_router(wf_queues.router)
 
     @app.get("/api/v1/health")
     async def health():
