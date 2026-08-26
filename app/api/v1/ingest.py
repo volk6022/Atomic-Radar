@@ -26,11 +26,14 @@
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import logging
+from collections.abc import Mapping
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -38,7 +41,7 @@ from app.api.deps import GetDB, requires
 from app.core.access import Section
 from app.core.config import get_settings
 from app.db.models import Channel, Message
-from app.services import engage, ingest as ingest_service, jobs
+from app.services import alerts, engage, ingest as ingest_service, jobs, queue
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,12 @@ def _webhook_url(**params) -> str:
 
 def _check_token(token: str) -> None:
     expected = get_settings().INGEST_TOKEN
-    if not expected or not hmac.compare_digest(token, expected):
+    # Сравниваем байты, а не строки. `compare_digest` на строках требует, чтобы обе
+    # были ASCII, и на кириллице в пути роняет `TypeError` — то есть `500` вместо
+    # `404`, да ещё и по-разному на «не тот токен» и «не тот алфавит». Токен приходит
+    # из URL, значит там может быть что угодно.
+    if not expected or not hmac.compare_digest(token.encode("utf-8"),
+                                               expected.encode("utf-8")):
         # 404, а не 403: не подтверждаем существование ручки тому, кто не знает токен.
         raise HTTPException(404, "not found")
 
@@ -74,13 +82,75 @@ def _check_token(token: str) -> None:
 # ── приём ─────────────────────────────────────────────────────────────────────
 
 @router.post("/{token}")
-async def receive(token: str, request: Request, db: GetDB):
-    """Единая точка приёма всех событий Engage."""
+async def receive(token: str, request: Request, response: Response, db: GetDB):
+    """Единая точка приёма всех событий Engage.
+
+    С включённой очередью ручка делает ровно две вещи: проверяет секрет и ставит
+    событие в очередь. Разбор — дело воркера, и ответ `202` честно говорит «принято»,
+    а не «сделано».
+
+    Зачем так. Разбор внутри запроса держит соединение Engage на всё время работы с
+    базой и моделями, а тяжёлый прогон конкурирует за event loop с ручками интерфейса
+    в том же процессе. Сверх того, работа, живущая в памяти процесса API, умирает
+    вместе с ним — ровно та беда, из-за которой прогоны сейчас помечаются
+    «прерванными» при каждом рестарте.
+
+    **Очередь выключена — старое поведение целиком.** Не «деградация»: на стенде и в
+    тестах Redis не нужен и не должен быть нужен, а разбор в запросе там ничему не
+    мешает. Обе ветки зовут один и тот же `process_event`, чтобы поведение не могло
+    разъехаться между ними.
+
+    **Очередь включена и не отвечает — `503` и тревога.** Разбирать в обход очереди
+    в этом случае было бы худшим из решений: под упавшим Redis система тихо
+    вернулась бы к тому поведению, от которого уходит, и никто бы не заметил.
+
+    Отказ при этом не означает потерю. Отправитель считает удачей всё, что меньше
+    `400` (`webhook_sender.py:41`), поэтому `202` он примет, а `503` перевезёт в
+    повторы — их у него пять (`MAX_ATTEMPTS`). Короткая недоступность очереди
+    закрывается ими и не доходит до данных. Вторая сеть — бэкфилл: он перечитывает
+    историю канала, и сообщение, пропущенное после всех пяти попыток, приезжает
+    следующим проходом. Сеть третьей не предусмотрено намеренно: журнал принятых, но
+    не разобранных событий был бы четвёртым местом, где живёт правда о сообщениях.
+    """
     _check_token(token)
 
     body = await request.json()
+    q = dict(request.query_params)
+
+    if queue.enabled():
+        try:
+            job = await queue.enqueue(queue.INGEST_EVENT, body, q, _job_id=_event_id(body, q))
+        except queue.QueueUnavailable as e:
+            await alerts.emit(
+                db, key="ingest_queue_down", severity="error",
+                text=f"Очередь приёма не отвечает, события Engage не разбираются: {e}")
+            await db.commit()
+            raise HTTPException(503, "очередь приёма недоступна") from e
+        response.status_code = 202
+        return {"queued": job or "duplicate"}
+
+    return await process_event(db, body, q)
+
+
+def _event_id(body: dict, q: Mapping[str, str]) -> str:
+    """Устойчивый ключ события — чтобы повторная доставка не разбиралась дважды.
+
+    Считается по содержимому, а не по времени: Engage ретраит доставку при неудачном
+    ответе, и один и тот же вебхук может приехать несколько раз. Разбор идемпотентен и
+    сам по себе (сообщения кладутся upsert-ом), так что это не единственная защита, а
+    вторая — и заодно экономия работы.
+    """
+    payload = json.dumps([body, sorted(q.items())], sort_keys=True, ensure_ascii=False)
+    return "ingest:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
+    """Разбор одного события Engage. Зовётся из ручки и из воркера — один и тот же код.
+
+    Держит `db` параметром, а не берёт сессию сам: в ручке транзакция уже открыта
+    зависимостью, а воркер открывает свою. Кто открыл — тот и закрывает.
+    """
     event = body.get("event")
-    q = request.query_params
 
     if event == "incoming_message":
         result = await ingest_service.ingest_incoming_message(db, body)

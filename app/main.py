@@ -16,7 +16,7 @@ from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
 from app.db.session import get_engine, get_session_maker
-from app.services import engage, engage_registry, jobs, workflows
+from app.services import engage, engage_registry, jobs, queue, workflows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
     logger.info("radar_started mode_default=%s", settings.DEFAULT_MODE)
     yield
     await engage.close()
+    await queue.close()
     logger.info("radar_stopping")
 
 

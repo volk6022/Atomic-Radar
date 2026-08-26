@@ -9,7 +9,8 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir \
       "fastapi>=0.115" "uvicorn[standard]>=0.32" "sqlalchemy[asyncio]>=2.0" \
       "asyncpg>=0.30" "alembic>=1.14" "pydantic>=2.9" "pydantic-settings>=2.6" \
-      "argon2-cffi>=23.1" "pyotp>=2.9" "itsdangerous>=2.2" "httpx>=0.27"
+      "argon2-cffi>=23.1" "pyotp>=2.9" "itsdangerous>=2.2" "httpx>=0.27" \
+      "arq>=0.26"
 
 COPY app ./app
 COPY scripts ./scripts

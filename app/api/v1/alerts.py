@@ -20,7 +20,7 @@ from app.api.v1.system import get_state
 from app.core import clock
 from app.core.access import Capability, Section
 from app.db.models import Alert, AuditLog, Message
-from app.services import embeddings, llm
+from app.services import embeddings, llm, queue
 
 logger = logging.getLogger("radar")
 
@@ -58,6 +58,16 @@ async def _states(db) -> list[dict]:
                         "created_at": None,
                         "text": f"{what} недоступен: {ok}. Сообщения копятся "
                                 f"необработанными"})
+
+    # Очередь молчит иначе, чем модели: те задерживают обработку, а эта заворачивает
+    # приём отказом — события Engage не доезжают вовсе. Поэтому формулировка называет
+    # и то, чем это лечится: бэкфилл перечитает пропущенное, когда очередь оживёт.
+    q = await queue.ping()
+    if q not in ("ok", "off"):
+        out.append({"id": "state:queue", "severity": "error", "ack": False,
+                    "created_at": None,
+                    "text": f"Очередь приёма недоступна: {q}. События Engage "
+                            f"отклоняются; пропущенное доберётся бэкфиллом"})
 
     pending = (await db.execute(select(func.count(Message.id))
                                 .where(Message.cascade_passed.is_(None)))).scalar_one()

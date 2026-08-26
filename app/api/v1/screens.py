@@ -36,7 +36,7 @@ from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
                            Lead, LlmTrace, Message, OutboundAttempt,
                            ProfileVersion, User)
-from app.services import drafting, embeddings, engage, llm
+from app.services import drafting, embeddings, engage, llm, queue
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
 
@@ -118,8 +118,8 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
         except engage.EngageUnavailable:
             return "down"
 
-    engage_status, embed_status, llm_status = await asyncio.gather(
-        _engage_status(), embeddings.ping(), llm.ping())
+    engage_status, embed_status, llm_status, queue_status = await asyncio.gather(
+        _engage_status(), embeddings.ping(), llm.ping(), queue.ping())
 
     return {
         "tiles": [
@@ -166,6 +166,7 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
             {"name": "postgres", "status": "ok"},
             {"name": "embeddings", "status": embed_status},
             {"name": "llm", "status": llm_status},
+            {"name": "queue", "status": queue_status},
         ],
     }
 
