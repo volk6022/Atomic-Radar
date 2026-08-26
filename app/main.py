@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, runs,
                         screens, system, wf_queues)
+# Псевдоним по той же причине, что и у сценариев ниже: рядом живёт `app.services.events`.
+from app.api.v1 import events as events_api
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
 # первый, и `include_router` уходит в модуль сервисов.
 from app.api.v1 import workflows as workflows_api
@@ -93,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(ingest.operator_router)
     app.include_router(alerts.router)
+    app.include_router(events_api.router)
     app.include_router(leads.router)
     app.include_router(manual_sends.router)
     app.include_router(runs.router)
