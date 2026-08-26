@@ -103,6 +103,11 @@ async def start_run(body: StartRequest, request: Request, db: GetDB,
     Право проверяется по виду задачи, а не одно на всю ручку: у «дочитать историю» и
     «пересчитать всё» разная цена и разные роли, и объединять их в одно разрешение
     значило бы выдать заказчику видеокарту вместе с бэкфиллом.
+
+    Ответ приходит сразу и означает «задача заведена», а не «посчитано»: с включённой
+    очередью прогон идёт в воркере, ход виден в этом же разделе. Недоступная очередь —
+    `503`: строка при этом уже помечена упавшей, и повторить запуск можно кнопкой,
+    когда очередь вернётся.
     """
     from app.core.access import allows  # локально: иначе цикл импорта через deps
 
@@ -137,6 +142,11 @@ async def start_run(body: StartRequest, request: Request, db: GetDB,
         raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
     except jobs.JobUnknown as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+    except jobs.JobQueueDown as e:
+        # 503, а не 500: это не ошибка в запросе и не поломка в коде, а отсутствующая
+        # сейчас ступень. Человеку нужно знать, что повторить попытку имеет смысл, —
+        # `500` сказал бы ровно обратное и отправил бы искать несуществующий баг.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
 
     db.add(AuditLog(
         user_id=user.id, user_email=user.email, action="run_start",

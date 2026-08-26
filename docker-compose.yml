@@ -110,6 +110,49 @@ services:
       RADAR_DEBUG: "false"
     networks: [radar_network, engage_vertsanov]
 
+  worker-jobs:
+    # Тот же образ, та же причина, что у воркера приёма: разойдись код между
+    # процессами — и прогон считал бы каскадом не то, что показывает интерфейс.
+    build: .
+    image: atomic-radar:latest
+    # Имя закреплено, и это не косметика. Воркер прогонов на старте помечает
+    # прерванными строки в «выполняется» (`app/workers/jobs.py`, `startup`), а такая
+    # пометка честна ровно пока исполнитель один: второй, поднявшись рядом, оборвал бы
+    # на экране чужую живую работу. `container_name` не даёт поднять реплики
+    # (`docker compose up --scale` откажет), то есть закрепляет допущение техникой,
+    # а не памятью о нём.
+    container_name: worker-jobs-radar
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      # И от API — не ради очерёдности запуска, а ради схемы. Таблицы создаёт и
+      # доводит миграциями только он (`app/main.py`, `lifespan`); воркер этого не
+      # делает и делать не должен — два процесса, накатывающих схему наперегонки,
+      # хуже одного. Поднявшись первым на свежей базе, воркер упал бы на первом же
+      # обращении к `runs`, а при `max_tries: 1` повтора у него нет.
+      api: {condition: service_healthy}
+    command: ["arq", "app.workers.jobs.WorkerSettings"]
+    environment:
+      RADAR_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RADAR_REDIS_URL: redis://redis:6379/0
+      # Ключ подписи воркеру не нужен для работы, но `validate_runtime()` на старте
+      # требует его у любого процесса: настройки одни на всех, и процесс, поднятый с
+      # половиной окружения, должен падать сразу, а не на первой задаче.
+      RADAR_SECRET_KEY: ${RADAR_SECRET_KEY}
+      # Ступени каскада — здесь они и работают: пересчёт ходит в bge-m3 и в Qwen.
+      # Пустое значение означает «ступень выключена», и прогон честно пишет это в лог
+      # вместо того, чтобы молча пропустить сообщения дальше. Разойдись эти адреса с
+      # адресами API — интерфейс показывал бы включённой ступень, которой у
+      # исполнителя нет.
+      RADAR_EMBED_BASE_URL: ${RADAR_EMBED_BASE_URL:-}
+      RADAR_LLM_BASE_URL: ${RADAR_LLM_BASE_URL:-}
+      RADAR_LLM_MODEL: ${RADAR_LLM_MODEL:-qwen-local}
+      RADAR_DEBUG: "false"
+    # Сеть Engage не подключается намеренно: прогон в Telegram не ходит. Лишний
+    # интерфейс у процесса — это доступ, о котором никто не просил.
+    networks: [radar_network]
+
 volumes:
   radar_pgdata:
   radar_redis:

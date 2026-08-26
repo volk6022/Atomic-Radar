@@ -39,9 +39,18 @@ async def lifespan(app: FastAPI):
         # Задачи, пережившие смерть процесса, честно помечаем прерванными: иначе
         # строка навсегда останется в «выполняется» с прогрессом, который уже
         # никогда не сдвинется.
-        stale = await jobs.mark_interrupted()
-        if stale:
-            logger.warning("jobs_interrupted_on_start count=%s", stale)
+        #
+        # Но только когда прогоны идут здесь. С включённой очередью они живут в
+        # воркере, которого наш рестарт не касается: пометка отсюда оборвала бы на
+        # экране работу, идущую прямо сейчас, и заодно отпустила бы `active_run` —
+        # оператор запустил бы вторую переклассификацию поверх первой, обе на одной
+        # видеокарте. Метит их воркер на своём старте (`app/workers/jobs.py`).
+        if queue.enabled():
+            logger.info("jobs_interrupt_sweep_left_to_worker")
+        else:
+            stale = await jobs.mark_interrupted()
+            if stale:
+                logger.warning("jobs_interrupted_on_start count=%s", stale)
 
         # Реестр инстансов Engage. Заводим строку из настроек процесса, если реестр
         # пуст, — так уже работающая установка переживает выкатку без ручного шага.

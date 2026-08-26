@@ -132,6 +132,57 @@ def test_backfill_has_no_in_process_runner():
     assert "backfill" not in jobs.RUNNERS
 
 
+# ── очередь: развилка, которая не должна разъехаться ──────────────────────────
+
+def test_the_sweep_defaults_to_both_active_states():
+    """Умолчание — для того, кто владеет и «в очереди», и «выполняется», то есть для
+    API без очереди. Сужает его только воркер, и делает это явно."""
+    import inspect
+    sig = inspect.signature(jobs.mark_interrupted)
+    assert sig.parameters["statuses"].default == jobs.ACTIVE
+
+
+def test_a_dead_queue_is_its_own_kind_of_refusal():
+    """«Занято» проходит само, «очередь не отвечает» требует человека, и ответы у них
+    разные: `409` против `503`. Одно исключение на оба случая заставило бы ручку
+    гадать по тексту сообщения."""
+    assert issubclass(jobs.JobQueueDown, Exception)
+    assert not issubclass(jobs.JobQueueDown, jobs.JobBusy)
+    assert runs_api.status.HTTP_503_SERVICE_UNAVAILABLE == 503
+
+
+async def test_cancel_skips_process_memory_when_the_run_lives_elsewhere(monkeypatch):
+    """Флаг в базе работает всегда, кэш в памяти — только пока прогон здесь.
+
+    При включённой очереди запись в кэш не просто бесполезна: снять её некому
+    (это делает сам прогон, то есть процесс воркера), и словарь копил бы по записи
+    на каждую отмену до самого рестарта API.
+    """
+    from unittest.mock import AsyncMock
+
+    from app.services import queue
+
+    class _Row:
+        id = 77
+        cancel_requested = False
+
+    monkeypatch.setattr(queue, "enabled", lambda: True)
+    jobs._CANCEL_CACHE.clear()
+    row = _Row()
+    db = AsyncMock()
+
+    await jobs.request_cancel(db, row)
+
+    assert row.cancel_requested is True
+    db.commit.assert_awaited()
+    assert jobs._CANCEL_CACHE == {}
+
+    monkeypatch.setattr(queue, "enabled", lambda: False)
+    await jobs.request_cancel(db, row)
+    assert jobs._CANCEL_CACHE == {77: True}
+    jobs._CANCEL_CACHE.clear()
+
+
 # ── тревоги ───────────────────────────────────────────────────────────────────
 
 def test_alert_severities_are_closed():

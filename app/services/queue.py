@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # живут в разных процессах, и опечатка в имени с одной стороны выглядит как молчаливо
 # пропавшая работа — задача ставится, исполнителя для неё нет.
 INGEST_EVENT = "ingest_event"
+RUN_JOB = "run_job"
 
 _pool: Any = None
 _lock = asyncio.Lock()
