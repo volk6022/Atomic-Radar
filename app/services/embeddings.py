@@ -70,11 +70,21 @@ async def ping() -> str:
     return "ok" if r.status_code < 400 else f"ответ {r.status_code}"
 
 
+# Сколько символов текста уходит в эмбеддер. Ограничение не наше, а сервера: bge-m3
+# поднят с физической пачкой в 512 токенов, и текст длиннее её llama.cpp не берёт
+# вовсе — отвечает 500 на весь запрос. 28.08 на этом оборвалась переклассификация
+# всего прода: одно сообщение на 535 токенов уронило прогон по 16 тысячам.
+# Тысяча символов русского — это 350–450 токенов, то есть с запасом. Для ближайшего
+# эталона хвост длинного сообщения всё равно ничего не решает: тема видна по началу.
+EMBED_TEXT_LIMIT = 1000
+
+
 async def embed(texts: list[str]) -> list[list[float]]:
     """Векторы для списка текстов. Порядок ответа совпадает с порядком запроса."""
     if not texts:
         return []
     s = get_settings()
+    texts = [t[:EMBED_TEXT_LIMIT] for t in texts]
     out: list[list[float]] = []
     for start in range(0, len(texts), s.EMBED_BATCH):
         chunk = texts[start:start + s.EMBED_BATCH]
