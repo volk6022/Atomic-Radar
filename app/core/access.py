@@ -29,6 +29,7 @@ class Section(StrEnum):
     LEADS = "leads"
     DRAFTS = "drafts"
     CONVERSATIONS = "conversations"
+    ACTIVITY = "activity"
     MANUAL_SENDS = "manual_sends"
     PROFILE = "profile"
     RUNS = "runs"
@@ -51,6 +52,12 @@ ACCESS: dict[Section, frozenset[Role]] = {
     Section.LEADS: _STAFF,
     Section.DRAFTS: _STAFF,
     Section.CONVERSATIONS: _STAFF,
+    # Активность — то же самое, что «Переписки», но для сценариев, где переписки не
+    # бывает: у публичного ответа и реакции есть только лента того, что ушло. Роли
+    # поэтому те же, что у переписок, и по той же причине: это внутренняя кухня, а не
+    # витрина. Гостю её видно быть не должно — иначе он через блок публичного сценария
+    # увидел бы ровно то, что ему закрыто в блоке личных сообщений.
+    Section.ACTIVITY: _STAFF,
     # Отправляет руками заказчик, а разборщик видит, что именно ушло, и с чем это
     # расходится с предложенным. Гостю здесь делать нечего: это внутренняя кухня.
     Section.MANUAL_SENDS: _STAFF,

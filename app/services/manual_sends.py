@@ -219,6 +219,22 @@ def correct(entry: ManualSend, fields: dict) -> list[str]:
     return changed
 
 
+def matches_suggestion(entry: ManualSend) -> bool:
+    """Совпало ли отправленное с тем, что предлагал Radar.
+
+    Отдельной функцией, а не выражением по месту: это же сравнение спрашивает лента
+    активности сценария, и вторая копия начала бы расходиться в мелочи — например, в
+    том, обрезаются ли пробелы. Расхождение здесь читалось бы как «одна и та же
+    запись в двух таблицах то совпадает с подсказкой, то нет».
+
+    Записи без снимка (написали тому, кого Radar не находил) — не совпадение, а
+    отсутствие второй половины пары; отдельного состояния под это нет намеренно:
+    считать «предложенного не было» совпадением значит завысить долю попаданий.
+    """
+    return (entry.suggested_text is not None
+            and entry.text.strip() == entry.suggested_text.strip())
+
+
 def describe(entry: ManualSend, *, target: WfTarget | None = None,
              message: Message | None = None, channel: Channel | None = None) -> dict:
     """Запись для экрана. Пара «предложено → отправлено» рядом, а не в разных местах —
@@ -231,8 +247,7 @@ def describe(entry: ManualSend, *, target: WfTarget | None = None,
         "engage_account_id": entry.engage_account_id,
         "text": entry.text,
         "suggested_text": entry.suggested_text,
-        "matches_suggestion": (entry.suggested_text is not None
-                               and entry.text.strip() == entry.suggested_text.strip()),
+        "matches_suggestion": matches_suggestion(entry),
         "note": entry.note,
         "sent_at": entry.sent_at.isoformat() if entry.sent_at else None,
         "recorded_by": entry.recorded_by,

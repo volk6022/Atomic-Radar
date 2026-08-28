@@ -34,10 +34,11 @@
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import Date, cast, func, literal_column, select
 
 from app.api.deps import CurrentUser, GetDB, permits, requires
 from app.api.v1.drafts import REASON_BY_N
@@ -47,9 +48,10 @@ from app.api.v1.system import current_mode
 from app.core import cascade, clock
 from app.core.access import BULK_LIMIT_REVIEWER, Capability, Role, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (AuditLog, Channel, Message, WfDraft, WfOutbound, WfTarget,
-                           WfVerdict, Workflow)
-from app.services import wf_drafting, workflows as workflow_service
+from app.db.models import (AuditLog, Channel, ManualSend, Message, WfDraft, WfOutbound,
+                           WfTarget, WfVerdict, Workflow)
+from app.services import (manual_sends as manual_sends_service, wf_drafting,
+                          workflows as workflow_service)
 
 logger = logging.getLogger("radar")
 
@@ -903,3 +905,298 @@ async def reopen_draft(draft_id: int, request: Request, db: GetDB,
 
     return {"draft_id": draft_id, "workflow": wf.key, "state": "pending",
             "previous": previous, "remaining": await _pending(db, wf)}
+
+
+# ── активность сценария ───────────────────────────────────────────────────────
+
+# Ручка отвечает на вопрос «что ушло», и половина её чисел сегодня — гарантированные
+# нули. Сказано это здесь, а не оставлено читателю как упражнение: **автоматической
+# отправки в контуре нет вовсе**. `wf_outbound` пуст, и писателя у него не существует —
+# `OutboundGate` зовётся из `drafts.py` и отсюда с `journal=None` и ничего никуда не
+# шлёт. Прежняя `outbound_attempts` пуста по той же причине.
+#
+# Поэтому `automatic` — константа, а не «есть ли строки в журнале». Пустой журнал и
+# отсутствующий отправитель — разные утверждения: первое означает «пока ничего не
+# отправляли», второе «отправлять некому», и на экране они читаются по-разному.
+# Вычисляй мы флаг по данным, первая же строка в журнале объявила бы контур рабочим.
+# Появится отправитель — правится одно место, здесь.
+AUTOMATIC_SENDING = False
+SENDING_NOTE = ("автоматической отправки в этом контуре ещё нет: журнал исходящих "
+                "пуст, отправитель не заведён")
+
+# Лента — обозримый хвост, а не выгрузка: сводки выше отвечают на «сколько», лента
+# нужна только чтобы глазом узнать последнее.
+RECENT_LIMIT = 30
+RECENT_TEXT_CHARS = 200
+
+# Заголовок строки без канала. Ровно тот же прочерк, что и в соседних ручках: строка
+# «канал неизвестен» обязана выглядеть как данные, иначе экран нарисует пустую ячейку
+# и человек решит, что таблица недогрузилась.
+NO_CHANNEL_TITLE = "—"
+
+
+# Пояс подставляется литералом в текст запроса, а не параметром, и это не
+# микрооптимизация. То же выражение стоит и в `SELECT`, и в `GROUP BY`, а Postgres
+# сличает их по разбору: параметр там и параметр тут — разные узлы, даже когда значение
+# одно, и группировка отвергается с «column must appear in the GROUP BY clause».
+_UTC = literal_column("'UTC'")
+
+
+def _utc_day(expr):
+    """Календарный день выражения со временем — в UTC, а не в поясе соединения.
+
+    `date(timestamptz)` в Postgres приводит к дате по `TimeZone` сессии, а его задаёт
+    не этот код: он приходит из настроек сервера. Ряд по дням, посчитанный в чужом
+    поясе, сдвинулся бы ровно на сутки — и заметно это стало бы только на машине,
+    настроенной иначе, чем та, на которой это писали.
+    """
+    return cast(func.timezone(_UTC, expr), Date)
+
+
+def _window_dates(until: datetime, days: int) -> list[date]:
+    """Даты ряда `daily`: ровно `days` штук подряд, последняя — сегодняшняя в UTC.
+
+    Отдельной функцией, потому что это единственная часть ручки, которую можно
+    проверить без базы, — а сломать её проще всего: ряд на день короче или на день
+    сдвинутый выглядит на графике как нормальный график.
+    """
+    return [until.date() - timedelta(days=n) for n in range(days - 1, -1, -1)]
+
+
+def _window_start(until: datetime, days: int) -> datetime:
+    """Начало окна — полночь первой даты ряда, а не `until - days`.
+
+    Окно нарезано по суткам намеренно, и это единственное место, где решение принято
+    против очевидного. Скользящее окно (`now - days`) начиналось бы в середине суток,
+    которых в ряду уже нет, и сумма по ряду оказывалась бы меньше `totals` — на одном
+    экране два честных числа, не сходящихся друг с другом. Человек, сложивший столбики
+    и не получивший плитку, справедливо перестаёт верить обоим.
+
+    Плата названа: `days=1` означает «сегодня», а не «за последние 24 часа», и рано
+    утром это короткий отрезок. Подпись на экране говорит «сегодня» именно поэтому.
+    """
+    return datetime.combine(_window_dates(until, days)[0], time.min,
+                            tzinfo=timezone.utc)
+
+
+def _outbound_status(row: WfOutbound) -> str:
+    """Чем кончилась попытка — словами, а не набором флагов.
+
+    Исходов три, а не два: «гейт не пустил», «гейт пустил, но доставки нет» и
+    «доставлено». Средний легко принять за сбой записи, но он законный — так выглядит
+    сухой прогон, и слить его с отказом гейта значило бы объявить заблокированным то,
+    что никто не блокировал.
+    """
+    if row.delivered_message_id is not None:
+        return "доставлено"
+    return "заблокировано гейтом" if not row.allowed else "отправка не подтверждена"
+
+
+@router.get("/activity")
+async def activity(db: GetDB, wf: Workflow = GetWorkflow,
+                   user=requires(Section.ACTIVITY),
+                   days: int = Query(7, ge=1, le=90)):
+    """Что по этому сценарию ушло к людям: руками и автоматически.
+
+    **Отправленное, а не воронка.** Спецификация (§9.2) запрещает здесь доли и
+    конверсию, и запрет этот содержательный: «одобрено → отправлено» на сегодняшних
+    данных дало бы аккуратный процент, посчитанный из того, что автоотправки нет.
+    Такое число хуже отсутствующего — на него смотрят как на качество работы.
+
+    **Половина чисел — гарантированные нули, и это не поломка.** Автоматической
+    отправки в контуре не существует: `wf_outbound` пуст, писателя у него нет (см.
+    `AUTOMATIC_SENDING` выше), поэтому `delivered` и `blocked` сегодня всегда нули.
+    Ручка сообщает об этом состоянием — `sending.automatic: false` и текст рядом, — а
+    не молчаливым нулём, который экран нарисует как «за неделю не отправили ничего».
+    Единственный настоящий источник отправленного — `manual_sends`, то есть форма, в
+    которую человек вносит то, что послал из Telegram сам.
+
+    **`awaiting` — не за период.** Это одобренные черновики без доставленной попытки,
+    то есть состояние «сейчас». Класть его в окно бессмысленно: одобренное неделю
+    назад и не отправленное — ровно та проблема, которую число обязано показать.
+    Подпись на экране про «сейчас, не за период» — часть контракта, а не украшение.
+
+    **`daily` отдаёт ровно `days` строк, включая нулевые,** и ряд покрывает то же
+    время, что и сводки: окно начинается полночью первой его даты (`_window_start`).
+    Дырка в ряду читается экраном как сдвинутый график, а не как пустой день, а
+    несовпадение ряда с окном давало бы `sum(daily.manual) < totals.manual` — два
+    честных числа на одном экране, не сходящихся между собой.
+
+    Часовых поясов пользователя тут нет намеренно: соседние экраны их тоже не знают, и
+    один экран, живущий в местном времени, разошёлся бы датами со всеми остальными.
+    """
+    until = clock.utcnow()
+    since = _window_start(until, days)
+
+    # «Когда отправил», а не «когда записал» — но `sent_at` необязателен: человек может
+    # его не заполнить, и запись без времени всё равно ценна. Голое сравнение по
+    # `sent_at` выкинуло бы такие строки из окна целиком (NULL не сравнивается ни с
+    # чем), то есть тихо занизило бы отправленное. Подпираем моментом записи.
+    sent_ts = func.coalesce(ManualSend.sent_at, ManualSend.recorded_at)
+    manual_where = (ManualSend.workflow_id == wf.id,
+                    sent_ts >= since, sent_ts <= until)
+    outbound_window = (WfOutbound.workflow_id == wf.id,
+                       WfOutbound.created_at >= since, WfOutbound.created_at <= until)
+    delivered_where = (*outbound_window, WfOutbound.delivered_message_id.isnot(None))
+
+    manual_total = (await db.execute(
+        select(func.count(ManualSend.id)).where(*manual_where))).scalar_one()
+    delivered_total = (await db.execute(
+        select(func.count(WfOutbound.id)).where(*delivered_where))).scalar_one()
+    blocked_total = (await db.execute(
+        select(func.count(WfOutbound.id))
+        .where(*outbound_window, WfOutbound.allowed.is_(False)))).scalar_one()
+
+    # Подзапрос отсекает `draft_id IS NULL` не ради скорости: `NOT IN` со списком, в
+    # котором есть NULL, не отбирает вообще ничего — счётчик молча стал бы нулём, и
+    # выглядело бы это как «всё отправлено».
+    delivered_drafts = (select(WfOutbound.draft_id)
+                        .where(WfOutbound.workflow_id == wf.id,
+                               WfOutbound.draft_id.isnot(None),
+                               WfOutbound.delivered_message_id.isnot(None)))
+    awaiting = (await db.execute(
+        select(func.count(WfDraft.id))
+        .where(WfDraft.workflow_id == wf.id, WfDraft.state == "approved",
+               WfDraft.id.notin_(delivered_drafts)))).scalar_one()
+
+    manual_by_day = dict((await db.execute(
+        select(_utc_day(sent_ts), func.count(ManualSend.id))
+        .where(*manual_where).group_by(_utc_day(sent_ts)))).all())
+    delivered_by_day = dict((await db.execute(
+        select(_utc_day(WfOutbound.created_at), func.count(WfOutbound.id))
+        .where(*delivered_where)
+        .group_by(_utc_day(WfOutbound.created_at)))).all())
+    daily = [{"date": d.isoformat(),
+              "manual": manual_by_day.get(d, 0),
+              "delivered": delivered_by_day.get(d, 0)}
+             for d in _window_dates(until, days)]
+
+    # Канал у ручной записи — через снимок сообщения, у попытки — через цель. Пути
+    # разные, потому что запись бывает и без наводки вовсе: человек написал тому, кого
+    # Radar не находил. Соединения внешние по той же причине — такая строка обязана
+    # дойти до экрана без канала, а не пропасть из сводки.
+    by_channel: dict[int | None, dict] = {}
+
+    def _channel_row(cid, title, username) -> dict:
+        row = by_channel.get(cid)
+        if row is None:
+            row = by_channel[cid] = {"channel_id": cid,
+                                     "title": title or NO_CHANNEL_TITLE,
+                                     "username": username,
+                                     "manual": 0, "delivered": 0}
+        return row
+
+    for cid, title, username, n in (await db.execute(
+            select(Channel.id, Channel.title, Channel.username,
+                   func.count(ManualSend.id))
+            .select_from(ManualSend)
+            .outerjoin(Message, ManualSend.message_id == Message.id)
+            .outerjoin(Channel, Message.channel_id == Channel.id)
+            .where(*manual_where)
+            .group_by(Channel.id, Channel.title, Channel.username))).all():
+        _channel_row(cid, title, username)["manual"] = n
+    for cid, title, username, n in (await db.execute(
+            select(Channel.id, Channel.title, Channel.username,
+                   func.count(WfOutbound.id))
+            .select_from(WfOutbound)
+            .outerjoin(WfTarget, WfOutbound.target_id == WfTarget.id)
+            .outerjoin(Channel, WfTarget.channel_id == Channel.id)
+            .where(*delivered_where)
+            .group_by(Channel.id, Channel.title, Channel.username))).all():
+        _channel_row(cid, title, username)["delivered"] = n
+
+    # Строка без канала — последней всегда, сколько бы записей в ней ни было: это не
+    # самый тихий канал, это «неизвестно куда», и место ему в конце списка, а не в его
+    # середине по величине.
+    channels = sorted(by_channel.values(),
+                      key=lambda r: (r["channel_id"] is None,
+                                     -(r["manual"] + r["delivered"]), r["title"]))
+
+    by_account: dict[int | None, dict] = {}
+
+    def _account_row(aid, last_at) -> dict:
+        row = by_account.get(aid)
+        if row is None:
+            row = by_account[aid] = {"engage_account_id": aid, "manual": 0,
+                                     "delivered": 0, "last_at": None}
+        if last_at is not None and (row["last_at"] is None or last_at > row["last_at"]):
+            row["last_at"] = last_at
+        return row
+
+    for aid, n, last_at in (await db.execute(
+            select(ManualSend.engage_account_id, func.count(ManualSend.id),
+                   func.max(sent_ts))
+            .where(*manual_where).group_by(ManualSend.engage_account_id))).all():
+        _account_row(aid, last_at)["manual"] = n
+    for aid, n, last_at in (await db.execute(
+            select(WfOutbound.engage_account_id, func.count(WfOutbound.id),
+                   func.max(WfOutbound.created_at))
+            .where(*delivered_where)
+            .group_by(WfOutbound.engage_account_id))).all():
+        _account_row(aid, last_at)["delivered"] = n
+
+    accounts = [{**r, "last_at": r["last_at"].isoformat() if r["last_at"] else None}
+                for r in sorted(by_account.values(),
+                                key=lambda r: (r["engage_account_id"] is None,
+                                               -(r["manual"] + r["delivered"]),
+                                               r["engage_account_id"] or 0))]
+
+    # Слияние двух журналов идёт по объекту времени, а не по строке ISO: строки
+    # сравнимы, только пока смещение у всех одинаковое, и первая же запись, пришедшая
+    # не в UTC, перемешала бы ленту незаметно.
+    merged: list[tuple] = []
+    for entry, channel in (await db.execute(
+            select(ManualSend, Channel)
+            .outerjoin(Message, ManualSend.message_id == Message.id)
+            .outerjoin(Channel, Message.channel_id == Channel.id)
+            .where(*manual_where)
+            .order_by(sent_ts.desc(), ManualSend.id.desc())
+            .limit(RECENT_LIMIT))).all():
+        at = entry.sent_at or entry.recorded_at
+        merged.append((at, entry.id, {
+            "kind": "manual", "id": entry.id, "at": at.isoformat(),
+            "channel": channel.title if channel is not None else NO_CHANNEL_TITLE,
+            "engage_account_id": entry.engage_account_id,
+            "target_id": entry.target_id,
+            "text": (entry.text or "")[:RECENT_TEXT_CHARS],
+            "status": "записано руками",
+            "matches_suggestion": manual_sends_service.matches_suggestion(entry),
+        }))
+
+    # Попытки берём все, а не только доставленные: заблокированная гейтом — это тоже
+    # то, что происходило, и `reasons` рядом с ней и есть ответ на «почему не ушло».
+    for row, channel in (await db.execute(
+            select(WfOutbound, Channel)
+            .outerjoin(WfTarget, WfOutbound.target_id == WfTarget.id)
+            .outerjoin(Channel, WfTarget.channel_id == Channel.id)
+            .where(*outbound_window)
+            .order_by(WfOutbound.created_at.desc(), WfOutbound.id.desc())
+            .limit(RECENT_LIMIT))).all():
+        merged.append((row.created_at, row.id, {
+            "kind": "outbound", "id": row.id, "at": row.created_at.isoformat(),
+            "channel": channel.title if channel is not None else NO_CHANNEL_TITLE,
+            "engage_account_id": row.engage_account_id,
+            "target_id": row.target_id,
+            "text": (row.text_snapshot or "")[:RECENT_TEXT_CHARS],
+            "status": _outbound_status(row),
+            "allowed": row.allowed,
+            "reasons": row.reasons or [],
+        }))
+    merged.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    return {
+        "workflow": {"key": wf.key, "title": wf.title, "action": wf.action,
+                     "visibility": wf.visibility},
+        "window": {"days": days, "since": since.isoformat(),
+                   "until": until.isoformat()},
+        # `sent` складывает сервер: та же сумма, посчитанная на экране, разъехалась бы
+        # с этой в тот день, когда сюда добавится третий источник отправленного.
+        "totals": {"sent": manual_total + delivered_total, "manual": manual_total,
+                   "delivered": delivered_total, "blocked": blocked_total,
+                   "awaiting": awaiting},
+        "sending": {"automatic": AUTOMATIC_SENDING, "note": SENDING_NOTE},
+        "daily": daily,
+        "channels": channels,
+        "accounts": accounts,
+        "recent": [row for _, _, row in merged[:RECENT_LIMIT]],
+    }

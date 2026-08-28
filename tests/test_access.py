@@ -10,7 +10,8 @@ import pytest
 from app.core.access import ACCESS, Role, Section, can, sections_for
 
 # Дословно из `ACCESS` в `Atomic Radar.dc.html` (см. contract/Atomic-Radar.md),
-# сверено 2026-08-24 после подключения раздела ручных отправок.
+# сверено 2026-08-24 после подключения раздела ручных отправок и 2026-08-26 после
+# раздела активности сценария.
 #
 # Одно расхождение остаётся намеренно: в оболочке есть маршрут `draftsTable` —
 # второй вид того же раздела черновиков, у которого нет и не должно быть отдельного
@@ -27,6 +28,7 @@ EXPECTED = {
     "leads": {"owner", "customer", "reviewer"},
     "drafts": {"owner", "customer", "reviewer"},
     "conversations": {"owner", "customer", "reviewer"},
+    "activity": {"owner", "customer", "reviewer"},
     "manual_sends": {"owner", "customer", "reviewer"},
     "profile": {"owner", "customer", "reviewer"},
     "runs": {"owner", "customer", "reviewer"},
@@ -68,6 +70,16 @@ def test_customer_sees_safety():
     """Заказчик обязан видеть переключатель DRY_RUN: по договорённости ни одно
     сообщение не уходит без его ведома."""
     assert can(Role.CUSTOMER, Section.SAFETY)
+
+
+def test_activity_is_closed_to_the_guest_like_conversations():
+    """Активность — та же внутренняя кухня, что и переписки, только у сценариев, где
+    переписки не бывает. Открой её гостю — и он через блок публичного ответа увидел бы
+    ровно то, что ему закрыто в блоке личных сообщений."""
+    for role in (Role.OWNER, Role.CUSTOMER, Role.REVIEWER):
+        assert can(role, Section.ACTIVITY), role
+    assert not can(Role.VIEWER, Section.ACTIVITY)
+    assert ACCESS[Section.ACTIVITY] == ACCESS[Section.CONVERSATIONS]
 
 
 def test_viewer_sees_only_dashboard_and_attribution():

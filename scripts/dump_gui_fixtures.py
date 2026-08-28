@@ -232,6 +232,12 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/workflows/{key}/drafts", "/workflows/public_reply/drafts?limit=5"),
         ("/workflows/{key}/drafts/next", "/workflows/public_reply/drafts/next"),
         ("/workflows/{key}/drafts/{id}", f"/workflows/public_reply/drafts/{wf_d}"),
+        # Активность снимается с публичного сценария: у ЛС этого раздела нет вовсе
+        # (см. `SECTIONS_BY_ACTION`), и снимок с `cold_dm` описывал бы экран, который
+        # там не открывается. Числа в снимке будут почти сплошь нулями — на стенде нет
+        # ни одной отправки, а автоотправки нет и в коде; это и есть та форма ответа,
+        # против которой экран обязан выглядеть прилично.
+        ("/workflows/{key}/activity", "/workflows/public_reply/activity?days=7"),
     ], t
 
 
