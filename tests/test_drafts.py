@@ -106,7 +106,8 @@ def test_unknown_pain_still_produces_a_variant():
 
 
 def test_spam_score_reacts_to_advertising_markers():
-    clean = drafting.spam_score("Видел твоё сообщение про VPN — помогло своё решение")
+    clean = drafting.spam_score(
+        "Видел твоё сообщение про оплату инвойса — помогло своё решение")
     salesy = drafting.spam_score(
         "ПОД КЛЮЧ за 1 день, гарантия, недорого, пишите прямо сейчас!!")
     assert clean < 0.3 < salesy

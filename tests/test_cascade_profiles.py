@@ -26,7 +26,12 @@ from app.core import cascade
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
 
 # Живая жалоба, дошедшая бы до конца каскада: тема, признак поломки, просьба.
-COMPLAINT = "впн не работает второй день, подскажите как поднять свой сервер"
+COMPLAINT = "платёж за рубеж не проходит второй день, подскажите что делать"
+
+# Якорь, который L1 нашёл бы в COMPLAINT. Передаётся в `score` руками: ступень и
+# оценка считаются раздельно, и подмешивать сюда весь каскад ради одного списка
+# значило бы проверять два правила одним тестом.
+COMPLAINT_ANCHORS = ["платеж за рубеж"]
 
 
 def classify(text=COMPLAINT, **kw):
@@ -65,14 +70,41 @@ def test_profile_cannot_be_edited_in_flight():
         cascade.DM_V1.pain_anchors["новая боль"] = ("слово",)
 
 
+def test_no_word_list_contains_yo():
+    """Якорь через «ё» не сработает никогда, и не скажет об этом.
+
+    `cascade._norm` складывает «ё» в «е» перед поиском подстроки, поэтому слово
+    «платёж» в списке — мёртвый груз: в нормализованном тексте такой подстроки не
+    бывает. Ошибка бесшумная — якорь выглядит рабочим и просто не находит ничего, —
+    и заметить её можно только вот такой проверкой, а не по результатам отбора.
+
+    Проверяются все списки всех профилей разом: правило про написание, а не про
+    конкретную боль, и новый профиль обязан ему подчиняться с первого дня.
+    """
+    dead: list[str] = []
+    for key, rules in cascade.PROFILES.items():
+        lists = [(f"{key}.pain_anchors[{name}]", words)
+                 for name, words in rules.pain_anchors.items()]
+        lists += [(f"{key}.disqualifier_markers[{name}]", words)
+                  for name, words in rules.disqualifier_markers.items()]
+        lists += [(f"{key}.{name}", getattr(rules, name))
+                  for name in ("problem_markers", "intent_markers", "urgency_markers",
+                               "decision_maker_markers")]
+        dead += [f"{where}: «{word}»" for where, words in lists for word in words
+                 if "ё" in word]
+
+    assert dead == [], ("эти слова не совпадут никогда — _norm заменяет «ё» на «е»: "
+                       + "; ".join(dead))
+
+
 # ── закреплённое поведение dm_v1 ──────────────────────────────────────────────
 
 def test_dm_v1_score_components_are_pinned():
     """Числа проверены на живых данных и нарисованы человеку в разборе оценки.
     Меняться они могут, но только осознанно — вместе с этим тестом."""
     total, breakdown = cascade.score(
-        text=COMPLAINT, anchors=["впн"], tg_date=NOW - timedelta(hours=1), now=NOW,
-        has_username=True)
+        text=COMPLAINT, anchors=COMPLAINT_ANCHORS, now=NOW,
+        tg_date=NOW - timedelta(hours=1), has_username=True)
     assert {b["label"]: b["value"] for b in breakdown} == {
         "совпадение с болью": 22,
         "срочность/интент": 24,
@@ -92,17 +124,17 @@ def test_dm_v1_score_components_are_pinned():
 def test_dm_v1_freshness_ladder_is_pinned(age, expected):
     """Лесенка свежести считается долями от потолка. Доли подобраны так, чтобы при
     потолке 10 давать прежние 10/7/3/0 — округление не должно съесть ни одного балла."""
-    _, breakdown = cascade.score(text=COMPLAINT, anchors=["впн"], tg_date=NOW - age,
-                                 now=NOW, has_username=True)
+    _, breakdown = cascade.score(text=COMPLAINT, anchors=COMPLAINT_ANCHORS,
+                                 tg_date=NOW - age, now=NOW, has_username=True)
     assert {b["label"]: b["value"] for b in breakdown}["свежесть"] == expected
 
 
 def test_dm_v1_score_cannot_exceed_the_sum_of_its_caps():
     """Потолки — это и есть веса. Слагаемое, пробивающее свой потолок, сделало бы
     оценку несравнимой между сообщениями."""
-    loud = ("хостинг vps впн не работает не могу не получается срочно горит "
-            "подскажите помогите у нас в компании наш сервер клиенты жалуются "
-            "ищу админа нужен devops")
+    loud = ("платёж за рубеж не проходит не могу оплатить срочно горит подскажите "
+            "помогите у нас в компании наш бухгалтер требует документы "
+            "ищу платёжного агента")
     total, breakdown = cascade.score(text=loud, anchors=["a", "b", "c", "d", "e"],
                                      tg_date=NOW, now=NOW, has_username=True)
     weights = cascade.DM_V1.weights
@@ -140,8 +172,9 @@ def test_a_zero_weight_removes_a_score_component_but_keeps_the_line():
     должен видеть, что достижимость учтена и оценена в ноль, а не что её забыли."""
     no_reach = replace(cascade.DM_V1, key="p", title="п",
                        weights=replace(cascade.DM_V1.weights, reach=0))
-    _, breakdown = cascade.score(text=COMPLAINT, anchors=["впн"], tg_date=NOW, now=NOW,
-                                 has_username=True, profile=no_reach)
+    _, breakdown = cascade.score(text=COMPLAINT, anchors=COMPLAINT_ANCHORS,
+                                 tg_date=NOW, now=NOW, has_username=True,
+                                 profile=no_reach)
     row = {b["label"]: b["value"] for b in breakdown}
     assert "достижимость в ЛС" in row
     assert row["достижимость в ЛС"] == 0
@@ -172,7 +205,8 @@ def test_no_profile_can_pass_a_message_the_model_calls_a_non_problem():
 
 
 def test_l2_margin_belongs_to_the_profile():
-    ranked = [("pos", "VPN не работает", 0.815), ("neg", "болтовня по теме", 0.795)]
+    ranked = [("pos", "банк не пропускает платёж", 0.815),
+              ("neg", "болтовня по теме", 0.795)]
     assert cascade.level2(ranked)[0] is True
     strict = replace(cascade.DM_V1, key="p", title="п", l2_min_margin=0.05)
     ok, why, _, _ = cascade.level2(ranked, profile=strict)
@@ -202,7 +236,7 @@ def test_workflow_pointing_at_a_missing_profile_is_rejected():
 
 
 def test_minimum_length_belongs_to_the_profile():
-    short = "впн лёг"
+    short = "платёж завис"
     assert classify(text=short)["level"] == 0
     talkative = replace(cascade.DM_V1, key="p", title="п", min_text_length=5)
     assert classify(text=short, profile=talkative)["level"] == 1

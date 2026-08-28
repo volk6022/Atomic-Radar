@@ -53,13 +53,13 @@ async def seed(db, *, lead_status="new", draft_state=None):
     message = Message(channel_id=channel.id, tg_message_id=1000, tg_date=NOW,
                       author_peer_id=500, author_username="user", author_name="Имя",
                       author_is_bot=False, is_automatic_forward=False,
-                      text="впн не работает, помогите настроить",
+                      text="не могу оплатить инвойс, помогите разобраться",
                       cascade_level=1, cascade_passed=True, processed_at=NOW)
     db.add(message)
     await db.flush()
 
     lead = Lead(message_id=message.id, channel_id=channel.id, author_peer_id=500,
-                author_username="user", author_name="Имя", pain="VPN не работает",
+                author_username="user", author_name="Имя", pain="не может оплатить за рубеж",
                 quote="цитата", score=50, status=lead_status)
     db.add(lead)
     await db.flush()

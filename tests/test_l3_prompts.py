@@ -30,7 +30,7 @@ def message(mid: int = 1) -> Message:
     m = Message(channel_id=1, tg_message_id=1000 + mid, tg_date=NOW,
                 author_peer_id=500, author_username="user", author_name="Имя",
                 author_is_bot=False, is_automatic_forward=False,
-                text="впн отваливается, ищу кто настроит, готов платить")
+                text="платёж за рубеж не проходит, ищу через кого оплатить инвойс")
     m.id = mid
     return m
 
@@ -45,9 +45,10 @@ def bound(key: str, profile: cascade.CascadeProfile) -> targeting.Bound:
 
 # Отранжированные эталоны, при которых L2 уверенно проходит: цель — довести каскад
 # до L3, а не проверять здесь саму ступень векторов.
-RANKED = [("pos", "VPN не работает", 0.81), ("neg", "болтовня", 0.42)]
+RANKED = [("pos", "не может оплатить за рубеж", 0.81), ("neg", "болтовня", 0.42)]
 
-PENDING_L3 = {"level": 2, "passed": None, "detail": {}, "pain": "VPN не работает",
+PENDING_L3 = {"level": 2, "passed": None, "detail": {},
+              "pain": "не может оплатить за рубеж",
               "score": 50, "breakdown": [], "disqualifiers": []}
 DONE = {**PENDING_L3, "level": 3, "passed": True}
 
@@ -246,7 +247,7 @@ def test_public_profile_takes_posts_without_an_author():
 
     В ЛС они отсеиваются правильно — писать в личку некому. Под ними отвечают.
     """
-    post = dict(text="перенесли сайт, теперь всё лежит, что делать",
+    post = dict(text="оплатили инвойс поставщику, банк вернул платёж, что делать",
                 is_automatic_forward=True, author_is_bot=False, author_peer_id=None,
                 author_username=None, tg_date=NOW, now=NOW)
 

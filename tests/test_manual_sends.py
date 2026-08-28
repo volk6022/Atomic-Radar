@@ -160,9 +160,9 @@ def test_describe_survives_a_record_without_a_target():
 
 def test_describe_takes_the_quote_from_the_message_when_there_is_no_target():
     """Наводки нет, но сообщение известно — цитату всё равно есть откуда взять."""
-    message = SimpleNamespace(text="впн не работает второй день")
+    message = SimpleNamespace(text="банк вернул платёж второй день")
     row = manual_sends.describe(entry(target_id=None), message=message)
-    assert row["quote"] == "впн не работает второй день"
+    assert row["quote"] == "банк вернул платёж второй день"
 
 
 def test_recorded_time_is_serialised_not_dumped_raw():

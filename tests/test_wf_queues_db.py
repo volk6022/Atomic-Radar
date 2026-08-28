@@ -78,7 +78,8 @@ async def _seed() -> dict:
         db.add(channel)
         await db.flush()
 
-        def msg(tg_id, *, author=500, forward=False, body="впн отваливается, ищу кто настроит"):
+        def msg(tg_id, *, author=500, forward=False,
+                body="платёж за рубеж не проходит, ищу через кого оплатить"):
             return Message(channel_id=channel.id, tg_message_id=tg_id, tg_date=NOW,
                            author_peer_id=author,
                            author_username="user" if author else None,
@@ -94,18 +95,18 @@ async def _seed() -> dict:
         db.add_all([
             WfVerdict(workflow_id=dm.id, message_id=both.id, level=3, passed=True,
                       detail={"l3": "модель: похоже на живую проблему"},
-                      pain="VPN не работает", score=70, score_breakdown=[],
+                      pain="не может оплатить за рубеж", score=70, score_breakdown=[],
                       disqualifiers=[], computed_at=NOW),
             WfVerdict(workflow_id=dm.id, message_id=only_public.id, level=0,
                       passed=False, detail={"l0": "автопересылка"}, pain=None,
                       score=0, score_breakdown=[], disqualifiers=[], computed_at=NOW),
             WfVerdict(workflow_id=public.id, message_id=both.id, level=3, passed=True,
                       detail={"l3": "модель: ответить по существу можно"},
-                      pain="VPN не работает", score=65, score_breakdown=[],
+                      pain="не может оплатить за рубеж", score=65, score_breakdown=[],
                       disqualifiers=[], computed_at=NOW),
             WfVerdict(workflow_id=public.id, message_id=only_public.id, level=3,
                       passed=True, detail={"l3": "модель: вопрос по теме"},
-                      pain="не может настроить сам", score=55, score_breakdown=[],
+                      pain="банк не пропускает платёж", score=55, score_breakdown=[],
                       disqualifiers=[], computed_at=NOW),
             # Вердикт «в пути»: ступень включена, вход ещё не посчитан. Нужен, чтобы
             # «ждёт обработки» было чем отличить от «сценарий сюда не доходил» —
@@ -119,18 +120,18 @@ async def _seed() -> dict:
             WfTarget(workflow_id=dm.id, target_kind="user", message_id=both.id,
                      channel_id=channel.id, recipient_peer_id=500,
                      author_peer_id=500, author_username="user", author_name="Имя",
-                     pain="VPN не работает", quote=both.text, score=70,
+                     pain="не может оплатить за рубеж", quote=both.text, score=70,
                      score_breakdown=[], disqualifiers=[], status="new"),
             WfTarget(workflow_id=public.id, target_kind="message", message_id=both.id,
                      channel_id=channel.id, chat_peer_id=channel.peer_id,
                      reply_to_message_id=1000,
                      author_peer_id=500, author_username="user", author_name="Имя",
-                     pain="VPN не работает", quote=both.text, score=65,
+                     pain="не может оплатить за рубеж", quote=both.text, score=65,
                      score_breakdown=[], disqualifiers=[], status="new"),
             WfTarget(workflow_id=public.id, target_kind="message",
                      message_id=only_public.id, channel_id=channel.id,
                      chat_peer_id=channel.peer_id, reply_to_message_id=1001,
-                     pain="не может настроить сам", quote=only_public.text, score=55,
+                     pain="банк не пропускает платёж", quote=only_public.text, score=55,
                      score_breakdown=[], disqualifiers=[], status="new"),
         ])
 
@@ -294,8 +295,8 @@ def test_pains_come_from_this_workflow_only(authed):
     dm = {p["pain"] for p in authed.get("/api/v1/workflows/cold_dm/pains").json()["rows"]}
     public = {p["pain"] for p in
               authed.get("/api/v1/workflows/public_reply/pains").json()["rows"]}
-    assert dm == {"VPN не работает"}
-    assert public == {"VPN не работает", "не может настроить сам"}
+    assert dm == {"не может оплатить за рубеж"}
+    assert public == {"не может оплатить за рубеж", "банк не пропускает платёж"}
 
 
 # ── поток ─────────────────────────────────────────────────────────────────────

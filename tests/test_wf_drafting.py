@@ -79,8 +79,8 @@ def test_contact_in_a_public_reply_is_rejected_when_nobody_asked():
     """Главное правило публичного контура: под вопросом «как починить» рекомендация
     подрядчика — реклама, даже если она правдива."""
     ok, note = wf_drafting.lint(
-        f"Тут поможет Андрей ({wf_drafting.CONTACT}), он такое настраивает.",
-        pain="VPN не работает", chosen=wf_drafting.PUBLIC_KIT)
+        f"Тут поможет Андрей ({wf_drafting.CONTACT}), он такие платежи проводит.",
+        pain="не может оплатить за рубеж", chosen=wf_drafting.PUBLIC_KIT)
     assert ok is False
     assert "не спрашивали" in note
 
@@ -89,8 +89,8 @@ def test_the_same_text_is_fine_in_a_private_message():
     """Та же фраза в личке — не нарушение, а смысл сообщения. Одно правило на оба
     контура означало бы либо немой ЛС, либо рекламу в ветке."""
     ok, note = wf_drafting.lint(
-        f"Тут поможет Андрей ({wf_drafting.CONTACT}), он такое настраивает.",
-        pain="VPN не работает", chosen=wf_drafting.DM_KIT)
+        f"Тут поможет Андрей ({wf_drafting.CONTACT}), он такие платежи проводит.",
+        pain="не может оплатить за рубеж", chosen=wf_drafting.DM_KIT)
     assert ok is True and note is None
 
 
@@ -112,7 +112,7 @@ def test_link_in_the_first_message_is_rejected_in_both_kits():
 def test_rejected_variant_says_what_is_wrong_with_it():
     """`lint_ok: false` без причины заставляет читать код, чтобы понять отказ."""
     ok, note = wf_drafting.lint(
-        f"Пиши Андрею {wf_drafting.CONTACT}", pain="VPN не работает",
+        f"Пиши Андрею {wf_drafting.CONTACT}", pain="не может оплатить за рубеж",
         chosen=wf_drafting.PUBLIC_KIT)
     assert ok is False and note
 
@@ -162,7 +162,7 @@ def test_unknown_pain_falls_back_instead_of_producing_nothing():
 
 def test_variant_carries_everything_the_review_screen_needs():
     for chosen in (wf_drafting.DM_KIT, wf_drafting.PUBLIC_KIT, wf_drafting.REACTION_KIT):
-        for v in wf_drafting.build_variants("VPN не работает", chosen=chosen):
+        for v in wf_drafting.build_variants("не может оплатить за рубеж", chosen=chosen):
             assert set(v) == {"text", "spam_score", "prompt_version", "lint_ok",
                               "lint_note", "critic_passed", "critic_text"}
             assert v["prompt_version"] == chosen.version
@@ -175,7 +175,7 @@ def test_variant_carries_everything_the_review_screen_needs():
 def test_reactions_ignore_the_pain_and_offer_emoji():
     """У реакции нет текста для разбора: список один на все случаи, и боль его не
     меняет. `final_text` повезёт выбранное эмодзи."""
-    for pain in ("VPN не работает", None, "боль, которой нет"):
+    for pain in ("не может оплатить за рубеж", None, "боль, которой нет"):
         variants = wf_drafting.build_variants(pain, chosen=wf_drafting.REACTION_KIT)
         assert [v["text"] for v in variants] == list(wf_drafting.REACTION_VARIANTS)
         assert all(v["lint_ok"] for v in variants)

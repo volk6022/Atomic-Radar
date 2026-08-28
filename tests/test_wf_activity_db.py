@@ -93,7 +93,8 @@ async def _seed() -> dict:
                            author_peer_id=500, author_username="user",
                            author_name="Имя", author_is_bot=False,
                            is_automatic_forward=False,
-                           text="впн отваливается, ищу кто настроит", processed_at=NOW)
+                           text="платёж за рубеж не проходит, ищу через кого оплатить",
+                           processed_at=NOW)
 
         # Третье сообщение заведено не для полноты картины: у целей стоит уникальность
         # по паре (сценарий, сообщение), и два черновика одного сценария над одним
@@ -107,7 +108,7 @@ async def _seed() -> dict:
                             message_id=message.id, channel_id=channel.id,
                             chat_peer_id=channel.peer_id, reply_to_message_id=reply_to,
                             author_peer_id=500, author_username="user",
-                            author_name="Имя", pain="VPN не работает",
+                            author_name="Имя", pain="не может оплатить за рубеж",
                             quote=message.text, score=65, score_breakdown=[],
                             disqualifiers=[], status="approved")
 
@@ -117,7 +118,7 @@ async def _seed() -> dict:
         t_dm = WfTarget(workflow_id=dm.id, target_kind="user", message_id=m_loud.id,
                         channel_id=loud.id, recipient_peer_id=500, author_peer_id=500,
                         author_username="user", author_name="Имя",
-                        pain="VPN не работает", quote=m_loud.text, score=70,
+                        pain="не может оплатить за рубеж", quote=m_loud.text, score=70,
                         score_breakdown=[], disqualifiers=[], status="approved")
         db.add_all([t_awaiting, t_delivered, t_pending, t_dm])
         await db.flush()

@@ -61,7 +61,7 @@ async def seed_old_schema(db, *, leads=3, drafts=2):
             tg_date=NOW - timedelta(hours=i),
             author_peer_id=500 + i, author_username=f"user{i}", author_name=f"Имя {i}",
             author_is_bot=False, is_automatic_forward=False,
-            text=f"нужен админ настроить vps, не работает {i}",
+            text=f"нужен агент, платёж за рубеж не проходит {i}",
             cascade_level=1, cascade_passed=(i < leads),
             cascade_detail={"l0": "ок", "l1": "совпало"},
             processed_at=NOW,
@@ -80,7 +80,7 @@ async def seed_old_schema(db, *, leads=3, drafts=2):
                     author_peer_id=messages[i].author_peer_id,
                     author_username=messages[i].author_username,
                     author_name=messages[i].author_name,
-                    pain="нужен админ/подрядчик", quote="цитата",
+                    pain="ищет, через кого платить", quote="цитата",
                     score=40 + i, score_breakdown=[{"label": "боль", "value": 22}],
                     status="new")
         db.add(lead)

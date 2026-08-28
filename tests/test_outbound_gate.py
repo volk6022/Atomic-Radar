@@ -42,7 +42,7 @@ def make_request(**over) -> SendRequest:
     """Заведомо валидная попытка: каждый тест ломает ровно одно поле."""
     base = dict(
         draft_id=1, conversation_id=1, account_id=1, recipient_peer_id=555,
-        text="Видел твой вопрос про хостинг, могу посоветовать знакомого",
+        text="Видел твой вопрос про оплату за рубеж, могу посоветовать знакомого",
         draft_state="approved", is_first_message=True, sent_count=0,
         last_sent_at=None, recipient_local_hour=14,
         recipient_is_admin=False, previously_contacted=False,

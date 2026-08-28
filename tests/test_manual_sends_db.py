@@ -48,7 +48,7 @@ async def seed(db):
                               base_url="http://engage:8103",
                               api_key_env="RADAR_ENGAGE_API_KEY")
     db.add(instance)
-    channel = Channel(peer_id=-1001, username="ch", title="Канал про VPS")
+    channel = Channel(peer_id=-1001, username="ch", title="Канал про ВЭД")
     db.add(channel)
     await db.flush()
 
@@ -67,7 +67,7 @@ async def seed(db):
                     tg_date=NOW - timedelta(hours=i), author_peer_id=500 + i,
                     author_username=f"user{i}", author_name=f"Имя {i}",
                     author_is_bot=False, is_automatic_forward=False,
-                    text=f"впн не работает, помогите настроить {i}")
+                    text=f"не могу оплатить инвойс, помогите разобраться {i}")
         messages.append(m)
         db.add(m)
     await db.flush()
@@ -75,17 +75,17 @@ async def seed(db):
     dm_target = WfTarget(
         workflow_id=dm.id, target_kind="user", message_id=messages[0].id,
         channel_id=channel.id, recipient_peer_id=500, author_peer_id=500,
-        author_username="user0", author_name="Имя 0", pain="VPN не работает",
-        quote="впн не работает, помогите настроить 0", score=55, status="new")
+        author_username="user0", author_name="Имя 0", pain="не может оплатить за рубеж",
+        quote="не могу оплатить инвойс, помогите разобраться 0", score=55, status="new")
     other_dm_target = WfTarget(
         workflow_id=dm.id, target_kind="user", message_id=messages[1].id,
         channel_id=channel.id, recipient_peer_id=501, author_peer_id=501,
-        author_username="user1", author_name="Пётр Хостингов", pain="хостинг",
-        quote="сервер тормозит", score=40, status="new")
+        author_username="user1", author_name="Пётр Валютов", pain="выплаты людям за границей",
+        quote="банк вернул платёж", score=40, status="new")
     public_target = WfTarget(
         workflow_id=public.id, target_kind="message", message_id=messages[2].id,
         channel_id=channel.id, chat_peer_id=-1002, reply_to_message_id=1002,
-        author_username="user2", author_name="Имя 2", quote="что там с впн",
+        author_username="user2", author_name="Имя 2", quote="что там с оплатой за рубеж",
         score=30, status="new")
     db.add_all([dm_target, other_dm_target, public_target])
     await db.flush()
@@ -106,11 +106,11 @@ async def test_recording_against_a_target_fills_everything_from_the_server(db):
     пара «предложено → отправлено» перестаёт быть свидетельством."""
     s = await seed(db)
     entry = await manual_sends.record(
-        db, workflow=s["dm"], text="  привет, видел твой вопрос про впн  ",
+        db, workflow=s["dm"], text="  привет, видел твой вопрос про оплату  ",
         recorded_by="andrey@example.com", target_id=s["target"].id)
     await db.commit()
 
-    assert entry.text == "привет, видел твой вопрос про впн", "текст обязан быть обрезан"
+    assert entry.text == "привет, видел твой вопрос про оплату", "текст обязан быть обрезан"
     assert entry.target_id == s["target"].id
     assert entry.message_id == s["messages"][0].id
     assert entry.draft_id is not None
@@ -199,10 +199,10 @@ async def test_candidates_carry_what_radar_suggested(db):
 async def test_candidates_are_searchable_by_person_and_by_words(db):
     """Человек помнит либо кому писал, либо про что было — заранее неизвестно, что."""
     s = await seed(db)
-    by_name = await manual_sends.candidates(db, workflow=s["dm"], q="хостингов")
+    by_name = await manual_sends.candidates(db, workflow=s["dm"], q="валютов")
     assert [r["target_id"] for r in by_name] == [s["other_target"].id]
 
-    by_quote = await manual_sends.candidates(db, workflow=s["dm"], q="тормозит")
+    by_quote = await manual_sends.candidates(db, workflow=s["dm"], q="вернул")
     assert [r["target_id"] for r in by_quote] == [s["other_target"].id]
 
     by_username = await manual_sends.candidates(db, workflow=s["dm"], q="user0")
@@ -298,7 +298,7 @@ async def test_history_names_the_channel_and_leaves_it_empty_without_a_target(db
 
     by_text = {r["text"]: r for r in
                (await manual_sends.history(db, workflow_id=s["dm"].id))["rows"]}
-    assert by_text["по наводке"]["channel"] == "Канал про VPS"
+    assert by_text["по наводке"]["channel"] == "Канал про ВЭД"
     assert by_text["мимо радара"]["channel"] is None
 
 

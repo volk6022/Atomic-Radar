@@ -45,8 +45,8 @@ pytestmark = pytest.mark.skipif(
 
 NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
-VARIANTS = [{"text": "Привет. Судя по описанию, дело в конфиге.", "kind": "template"},
-            {"text": "Похоже на настройку — могу подсказать.", "kind": "template"}]
+VARIANTS = [{"text": "Привет. Судя по описанию, дело в валютном контроле.", "kind": "template"},
+            {"text": "Похоже на типовой отказ банка — могу подсказать.", "kind": "template"}]
 
 
 async def _seed() -> dict:
@@ -92,7 +92,8 @@ async def _seed() -> dict:
                         author_peer_id=500 + n, author_username=f"user{n}",
                         author_name=f"Имя {n}", author_is_bot=False,
                         is_automatic_forward=False,
-                        text="впн отваливается, ищу кто настроит", processed_at=NOW)
+                        text="платёж за рубеж не проходит, ищу через кого оплатить",
+                        processed_at=NOW)
             messages.append(m)
         db.add_all(messages)
         await db.flush()
@@ -119,12 +120,12 @@ async def _seed() -> dict:
                             status="new")
 
         # Боли и каналы разведены нарочно: без этого отбор по фильтру нечем проверить.
-        dm_a = dm_target(messages[0], score=70, pain="VPN не работает")
-        dm_b = dm_target(messages[1], score=30, pain="хостинг тормозит",
+        dm_a = dm_target(messages[0], score=70, pain="не может оплатить за рубеж")
+        dm_b = dm_target(messages[1], score=30, pain="выплаты людям за границей",
                          channel_id=other.id)
-        dm_sent = dm_target(messages[2], score=61, pain="VPN не работает")
-        pub_a = public_target(messages[0], score=65, pain="VPN не работает")
-        pub_b = public_target(messages[3], score=40, pain="нужен админ/подрядчик")
+        dm_sent = dm_target(messages[2], score=61, pain="не может оплатить за рубеж")
+        pub_a = public_target(messages[0], score=65, pain="не может оплатить за рубеж")
+        pub_b = public_target(messages[3], score=40, pain="ищет, через кого платить")
         db.add_all([dm_a, dm_b, dm_sent, pub_a, pub_b])
         await db.flush()
 
@@ -297,12 +298,12 @@ def test_bulk_by_filter_does_not_leak_into_another_workflow(authed, seeded):
     """«Отклонить всё под фильтром» в одном блоке не косит соседний.
 
     Боль у `dm_a` и `pub_a` одна и та же нарочно: без ограничения по сценарию фильтр
-    «VPN не работает» захватил бы обе цели, и в публичном блоке отклонилось бы то,
+    «не может оплатить за рубеж» захватил бы обе цели, и в публичном блоке отклонилось бы то,
     чего человек не видел.
     """
     r = authed.post("/api/v1/workflows/cold_dm/targets/bulk",
                     json={"action": "reject", "reason": "шум",
-                          "filter": {"pain": "VPN не работает"}})
+                          "filter": {"pain": "не может оплатить за рубеж"}})
     assert r.status_code == 200
     assert _status(seeded["targets"]["pub_a"]) == "new"
 

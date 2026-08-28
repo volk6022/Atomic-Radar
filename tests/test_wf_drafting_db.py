@@ -73,13 +73,14 @@ async def seed(db) -> dict:
     message = Message(channel_id=channel.id, tg_message_id=1000, tg_date=NOW,
                       author_peer_id=500, author_username="user", author_name="Имя",
                       author_is_bot=False, is_automatic_forward=False,
-                      text="впн отваливается, ищу кто настроит", processed_at=NOW)
+                      text="платёж за рубеж не проходит, ищу через кого оплатить",
+                      processed_at=NOW)
     db.add(message)
     await db.commit()
     return {"dm": dm, "public": public, "channel": channel, "message": message}
 
 
-async def add_target(db, wf: Workflow, s: dict, *, pain="VPN не работает",
+async def add_target(db, wf: Workflow, s: dict, *, pain="не может оплатить за рубеж",
                      status="new") -> WfTarget:
     """Цель нужной формы. Адресация заполняется по `target_kind` — иначе `CHECK`
     не пропустит, и правильно сделает."""
@@ -156,7 +157,7 @@ async def test_public_draft_does_not_name_the_contact(db):
     """То, ради чего заготовки и разводились: под чужим вопросом «как починить»
     рекомендация подрядчика читается как реклама, и её удаляют."""
     s = await seed(db)
-    target = await add_target(db, s["public"], s, pain="VPN не работает")
+    target = await add_target(db, s["public"], s, pain="не может оплатить за рубеж")
 
     draft = await wf_drafting.ensure_wf_draft(db, s["public"], target)
     await db.commit()
@@ -169,7 +170,7 @@ async def test_public_draft_does_not_name_the_contact(db):
 async def test_dm_draft_does_name_the_contact(db):
     """Обратная сторона: в личке контакт и есть смысл сообщения."""
     s = await seed(db)
-    target = await add_target(db, s["dm"], s, pain="VPN не работает")
+    target = await add_target(db, s["dm"], s, pain="не может оплатить за рубеж")
 
     draft = await wf_drafting.ensure_wf_draft(db, s["dm"], target)
     await db.commit()
@@ -212,14 +213,14 @@ async def test_draft_works_for_a_post_without_an_author(db):
     post = Message(channel_id=s["channel"].id, tg_message_id=1001, tg_date=NOW,
                    author_peer_id=None, author_username=None, author_name=None,
                    author_is_bot=False, is_automatic_forward=True,
-                   text="перенесли сайт, теперь всё лежит", processed_at=NOW)
+                   text="платёж завис в банке, поставка встала", processed_at=NOW)
     db.add(post)
     await db.commit()
 
     target = WfTarget(workflow_id=s["public"].id, target_kind="message",
                       message_id=post.id, channel_id=s["channel"].id,
                       chat_peer_id=s["channel"].peer_id, reply_to_message_id=1001,
-                      pain="не может настроить сам", quote=post.text, score=40,
+                      pain="банк не пропускает платёж", quote=post.text, score=40,
                       score_breakdown=[], disqualifiers=[], status="new")
     db.add(target)
     await db.commit()
