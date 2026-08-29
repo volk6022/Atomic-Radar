@@ -38,6 +38,20 @@ logger = logging.getLogger(__name__)
 INGEST_EVENT = "ingest_event"
 RUN_JOB = "run_job"
 
+# У каждого исполнителя своя очередь, и это не аккуратность, а обязательное условие.
+#
+# arq раздаёт работу из одной очереди всем, кто на неё подписан, и подобравший обязан
+# знать функцию. Наши воркеры знают по одной, разные. Пока очередь одна на двоих,
+# событие приёма с некоторой вероятностью подбирает воркер прогонов — и выбрасывает,
+# написав в свой лог «function 'ingest_event' not found». Постановщик при этом получил
+# идентификатор работы, ручка ответила `202`, счётчики провалов чистые: работа исчезла,
+# и никто, кроме чужого лога, об этом не знает.
+#
+# Поймано 29.08 на живом бэкфилле: из 22 принятых событий разобрано 21, цепочка
+# оборвалась на потерянном, а прогон навсегда остался «выполняется». Ровно то же
+# повторилось на следующем канале с первого же события.
+QUEUE_NAMES = {INGEST_EVENT: "arq:queue:ingest", RUN_JOB: "arq:queue:jobs"}
+
 _pool: Any = None
 _lock = asyncio.Lock()
 
@@ -106,9 +120,16 @@ async def enqueue(task: str, *args: Any, **kwargs: Any) -> str:
     if not enabled():
         raise QueueDisabled("RADAR_REDIS_URL не задан")
 
+    queue_name = QUEUE_NAMES.get(task)
+    if queue_name is None:
+        # Имя задачи без очереди — это опечатка или новая задача, которую забыли
+        # прописать. И то и другое обязано быть слышно сразу: без имени очереди работа
+        # уедет в общую и достанется тому, кто её не умеет.
+        raise QueueUnavailable(f"для задачи {task} не задана очередь")
+
     try:
         pool = await _get_pool()
-        job = await pool.enqueue_job(task, *args, **kwargs)
+        job = await pool.enqueue_job(task, *args, _queue_name=queue_name, **kwargs)
     except Exception as e:  # noqa: BLE001 — вид ошибки Redis тут не важен, важен сброс
         await close()
         logger.error("queue_enqueue_failed task=%s error=%s", task, e)
