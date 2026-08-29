@@ -233,7 +233,7 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
         # запуск с большей целью сначала перечитывал бы уже лежащие в базе свежие
         # страницы — идемпотентно, но это выброшенные вызовы к Telegram.
         resume = channel.backfill_cursor
-        await _request_page(peer_id=peer_id, username=username, title=title,
+        await _request_page(peer_id=peer_id, username=username,
                             account_id=account_id, limit=limit, target=target,
                             max_id=(resume - 1) if resume else 0, cursor=resume or 0,
                             run_id=run_id)
@@ -253,13 +253,22 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
             "linked_chat_username": linked, "next": next_step}
 
 
-async def _request_page(*, peer_id: int, username: str | None, title: str | None,
+async def _request_page(*, peer_id: int, username: str | None,
                         account_id: int, limit: int, target: int,
                         max_id: int, cursor: int, run_id: int = 0) -> None:
     """Заказать одну страницу истории. `cursor` едет обратно для защиты от зацикливания.
 
     `run_id` едет туда же: цепочку двигает Engage, а не наш процесс, и связать
     приехавшую страницу с задачей в `runs` можно только через адрес вебхука.
+
+    Названия группы в адресе нет намеренно, и это не экономия. `tasks.webhook_url` у
+    Engage — `varchar(500)`, а кириллическое название в percent-encoding раздувается
+    вшестеро: у «ВЭД чат (таможенное оформление, сертификация, грузоперевозки, экспорт,
+    импорт)» одно только название заняло больше четырёхсот символов, адрес не влез, и
+    Engage ответил `500` на вставку задачи. Цепочка вставала на первой же странице —
+    29.08 так потерялся весь бэкфилл @CentrVED. Название и не нужно: строка канала уже
+    заведена шагом `chat_info`, а `get_or_create_channel` при пустом названии берёт
+    существующее. В адрес возврата кладём только то, без чего страницу не привязать.
     """
     payload = {"username": username or str(peer_id), "limit": limit}
     if max_id:
@@ -267,7 +276,7 @@ async def _request_page(*, peer_id: int, username: str | None, title: str | None
     await engage.action(
         account_id=account_id, action="get_chat_history", payload=payload,
         webhook_url=_webhook_url(kind="history", peer_id=peer_id,
-                                 username=username or "", title=title or "",
+                                 username=username or "",
                                  account_id=account_id, limit=limit, target=target,
                                  prev_cursor=cursor, run_id=run_id))
 
@@ -334,7 +343,7 @@ async def _continue_backfill(db, out: dict, q) -> str:
         select(Channel).where(Channel.id == out["channel_id"]))).scalar_one()
     try:
         await _request_page(
-            peer_id=channel.peer_id, username=channel.username, title=channel.title,
+            peer_id=channel.peer_id, username=channel.username,
             account_id=account_id, limit=int(q.get("limit") or PAGE_LIMIT),
             target=target, max_id=cursor - 1, cursor=cursor, run_id=run_id)
     except engage.EngageUnavailable as e:
