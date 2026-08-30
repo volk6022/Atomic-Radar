@@ -50,7 +50,7 @@ ACTIVE = ("queued", "running")
 
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
 # браузера, и запускать по нему произвольную функцию нельзя.
-KINDS = ("reclassify", "backfill", "export")
+KINDS = ("reclassify", "backfill", "channel_add", "export")
 
 
 class JobBusy(Exception):

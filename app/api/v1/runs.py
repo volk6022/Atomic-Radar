@@ -32,15 +32,21 @@ RUN_SORTS = {"created": Run.created_at, "kind": Run.kind, "status": Run.status,
 KIND_CAPABILITY = {
     "reclassify": Capability.RUN_HEAVY,
     "backfill": Capability.RUN_BACKFILL,
+    # Подключение канала — то же право, что пускает саму кнопку «Добавить канал»
+    # в `POST /api/v1/channels`: запуск задачи здесь только отражает то решение,
+    # не добавляет новое.
+    "channel_add": Capability.CHANNEL_ADD,
     "export": Capability.RUN_EXPORT,
 }
 
 KIND_TITLE = {"reclassify": "Переклассификация", "backfill": "Дочитать историю",
-              "export": "Выгрузка"}
+              "channel_add": "Подключение канала", "export": "Выгрузка"}
 
-# Где у вида задачи кнопка. Бэкфиллу нужен выбранный канал, поэтому он живёт в
-# разделе Channels и оттуда же заводит строку в `runs`.
-KIND_WHERE = {"reclassify": "runs", "backfill": "channels", "export": "nowhere"}
+# Где у вида задачи кнопка. Бэкфиллу и подключению канала нужен выбранный канал
+# (или его username) — оба живут в разделе Channels и оттуда же заводят строку в
+# `runs`, а не через общий `POST /runs`.
+KIND_WHERE = {"reclassify": "runs", "backfill": "channels",
+             "channel_add": "channels", "export": "nowhere"}
 
 
 def _row(r: Run) -> dict:

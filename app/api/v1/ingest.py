@@ -34,14 +34,17 @@ from collections.abc import Mapping
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
-from app.api.deps import GetDB, requires
-from app.core.access import Section
+from app.api.deps import GetDB, permits, requires
+from app.core import clock
+from app.core.access import Capability, Section
 from app.core.config import get_settings
-from app.db.models import Channel, Message
-from app.services import alerts, engage, ingest as ingest_service, jobs, queue
+from app.db.models import AuditLog, Channel, Message
+from app.services import alerts, channels as channels_service, engage
+from app.services import ingest as ingest_service
+from app.services import jobs, queue
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +163,18 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
     if event == "task_failed":
         # Провал шага бэкфилла — не ошибка приёма. Логируем и отвечаем 200: Engage
         # иначе будет ретраить доставку вебхука, хотя переигрывать тут нечего.
-        logger.warning("engage_task_failed task=%s error=%s kind=%s",
-                       body.get("task_id"), body.get("error_code"), q.get("kind"))
+        #
+        # Задачу в `runs`, если она у этого шага есть, закрываем здесь же —
+        # раньше не закрывал никто, и строка навсегда оставалась «выполняется» с
+        # прогрессом, который уже не сдвинется: ровно та беда, которую в других
+        # местах чинил `mark_interrupted`, а тут её было некому чинить вообще.
+        run_id = int(q.get("run_id") or 0)
+        reason = _translate_engage_reason(str(body.get("error_code") or ""))
+        logger.warning("engage_task_failed task=%s error=%s kind=%s run=%s",
+                       body.get("task_id"), body.get("error_code"), q.get("kind"), run_id)
+        if run_id:
+            await jobs.finish(run_id, status="failed", error=reason,
+                              note=f"задача Engage не выполнена: {reason}")
         return {"accepted": 0, "error": body.get("error_code")}
 
     if event != "task_complete":
@@ -170,9 +183,29 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
 
     result = body.get("result") or {}
     if not result.get("found", True):
+        reason_code = result.get("reason")
+        reason_text = _translate_engage_reason(reason_code)
         logger.warning("engage_not_found kind=%s reason=%s target=%s",
-                       q.get("kind"), result.get("reason"), q.get("username"))
-        return {"accepted": 0, "reason": result.get("reason")}
+                       q.get("kind"), reason_code, q.get("username"))
+        run_id = int(q.get("run_id") or 0)
+        if run_id:
+            # `stage=linked` — вторая половина подключения канала (вступление в
+            # группу обсуждения), и к этому моменту канал уже заведён и
+            # отслеживается: неудача здесь не отменяет первую половину. Задача
+            # закрывается «готово», а не «упала» — иначе владелец увидел бы
+            # красный крест над каналом, который на самом деле подключён.
+            if q.get("kind") in ("join", "chat_info_join") and q.get("stage") == "linked":
+                await jobs.finish(
+                    run_id, status="done",
+                    result={"channel_id": int(q.get("channel_id") or 0),
+                           "linked_group_joined": False, "reason": reason_code},
+                    note=f"канал подключён, но в группу обсуждения вступить не "
+                        f"вышло: {reason_text}. Комментарии не будут приходить в "
+                        f"реальном времени, пока аккаунт не вступит в неё")
+            else:
+                await jobs.finish(run_id, status="failed", error=reason_text,
+                                  note=f"не найдено: {reason_text}")
+        return {"accepted": 0, "reason": reason_code, "reason_text": reason_text}
 
     kind = q.get("kind")
 
@@ -190,8 +223,38 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
         out["next"] = await _continue_backfill(db, out, q)
         return out
 
+    if kind == "join":
+        return await _handle_join(db, result, q)
+
+    if kind == "chat_info_join":
+        return await _handle_chat_info_join(db, result, q)
+
     logger.info("engage_task_complete_unknown_kind kind=%s", kind)
     return {"accepted": 0, "ignored": "kind=" + str(kind)}
+
+
+# Причины отказа Engage человеческим текстом. Список собран по кодам, уже
+# встречавшимся в переписке с Андреем и в блокерах Engage (`andrey-access.md`,
+# `engage-blockers.md`) — не исчерпывающий: неизвестный код отдаётся как есть,
+# без выдумывания смысла, которого мы не проверяли.
+_ENGAGE_REASON_TEXT: dict[str, str] = {
+    "username_not_found": "такого username не существует — проверьте, нет ли опечатки",
+    "username_not_occupied": "такого username не существует — проверьте, нет ли опечатки",
+    "username_invalid": "некорректный username — проверьте написание",
+    "channel_private": "канал приватный: обычная подписка недоступна, нужна инвайт-ссылка",
+    "chat_private": "канал приватный: обычная подписка недоступна, нужна инвайт-ссылка",
+    "invite_request_sent": "вступление закрыто: заявка отправлена, ждите подтверждения администратора",
+    "user_already_participant": "аккаунт уже состоит в этом канале",
+    "user_banned_in_channel": "аккаунт заблокирован в этом канале",
+    "chat_admin_required": "нужны права администратора канала",
+    "flood_wait": "Telegram временно ограничил действия аккаунта — попробуйте позже",
+}
+
+
+def _translate_engage_reason(reason: str | None) -> str:
+    if not reason:
+        return "Engage не назвал причину"
+    return _ENGAGE_REASON_TEXT.get(reason.strip().lower(), f"Engage: {reason}")
 
 
 async def _handle_chat_info(db, result: dict, q) -> dict:
@@ -251,6 +314,151 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
                 peer_id, chat_type, linked, next_step)
     return {"accepted": 1, "channel_id": channel.id, "type": chat_type,
             "linked_chat_username": linked, "next": next_step}
+
+
+async def _start_join_chain(*, account_id: int, username: str, run_id: int,
+                            subscribed_by: str, stage: str,
+                            channel_id: int | None = None) -> None:
+    """Заказать `join_group` и подписать вебхук возврата так, чтобы `_handle_join`
+    знал, куда вести цепочку дальше.
+
+    `stage` различает два прохода одной и той же пары шагов (`join` →
+    `chat_info_join`): `"channel"` — подписка на сам канал, `"linked"` — на его
+    группу обсуждения, запрошенная вторым проходом уже известным `channel_id`.
+    Без общего имени пришлось бы заводить две пары функций ради разницы в
+    несколько строк на финализации.
+    """
+    await engage.action(
+        account_id=account_id, action="join_group", payload={"username": username},
+        webhook_url=_webhook_url(kind="join", account_id=account_id, username=username,
+                                 run_id=run_id, subscribed_by=subscribed_by, stage=stage,
+                                 channel_id=channel_id or 0))
+
+
+async def _handle_join(db, result: dict, q) -> dict:
+    """Итог `join_group`: аккаунт вступил, дальше резолвим карточку отдельным
+    `get_chat_info` — Engage у `join_group` отдаёт `chat_id: null` (известная и не
+    закрытая на его стороне недоделка, engage-blockers.md #7.6), а peer_id и
+    название нужны, чтобы завести строку `channels` (или дописать в неё
+    `linked_chat_peer_id`, если это второй проход — стадия `"linked"`).
+    """
+    account_id = int(q.get("account_id") or 0)
+    username = q.get("username") or ""
+    run_id = int(q.get("run_id") or 0)
+    subscribed_by = q.get("subscribed_by") or ""
+    stage = q.get("stage") or "channel"
+    channel_id = int(q.get("channel_id") or 0) or None
+
+    if run_id:
+        await jobs.progress(
+            run_id, 40 if stage == "channel" else 80,
+            f"аккаунт {account_id} подписан на @{username}"
+            + (" (канал)" if stage == "channel" else " (группа обсуждения)")
+            + ", запрошена карточка")
+    try:
+        await engage.action(
+            account_id=account_id, action="get_chat_info", payload={"username": username},
+            webhook_url=_webhook_url(kind="chat_info_join", account_id=account_id,
+                                     username=username, run_id=run_id,
+                                     subscribed_by=subscribed_by, stage=stage,
+                                     channel_id=channel_id or 0))
+    except engage.EngageUnavailable as e:
+        if run_id:
+            note = (f"канал подключён, но карточку группы обсуждения запросить "
+                    f"не вышло: {e}" if stage == "linked" else
+                    f"подписались, но карточку канала запросить не вышло: {e}")
+            # Стадия `linked` идёт после того, как канал уже заведён — упавший
+            # запрос карточки группы не отменяет то, что уже сделано.
+            await jobs.finish(run_id, status="done" if stage == "linked" else "failed",
+                              error=None if stage == "linked" else str(e), note=note,
+                              result={"channel_id": channel_id} if stage == "linked" else None)
+        raise
+    logger.info("engage_join_done account=%s username=%s stage=%s run=%s",
+               account_id, username, stage, run_id)
+    return {"accepted": 1, "joined": True, "username": username, "stage": stage}
+
+
+async def _handle_chat_info_join(db, result: dict, q) -> dict:
+    """Финал одного прохода подключения канала: карточка получена.
+
+    Стадия `"channel"` заводит строку `channels`, включает отслеживание и, если у
+    канала есть группа обсуждения, запускает второй проход `_start_join_chain` тем
+    же аккаунтом на неё — без вступления в группу вотчер видит только посты
+    канала, а лиды живут в комментариях. Стадия `"linked"` дописывает
+    `linked_chat_peer_id` уже существующему каналу и закрывает задачу.
+
+    В отличие от `_handle_chat_info` (бэкфилл), историю здесь не запрашиваем ни
+    на одной стадии: добавление канала и «Дочитать историю» — два разных решения
+    оператора, FIXES.md #7 их не объединяет.
+    """
+    peer_id = result.get("peer_id")
+    username = result.get("username") or q.get("username")
+    title = result.get("title")
+    account_id = int(q.get("account_id") or 0)
+    run_id = int(q.get("run_id") or 0)
+    subscribed_by = q.get("subscribed_by") or None
+    stage = q.get("stage") or "channel"
+
+    if stage == "linked":
+        channel_id = int(q.get("channel_id") or 0)
+        channel = (await db.execute(
+            select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
+        if channel is not None:
+            channel.linked_chat_peer_id = peer_id
+            if username:
+                channel.linked_chat_username = username
+            await db.commit()
+        if run_id:
+            await jobs.finish(
+                run_id, status="done",
+                result={"channel_id": channel_id, "linked_chat_peer_id": peer_id,
+                       "linked_group_joined": True},
+                note=f"канал подключён вместе с группой обсуждения @{username} — "
+                    f"комментарии теперь видны вотчеру в реальном времени")
+        logger.info("channel_linked_group_joined channel=%s linked_peer=%s account=%s",
+                   channel_id, peer_id, account_id)
+        return {"accepted": 1, "channel_id": channel_id, "linked_chat_peer_id": peer_id}
+
+    channel = await ingest_service.get_or_create_channel(
+        db, peer_id=peer_id, username=username, title=title)
+    channel.members = result.get("members_count")
+    linked = result.get("linked_chat_username")
+    channel.linked_chat_username = linked
+    channel.ingest_enabled = True
+    channel.subscribed_account_id = account_id
+    channel.subscribed_by = subscribed_by
+    channel.subscribed_at = clock.utcnow()
+    await db.commit()
+    logger.info("channel_added channel=%s peer=%s username=%s account=%s by=%s linked=%s",
+               channel.id, peer_id, username, account_id, subscribed_by, linked)
+
+    if linked and account_id:
+        try:
+            await _start_join_chain(account_id=account_id, username=linked, run_id=run_id,
+                                    subscribed_by=subscribed_by or "", stage="linked",
+                                    channel_id=channel.id)
+        except engage.EngageUnavailable as e:
+            if run_id:
+                await jobs.finish(
+                    run_id, status="done", result={"channel_id": channel.id},
+                    note=f"канал «{channel.title}» подключён, но подписаться на "
+                        f"группу обсуждения @{linked} не вышло: {e}")
+            return {"accepted": 1, "channel_id": channel.id, "peer_id": peer_id,
+                   "username": username, "linked_join_failed": str(e)}
+        if run_id:
+            await jobs.progress(run_id, 60,
+                                f"канал «{channel.title}» подключён, вступаем в "
+                                f"группу обсуждения @{linked}")
+        return {"accepted": 1, "channel_id": channel.id, "peer_id": peer_id,
+               "username": username, "next": f"вступление в группу @{linked}"}
+
+    if run_id:
+        await jobs.finish(run_id, status="done",
+                          result={"channel_id": channel.id, "peer_id": peer_id,
+                                  "username": username},
+                          note=f"канал «{channel.title}» подключён и отслеживается"
+                              + ("" if linked else " (группы обсуждения нет)"))
+    return {"accepted": 1, "channel_id": channel.id, "peer_id": peer_id, "username": username}
 
 
 async def _request_page(*, peer_id: int, username: str | None,
@@ -353,6 +561,133 @@ async def _continue_backfill(db, out: dict, q) -> str:
                        out.get("channel_id"), e)
         return await stop(f"страница записана, но продолжить не вышло: {e}", ok=False)
     return f"запрошена следующая страница: {total}/{target}, max_id={cursor - 1}"
+
+
+# ── подключение и отключение каналов (FIXES.md #7) ────────────────────────────
+
+class AddChannelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(min_length=1)
+    engage_account_id: int = Field(gt=0)
+
+
+@operator_router.post("", status_code=201)
+async def add_channel(body: AddChannelRequest, request: Request, db: GetDB,
+                      user=permits(Section.CHANNELS, Capability.CHANNEL_ADD)):
+    """Подключить канал по `@username`: резолв через Engage, подписка выбранным
+    аккаунтом, заведение строки канала и (если есть) её группы обсуждения.
+
+    Раньше строка канала заводилась только неявно — при первом принятом
+    сообщении (`ingest_service.get_or_create_channel`), и подключить канал из
+    интерфейса было нельзя вовсе, только со стороны Engage. Ответ приходит сразу
+    и означает «подписка запрошена», а не «канал подключён»: `join_group` у
+    Engage идёт через хьюманайзер с паузой 60–300 секунд — итог придёт вебхуком,
+    ход виден в разделе Runs.
+    """
+    username = body.username.lstrip("@").strip()
+    if not username:
+        raise HTTPException(422, "пустой username")
+
+    existing = (await db.execute(
+        select(Channel).where(Channel.username == username))).scalar_one_or_none()
+    if existing is not None and existing.ingest_enabled:
+        raise HTTPException(409, f"канал @{username} уже отслеживается (id {existing.id})")
+    if existing is not None and not existing.ingest_enabled:
+        raise HTTPException(
+            409, f"канал @{username} уже был подключён и отслеживание снято — "
+                f"включите его снова (PATCH /channels/{existing.id}), а не "
+                f"подключайте заново: аккаунт уже подписан")
+
+    try:
+        run = await jobs.create_external(
+            db, kind="channel_add",
+            params={"username": username, "engage_account_id": body.engage_account_id},
+            name=f"Подключение канала · @{username}", user_email=user.email)
+    except jobs.JobBusy as e:
+        raise HTTPException(409, str(e)) from e
+
+    try:
+        await _start_join_chain(account_id=body.engage_account_id, username=username,
+                                run_id=run.id, subscribed_by=user.email, stage="channel")
+    except engage.EngageUnavailable as e:
+        await jobs.finish(run.id, status="failed", error=str(e),
+                          note=f"Engage недоступен: {e}")
+        raise HTTPException(503, str(e)) from e
+    except ValueError as e:  # закрытый список действий у engage.action
+        await jobs.finish(run.id, status="failed", error=str(e), note=str(e))
+        raise HTTPException(400, str(e)) from e
+
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="channel_add_started",
+        detail={"username": username, "engage_account_id": body.engage_account_id,
+               "run_id": run.id}, ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("channel_add_started username=%s account=%s run=%s by=%s",
+               username, body.engage_account_id, run.id, user.email)
+    return {"started": True, "username": username, "run_id": run.id,
+           "note": "аккаунт подписывается на канал (и на его группу обсуждения, "
+                   "если она есть); результат придёт вебхуком, ход виден в разделе Runs"}
+
+
+class UpdateChannelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ingest_enabled: bool
+
+
+@operator_router.patch("/{channel_id}")
+async def update_channel(channel_id: int, body: UpdateChannelRequest, request: Request,
+                         db: GetDB, user=permits(Section.CHANNELS, Capability.CHANNEL_ARCHIVE)):
+    """Снять или вернуть отслеживание — отдельно от удаления сообщений (см. ниже).
+
+    Читает и пишет ровно то же поле, что сам себе молча ставит `get_or_create_channel`
+    при первом сообщении: включение здесь не заводит канал заново и не трогает
+    накопленное, только решает, продолжать ли класть новые сообщения.
+    """
+    channel = (await db.execute(
+        select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(404, f"канал {channel_id} не найден")
+
+    was = channel.ingest_enabled
+    channel.ingest_enabled = body.ingest_enabled
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="channel_tracking_changed",
+        detail={"channel_id": channel_id, "title": channel.title,
+               "from": was, "to": body.ingest_enabled},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("channel_tracking_changed channel=%s from=%s to=%s by=%s",
+               channel_id, was, body.ingest_enabled, user.email)
+    return {"id": channel.id, "ingest_enabled": channel.ingest_enabled}
+
+
+@operator_router.delete("/{channel_id}/messages")
+async def delete_channel_messages(channel_id: int, request: Request, db: GetDB,
+                                  user=permits(Section.CHANNELS, Capability.CHANNEL_ARCHIVE)):
+    """Удалить накопленные сообщения канала — отдельное решение от снятия
+    отслеживания (см. `update_channel`): один щёлкает выключатель, другой стирает
+    архив, и объединять их в одну кнопку FIXES.md запрещает прямым текстом.
+
+    Канал не удаляется: строка остаётся, чтобы к ней было куда прийти новым
+    сообщениям, если отслеживание снова включат. Обнуляются только производные —
+    счётчик лидов и курсор бэкфилла, читать историю заново придётся с начала.
+    """
+    channel = (await db.execute(
+        select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(404, f"канал {channel_id} не найден")
+
+    counts = await channels_service.purge_messages(db, channel_id=channel_id)
+    channel.leads_total = 0
+    channel.backfill_cursor = None
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="channel_messages_purged",
+        detail={"channel_id": channel_id, "title": channel.title, **counts},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("channel_messages_purged channel=%s by=%s counts=%s",
+               channel_id, user.email, counts)
+    return {"channel_id": channel_id, "deleted": counts}
 
 
 # ── запуск ────────────────────────────────────────────────────────────────────
