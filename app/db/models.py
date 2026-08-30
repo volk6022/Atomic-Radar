@@ -167,6 +167,15 @@ class Channel(Base):
     ingest_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_junk: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     backfill_cursor: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Каким аккаунтом Engage канал был подключён (пункт 7 FIXES.md). Не связь
+    # «канал ↔ аккаунт» — это m2m и id аккаунта Engage, локальной таблицы accounts
+    # для него нет; полноценная схема на несколько подписчиков одного канала —
+    # отдельная задача (пункт 9), здесь только «кто подписал последним».
+    subscribed_account_id: Mapped[int | None] = mapped_column(BigInteger)
+    subscribed_by: Mapped[str | None] = mapped_column(String(255))
+    subscribed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 
@@ -352,6 +361,81 @@ class ProfileVersion(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_by: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = _created()
+
+
+class CascadeVersion(Base):
+    """Версия таксономии L1: якоря боли и дисквалификаторы.
+
+    До 30.08 это были константы в `app/core/cascade.py` — экран профиля читал их
+    напрямую, а редактировать было негде. Версии здесь по образцу `ProfileVersion`:
+    `is_active=False` — это не черновик, а предложенная заказчиком правка
+    (`Capability.CONFIG_PROPOSE`), которая ждёт, когда владелец её включит
+    (`CONFIG_ACTIVATE`). Хранить только активную строку значило бы потерять само
+    предложение в момент, когда его отклонили или просто не успели посмотреть.
+
+    Снимок полный, а не diff: строка целиком описывает состояние каскада на момент
+    активации, и по одной строке видно, на каких правилах вынесен вердикт — без
+    необходимости накатывать цепочку патчей.
+    """
+    __tablename__ = "cascade_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    pain_anchors: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    disqualifiers: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_cascade_version_active", "is_active", "id"),)
+
+
+class L2Prototype(Base):
+    """Одна эталонная фраза L2 (положительная или шумовая) внутри версии таксономии.
+
+    Привязана к `cascade_version_id`, а не к «текущему состоянию» без версии: когда
+    владелец активирует другую версию `CascadeVersion`, набор эталонов обязан
+    переключиться вместе с ней атомарно — иначе якоря L1 уже говорят про новую
+    боль, а эмбеддинги L2 ещё сравнивают со старой.
+
+    `vector` может быть NULL: строка заводится с текстом сразу, а посчитать
+    эмбеддинг получится только когда ответит эмбеддер (см. `cascade_registry`).
+    До этого момента L2 не должен тихо доверять пустому вектору — читающий код
+    обязан считать NULL как «эталон ещё не участвует в сравнении».
+    """
+    __tablename__ = "l2_prototypes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cascade_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("cascade_versions.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    phrase: Mapped[str] = mapped_column(String(500), nullable=False)
+    vector: Mapped[list | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_l2_prototype_version", "cascade_version_id"),)
+
+
+class L3Prompt(Base):
+    """Версия системного промпта L3, по ключу контура (`dm_v1`, `public_v1`).
+
+    Правка обязана поднимать версию, а не переписывать текст на месте: старые
+    вердикты в `llm_traces.prompt_version` вынесены прежним вопросом к модели, и
+    молча смешивать их с новыми нельзя — по версии видно, каким промптом получен
+    конкретный ответ (см. докстринг `app/services/llm.Prompt`).
+    """
+    __tablename__ = "l3_prompts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    prompt_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_l3_prompt_active", "prompt_key", "is_active"),)
 
 
 class Run(Base):

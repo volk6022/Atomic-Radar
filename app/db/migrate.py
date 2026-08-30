@@ -32,6 +32,37 @@ STATEMENTS: list[str] = [
     # не копилось сотнями строк.
     "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS key VARCHAR(80)",
     "CREATE INDEX IF NOT EXISTS ix_alert_unread ON alerts (read_at, created_at)",
+
+    # 2026-08-30, FIXES.md #5: таксономия каскада (боли, дисквалификаторы, эталоны
+    # L2, промпт L3) переехала из констант в БД с версионированием, чтобы экран
+    # Profile & Prompts мог писать в тот же источник, из которого читает каскад.
+    "CREATE TABLE IF NOT EXISTS cascade_versions ("
+    "id BIGSERIAL PRIMARY KEY, version VARCHAR(32) NOT NULL, "
+    "pain_anchors JSONB NOT NULL, disqualifiers JSONB NOT NULL, "
+    "is_active BOOLEAN NOT NULL DEFAULT FALSE, created_by VARCHAR(255), "
+    "created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS ix_cascade_version_active "
+    "ON cascade_versions (is_active, id)",
+    "CREATE TABLE IF NOT EXISTS l2_prototypes ("
+    "id BIGSERIAL PRIMARY KEY, "
+    "cascade_version_id BIGINT NOT NULL REFERENCES cascade_versions(id), "
+    "kind VARCHAR(8) NOT NULL, label VARCHAR(120) NOT NULL, "
+    "phrase VARCHAR(500) NOT NULL, vector JSONB, "
+    "created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS ix_l2_prototype_version "
+    "ON l2_prototypes (cascade_version_id)",
+    "CREATE TABLE IF NOT EXISTS l3_prompts ("
+    "id BIGSERIAL PRIMARY KEY, prompt_key VARCHAR(32) NOT NULL, "
+    "version VARCHAR(32) NOT NULL, system_prompt TEXT NOT NULL, "
+    "is_active BOOLEAN NOT NULL DEFAULT FALSE, created_by VARCHAR(255), "
+    "created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS ix_l3_prompt_active ON l3_prompts (prompt_key, is_active)",
+
+    # 2026-08-30, FIXES.md #7: канал заводится сам при первом сообщении, но теперь
+    # его можно завести и руками — запоминаем, каким аккаунтом Engage подписались.
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_account_id BIGINT",
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_by VARCHAR(255)",
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_at TIMESTAMPTZ",
 ]
 
 
