@@ -214,6 +214,7 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/drafts/{id}", f"/drafts/{d}"),
         ("/conversations", "/conversations"),
         ("/profile", "/profile"),
+        ("/profile/versions", "/profile/versions"),
         ("/limits", "/limits"),
         ("/system/mode", "/system/mode"),
         ("/evaluations", "/evaluations"),
