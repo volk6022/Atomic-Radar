@@ -194,8 +194,12 @@ PUBLIC_SYSTEM = (
 
 PUBLIC_V1 = Prompt(key="public_v1", version="l3-public-v3", system=PUBLIC_SYSTEM)
 
-PROMPTS: Mapping[str, Prompt] = MappingProxyType({DM_V1.key: DM_V1,
-                                                  PUBLIC_V1.key: PUBLIC_V1})
+# Приватный изменяемый словарь плюс публичный вид только на чтение поверх него.
+# `prompt()` читает `_PROMPTS` напрямую и поэтому видит правку сразу; снаружи
+# модуля виден только `PROMPTS` — `MappingProxyType` не даёт положить в реестр
+# что-то в обход `apply_prompt`, у которого есть с чем сверить ключ.
+_PROMPTS: dict[str, Prompt] = {DM_V1.key: DM_V1, PUBLIC_V1.key: PUBLIC_V1}
+PROMPTS: Mapping[str, Prompt] = MappingProxyType(_PROMPTS)
 
 DEFAULT_PROMPT = DM_V1.key
 
@@ -217,9 +221,23 @@ def prompt(key: str) -> Prompt:
     ошибке при запуске.
     """
     try:
-        return PROMPTS[key]
+        return _PROMPTS[key]
     except KeyError:
         raise UnknownPromptError(key) from None
+
+
+def apply_prompt(key: str, prompt_obj: Prompt) -> None:
+    """Подменить промпт контура, не поднимая процесс заново.
+
+    Зовёт только `app/services/cascade_registry.py`, прочитавший активную строку
+    `l3_prompts` из базы. `key` проверяется отдельно от `prompt_obj.key`: оба
+    обязаны совпадать, иначе редактор молча завёл бы промпт под чужим ключом
+    контура, и `cascade.profile(...).l3_prompt_key` продолжал бы искать прежний.
+    """
+    if key != prompt_obj.key:
+        raise ValueError(f"ключ промпта «{key}» не совпадает с prompt_obj.key "
+                         f"«{prompt_obj.key}»")
+    _PROMPTS[key] = prompt_obj
 
 
 def build_prompt(*, text: str, context: list[str]) -> str:

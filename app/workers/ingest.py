@@ -44,7 +44,7 @@ from fastapi import HTTPException
 from app.api.v1.ingest import process_event
 from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
-from app.services import alerts, engage, engage_registry, queue
+from app.services import alerts, cascade_registry, engage, engage_registry, queue
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,11 @@ async def startup(ctx: dict) -> None:
     Реестр инстансов Engage подключается обязательно: без него `engage.*` не знает,
     в какой инстанс идти, и дозапрос следующей страницы бэкфилла падает уже в воркере
     — то есть в месте, куда никто не смотрит.
+
+    Таксономию каскада (`cascade_registry.reload`) читаем по той же причине: приём
+    считает L0/L1 прямо здесь (`upsert_message` → `cascade.classify`), и воркер с
+    таксономией по умолчанию из констант кода молча судил бы новые сообщения по
+    старым якорям, пока правка не доедет случайным перезапуском контейнера.
     """
     get_settings().validate_runtime()
     if not queue.enabled():
@@ -126,10 +131,13 @@ async def startup(ctx: dict) -> None:
     async with get_session_maker()() as db:
         engage_registry.install()
         await engage_registry.reload(db)
+        await cascade_registry.reload(db)
+    cascade_registry.start_watch()
     logger.info("ingest_worker_started")
 
 
 async def shutdown(ctx: dict) -> None:
+    await cascade_registry.stop_watch()
     await engage.close()
     await queue.close()
     await get_engine().dispose()

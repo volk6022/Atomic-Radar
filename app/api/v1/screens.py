@@ -26,17 +26,18 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, func, or_, select
 
 from app.api.deps import GetDB, requires
+from app.api.v1 import profile as profile_api
 from app.api.v1.listing import ListParams, apply_search, apply_sort, list_params
 from app.core import cascade
 from app.core import invariants as inv
 from app.core import prototypes
-from app.core.access import Section
+from app.core.access import Capability, Section, allows
 from app.core.config import get_settings
 from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
                            Lead, LlmTrace, Message, OutboundAttempt,
                            ProfileVersion, User)
-from app.services import drafting, embeddings, engage, llm, queue
+from app.services import cascade_registry, drafting, embeddings, engage, llm, queue
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
 
@@ -273,6 +274,10 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
             "leads_per_1000": round(c.leads_total * 1000 / msgs, 2) if msgs else None,
             "ingest_enabled": c.ingest_enabled, "is_junk": c.is_junk,
             "linked_chat_username": c.linked_chat_username,
+            # Кем подписан (FIXES.md #7). `None` у каналов, заведённых по старому
+            # пути — сами при первом сообщении, никто руками не подключал.
+            "subscribed_account_id": c.subscribed_account_id,
+            "subscribed_by": c.subscribed_by,
         })
     return {**p.page(total), "rows": out}
 
@@ -453,11 +458,17 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
     version = (await db.execute(
         select(ProfileVersion).where(ProfileVersion.is_active.is_(True))
         .order_by(ProfileVersion.id.desc()).limit(1))).scalar_one_or_none()
+    cascade_version = await cascade_registry.active_cascade_version(db)
 
     # Рядом с каждой болью — не только слова для L1, но и эталонные фразы для L2:
     # это две разные механики отбора одной и той же боли, и человеку, который решает,
     # «почему система на это среагировала», нужны обе.
-    pains = [{"key": pain, "label": pain, "anchors": list(anchors)[:6],
+    #
+    # Списки отдаются целиком, без обрезки. До правки экран был витриной и
+    # показывал первые несколько значений ради компактности — теперь он же
+    # редактор, и сохранение обязано писать назад ровно то, что показано:
+    # обрезанный список на входе тихо стёр бы хвост, которого экран не увидел.
+    pains = [{"key": pain, "label": pain, "anchors": list(anchors),
               "anchors_total": len(anchors),
               "prototypes": list(prototypes.POSITIVE.get(pain, ()))}
              for pain, anchors in rules.pain_anchors.items()]
@@ -469,11 +480,11 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
                                  "Настройка и сопровождение VPN/VPS-инфраструктуры "
                                  "под ключ, перенос без простоя."),
         "pains": pains,
-        "disqualifiers": [{"key": k, "markers": list(v)[:6]}
+        "disqualifiers": [{"key": k, "markers": list(v)}
                           for k, v in rules.disqualifier_markers.items()],
         # Отрицательные эталоны L2 — половина работы ступени, и без них список
         # «на кого охотимся» выглядел бы так, будто система только соглашается.
-        "noise_prototypes": [{"key": k, "examples": list(v)[:4]}
+        "noise_prototypes": [{"key": k, "examples": list(v)}
                              for k, v in prototypes.NEGATIVE.items()],
         "cascade": {
             "profile": rules.key,
@@ -494,6 +505,20 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
             "prompt_version": drafting.PROMPT_VERSION,
             "note": "Черновики собираются по шаблонам: текст ответа модель пока "
                     "не пишет — L3 только выносит вердикт по сообщению",
+        },
+        # Версии таксономии и то, что из неё уже вынесено прежним промптом —
+        # см. `app/api/v1/profile.py`. Пусто и `0`, если правок ещё не было.
+        "cascade_version": {
+            "version": cascade_version.version if cascade_version else None,
+            "created_by": cascade_version.created_by if cascade_version else None,
+            "created_at": cascade_version.created_at.isoformat()
+                          if cascade_version else None,
+        },
+        "stale_l3_verdicts": await profile_api.stale_l3_verdict_count(db),
+        "editable": {
+            "can_edit": allows(user.role, Capability.CONFIG_EDIT),
+            "can_propose": allows(user.role, Capability.CONFIG_PROPOSE),
+            "can_activate": allows(user.role, Capability.CONFIG_ACTIVATE),
         },
     }
 

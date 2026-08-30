@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, runs,
-                        screens, system, wf_queues)
+from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, profile,
+                        runs, screens, system, wf_queues)
 # Псевдоним по той же причине, что и у сценариев ниже: рядом живёт `app.services.events`.
 from app.api.v1 import events as events_api
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
@@ -18,7 +18,7 @@ from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
 from app.db.session import get_engine, get_session_maker
-from app.services import engage, engage_registry, jobs, queue, workflows
+from app.services import cascade_registry, engage, engage_registry, jobs, queue, workflows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -63,12 +63,23 @@ async def lifespan(app: FastAPI):
             # Сценарий ЛС существовал молча — установка работает ровно по нему.
             # Заводим его строкой, чтобы накопленным данным было к чему привязаться.
             await workflows.ensure_bootstrap(db)
+
+            # Таксономия каскада (FIXES.md #5): до первой правки она и так лежит в
+            # константах кода — заводим версию `v1` из них же, чтобы редактор писал
+            # поверх реального состояния, а не поверх пустоты, и перечитываем её в
+            # module-level словари каскада на каждый старт процесса.
+            await cascade_registry.ensure_bootstrap(db)
+            await cascade_registry.reload(db)
+        # Вне сессии выше: правку могут активировать из воркера или из другого
+        # реплика API, и этот процесс обязан её увидеть без своего рестарта.
+        cascade_registry.start_watch()
     except Exception as e:  # noqa: BLE001 — без БД отдаём 503, но поднимаемся
         app.state.db_ready = False
         logger.warning("db_not_ready: %s", e)
 
     logger.info("radar_started mode_default=%s", settings.DEFAULT_MODE)
     yield
+    await cascade_registry.stop_watch()
     await engage.close()
     await queue.close()
     logger.info("radar_stopping")
@@ -100,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(manual_sends.router)
     app.include_router(runs.router)
     app.include_router(screens.router)
+    app.include_router(profile.router)
     app.include_router(workflows_api.router)
     # Данные сценария отдельным роутером: у реестра выше права намеренно слабые
     # (меню рисуется до входа в раздел), а здесь — матрица на каждой ручке.

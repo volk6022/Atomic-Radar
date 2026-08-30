@@ -105,7 +105,10 @@ async def embed(texts: list[str]) -> list[list[float]]:
 
 
 async def prototype_vectors() -> list[tuple[str, str, list[float]]]:
-    """`(kind, label, вектор)` для всех эталонов. Считается один раз за процесс."""
+    """`(kind, label, вектор)` для всех эталонов. Считается один раз за процесс —
+    или один раз за версию таксономии, если её подменил `cascade_registry`
+    (`set_prototype_cache`) векторами, уже посчитанными и сохранёнными в базе.
+    """
     global _prototype_cache
     if _prototype_cache is None:
         protos = prototypes.all_prototypes()
@@ -115,6 +118,30 @@ async def prototype_vectors() -> list[tuple[str, str, list[float]]]:
         logger.info("prototypes_embedded n=%s dim=%s",
                     len(_prototype_cache), len(_prototype_cache[0][2]))
     return _prototype_cache
+
+
+def set_prototype_cache(vectors: list[tuple[str, str, list[float]]]) -> None:
+    """Подставить уже посчитанные векторы эталонов, минуя обращение к эмбеддеру.
+
+    Зовёт `cascade_registry` при перечитке активной версии таксономии: векторы
+    для неё уже лежат в `l2_prototypes.vector`, посчитанные один раз при сохранении
+    правки. Пересчитывать их заново на каждый рестарт процесса значило бы держать
+    старт в зависимости от того, жив ли сейчас туннель до bge-m3 (см. FIXES.md #1) —
+    а он падал уже на два часа.
+    """
+    global _prototype_cache
+    _prototype_cache = vectors
+
+
+def reset_prototype_cache() -> None:
+    """Сбросить кэш эталонов без закрытия HTTP-клиента.
+
+    В отличие от `close()`: правка таксономии не должна рвать соединение к
+    эмбеддеру, которое, возможно, прямо сейчас считает эмбеддинги для соседнего
+    запроса. Следующий `prototype_vectors()` пересчитает кэш по актуальным данным.
+    """
+    global _prototype_cache
+    _prototype_cache = None
 
 
 def cosine(a: list[float], b: list[float]) -> float:

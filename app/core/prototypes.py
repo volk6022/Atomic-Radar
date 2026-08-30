@@ -117,3 +117,19 @@ def all_prototypes() -> list[tuple[str, str, str]]:
     for label, texts in NEGATIVE.items():
         out.extend(("neg", label, t) for t in texts)
     return out
+
+
+def apply_prototypes(*, positive: dict[str, tuple[str, ...]],
+                     negative: dict[str, tuple[str, ...]]) -> None:
+    """Подменить эталоны, не поднимая процесс заново.
+
+    Зовёт только `app/services/cascade_registry.py`, прочитавший активную версию
+    из `l2_prototypes`. Мутация на месте, а не переприсваивание: `POSITIVE` и
+    `NEGATIVE` — те самые объекты, на которые смотрит `all_prototypes()`, и
+    `app/services/embeddings.py` пересоберёт кэш векторов по ним при следующем
+    обращении (`embeddings.reset_prototype_cache` вызывает та же перечитка).
+    """
+    POSITIVE.clear()
+    POSITIVE.update(positive)
+    NEGATIVE.clear()
+    NEGATIVE.update(negative)

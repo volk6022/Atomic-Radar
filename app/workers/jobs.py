@@ -66,7 +66,7 @@ import logging
 
 from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
-from app.services import alerts, embeddings, jobs, llm, queue
+from app.services import alerts, cascade_registry, embeddings, jobs, llm, queue
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,13 @@ async def startup(ctx: dict) -> None:
         raise RuntimeError(
             "RADAR_REDIS_URL не задан: воркеру прогонов неоткуда брать работу")
 
+    # Переклассификация — тот самый прогон, ради которого правку таксономии вообще
+    # предлагают активировать. Без перечитки здесь воркер пересчитал бы каскад по
+    # константам кода и получил старые вердикты, будто активации не было.
+    async with get_session_maker()() as db:
+        await cascade_registry.reload(db)
+    cascade_registry.start_watch()
+
     stale = await jobs.mark_interrupted(statuses=("running",))
     if stale:
         logger.warning("jobs_interrupted_on_start count=%s", stale)
@@ -163,6 +170,7 @@ async def startup(ctx: dict) -> None:
 
 
 async def shutdown(ctx: dict) -> None:
+    await cascade_registry.stop_watch()
     await embeddings.close()
     await llm.close()
     await queue.close()

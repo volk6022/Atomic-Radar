@@ -130,7 +130,11 @@ async def test_startup_marks_only_the_runs_that_died_with_the_process(monkeypatc
     работы, оставив в строке `error` и `finished_at`, которых потом никто не сотрёт.
     """
     monkeypatch.setattr(queue, "enabled", lambda: True)
-    with patch.object(worker.jobs, "mark_interrupted",
+    # Перечитка таксономии каскада тоже трогает базу (`cascade_registry.reload`) —
+    # мокаем её той же монетой, что и `mark_interrupted`: тест проверяет решение
+    # про пометку прерванных, а не то, что воркер умеет говорить с Postgres.
+    with patch.object(worker.cascade_registry, "reload", AsyncMock()), \
+         patch.object(worker.jobs, "mark_interrupted",
                       AsyncMock(return_value=2)) as sweep:
         await worker.startup({})
 
