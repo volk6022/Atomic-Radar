@@ -31,7 +31,6 @@ import hmac
 import json
 import logging
 from collections.abc import Mapping
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -42,7 +41,9 @@ from app.core import clock
 from app.core.access import Capability, Section
 from app.core.config import get_settings
 from app.db.models import AuditLog, Channel, Message
-from app.services import alerts, channels as channels_service, engage
+from app.services import alerts, channels as channels_service
+from app.services import discussions as discussions_service
+from app.services import engage
 from app.services import ingest as ingest_service
 from app.services import jobs, queue
 
@@ -62,12 +63,6 @@ PAGE_LIMIT = 500
 # ровно у того, для кого сделана.
 router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
 operator_router = APIRouter(prefix="/api/v1/channels", tags=["ingest"])
-
-
-def _webhook_url(**params) -> str:
-    s = get_settings()
-    base = s.SELF_BASE_URL.rstrip("/")
-    return f"{base}/api/v1/ingest/{s.INGEST_TOKEN}?{urlencode(params)}"
 
 
 def _check_token(token: str) -> None:
@@ -223,6 +218,14 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
         out["next"] = await _continue_backfill(db, out, q)
         return out
 
+    if kind == "polled":
+        # Ответ на задачу, за результатом которой пошли опросом (`app/services/
+        # discussions.py`). Обратный адрес у Engage обязателен по контракту, поэтому
+        # вебхук всё равно приезжает — и разбирать его здесь значило бы положить те
+        # же сообщения вторым путём. Молчаливое «неизвестный kind» тоже не годится:
+        # в логах оно неотличимо от настоящей рассинхронизации адресов.
+        return {"accepted": 0, "polled": True}
+
     if kind == "join":
         return await _handle_join(db, result, q)
 
@@ -273,6 +276,12 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
         db, peer_id=peer_id, username=username, title=title)
     channel.members = result.get("members_count")
     channel.linked_chat_username = linked
+    channel.chat_type = chat_type
+    # Отметка «карточку спрашивали» ставится здесь же, а не только в пакетном
+    # разборе: иначе один и тот же факт означал бы разное в зависимости от того,
+    # каким путём он получен, и экран показывал бы «не проверяли» у канала, чью
+    # карточку только что прочитали (FIXES.md #3).
+    channel.linked_checked_at = clock.utcnow()
     await db.commit()
 
     account_id = int(q.get("account_id") or 0) or None
@@ -286,7 +295,7 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
         await engage.action(
             account_id=account_id, action="get_chat_info",
             payload={"username": linked},
-            webhook_url=_webhook_url(kind="chat_info", account_id=account_id,
+            webhook_url=engage.webhook_url(kind="chat_info", account_id=account_id,
                                      limit=limit, target=target, run_id=run_id))
         next_step = f"запрошена карточка группы @{linked}"
     # "forum" — та же супергруппа, только с включёнными темами. Читается ровно так же;
@@ -328,9 +337,13 @@ async def _start_join_chain(*, account_id: int, username: str, run_id: int,
     Без общего имени пришлось бы заводить две пары функций ради разницы в
     несколько строк на финализации.
     """
+    # `target`, а не `username`: воркер Engage читает из payload `invite_link` или
+    # `target` (`app/workers/join_group.py`) и про `username` не знает — с ним
+    # вступление уходило в `join_chat(None)`. Проверено 31.08 по коду воркера на
+    # проде; на стенде это не всплывало, потому что живого Engage там нет.
     await engage.action(
-        account_id=account_id, action="join_group", payload={"username": username},
-        webhook_url=_webhook_url(kind="join", account_id=account_id, username=username,
+        account_id=account_id, action="join_group", payload={"target": username},
+        webhook_url=engage.webhook_url(kind="join", account_id=account_id, username=username,
                                  run_id=run_id, subscribed_by=subscribed_by, stage=stage,
                                  channel_id=channel_id or 0))
 
@@ -358,7 +371,7 @@ async def _handle_join(db, result: dict, q) -> dict:
     try:
         await engage.action(
             account_id=account_id, action="get_chat_info", payload={"username": username},
-            webhook_url=_webhook_url(kind="chat_info_join", account_id=account_id,
+            webhook_url=engage.webhook_url(kind="chat_info_join", account_id=account_id,
                                      username=username, run_id=run_id,
                                      subscribed_by=subscribed_by, stage=stage,
                                      channel_id=channel_id or 0))
@@ -407,6 +420,11 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
             channel.linked_chat_peer_id = peer_id
             if username:
                 channel.linked_chat_username = username
+            # Момент вступления, а не просто «мы знаем про группу». Именно с него у
+            # канала появляется живой поток комментариев: историю Telegram отдаёт и
+            # постороннему, апдейты — только участнику (FIXES.md #3).
+            channel.linked_joined_at = clock.utcnow()
+            channel.linked_checked_at = clock.utcnow()
             await db.commit()
         if run_id:
             await jobs.finish(
@@ -424,6 +442,8 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
     channel.members = result.get("members_count")
     linked = result.get("linked_chat_username")
     channel.linked_chat_username = linked
+    channel.chat_type = result.get("type")
+    channel.linked_checked_at = clock.utcnow()
     channel.ingest_enabled = True
     channel.subscribed_account_id = account_id
     channel.subscribed_by = subscribed_by
@@ -483,7 +503,7 @@ async def _request_page(*, peer_id: int, username: str | None,
         payload["max_id"] = max_id
     await engage.action(
         account_id=account_id, action="get_chat_history", payload=payload,
-        webhook_url=_webhook_url(kind="history", peer_id=peer_id,
+        webhook_url=engage.webhook_url(kind="history", peer_id=peer_id,
                                  username=username or "",
                                  account_id=account_id, limit=limit, target=target,
                                  prev_cursor=cursor, run_id=run_id))
@@ -690,6 +710,83 @@ async def delete_channel_messages(channel_id: int, request: Request, db: GetDB,
     return {"channel_id": channel_id, "deleted": counts}
 
 
+# ── группы обсуждения (FIXES.md #3) ───────────────────────────────────────────
+
+@operator_router.get("/discussions")
+async def discussions_summary(db: GetDB, user=requires(Section.CHANNELS)):
+    """Сколько каналов в каком состоянии по группам обсуждения.
+
+    Нужен затем же, зачем и весь пункт 3: «ноль сообщений» на экране до сих пор
+    значило и «у канала нет обсуждения», и «мы про него не спрашивали», и «группа
+    есть, но мы её не читаем». Это три разные причины и три разных следующих шага,
+    и сводка называет их по именам, чтобы решение принималось по числам.
+    """
+    channels = (await db.execute(select(Channel))).scalars().all()
+    counts = dict((await db.execute(
+        select(Message.channel_id, func.count(Message.id))
+        .group_by(Message.channel_id))).all())
+    by_name = {c.username.lower(): c for c in channels if c.username}
+
+    out = {"unknown": 0, "none": 0, "unread": 0, "history": 0, "live": 0,
+           "groups": 0}
+    for c in channels:
+        if c.chat_type in discussions_service.GROUP_TYPES:
+            out["groups"] += 1
+            continue
+        state = discussions_service.discussion_state(c, by_name, counts)["state"]
+        out[state] = out.get(state, 0) + 1
+    return out
+
+
+class ScanDiscussionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # `unread` по умолчанию: это ровно те каналы, из-за которых пункт 3 и появился.
+    scope: str = Field("unread", pattern="^(unread|unknown|all|ids)$")
+    channel_ids: list[int] = Field(default_factory=list)
+    account_ids: list[int] = Field(default_factory=list)
+    target: int = Field(PAGE_LIMIT, ge=1, le=10_000)
+
+
+@operator_router.post("/discussions/scan", status_code=202)
+async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: GetDB,
+                           user=permits(Section.CHANNELS, Capability.RUN_BACKFILL)):
+    """Разобрать группы обсуждения списком: связь + история.
+
+    Кнопка «Запустить бэкфилл всем» на экране Channels этого не умеет и не сможет:
+    она перебирает строки, которые видит, а у групп, которые мы ни разу не читали,
+    строк в Радаре нет вовсе — их ещё предстоит завести по карточке канала. Отсюда
+    отдельный прогон: он идёт от каналов, а не от того, что уже лежит в базе.
+
+    Вступление в группу сюда не входит намеренно. Оно меняет поведение аккаунта в
+    Telegram, а не наши данные, живёт в подключении канала (FIXES.md #7) и упирается
+    в профиль безопасности флота. Разбор же — только чтение, публичную супергруппу
+    Telegram отдаёт и постороннему.
+    """
+    if body.scope == "ids" and not body.channel_ids:
+        raise HTTPException(422, "scope=ids требует непустой channel_ids")
+
+    params = {"scope": body.scope, "channel_ids": body.channel_ids,
+              "account_ids": body.account_ids, "target": body.target}
+    try:
+        run = await jobs.start(db, kind="discussions", params=params,
+                               name="Разбор групп обсуждения", user_email=user.email)
+    except jobs.JobBusy as e:
+        raise HTTPException(409, str(e)) from e
+    except jobs.JobQueueDown as e:
+        raise HTTPException(503, str(e)) from e
+
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="discussions_scan_started",
+        detail={**params, "run_id": run.id},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("discussions_scan_started scope=%s target=%s run=%s by=%s",
+                body.scope, body.target, run.id, user.email)
+    return {"started": True, "run_id": run.id,
+            "note": "разбор идёт в разделе Runs: у каждого канала спрашиваем "
+                    "карточку, заводим его группу обсуждения и дочитываем её историю"}
+
+
 # ── запуск ────────────────────────────────────────────────────────────────────
 
 class BackfillRequest(BaseModel):
@@ -729,7 +826,7 @@ async def start_backfill(body: BackfillRequest, db: GetDB,
         task = await engage.action(
             account_id=body.account_id, action="get_chat_info",
             payload={"username": username},
-            webhook_url=_webhook_url(kind="chat_info", account_id=body.account_id,
+            webhook_url=engage.webhook_url(kind="chat_info", account_id=body.account_id,
                                      limit=body.limit, target=body.target,
                                      run_id=run.id))
     except engage.EngageUnavailable as e:

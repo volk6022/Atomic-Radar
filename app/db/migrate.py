@@ -63,6 +63,18 @@ STATEMENTS: list[str] = [
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_account_id BIGINT",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_by VARCHAR(255)",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed_at TIMESTAMPTZ",
+
+    # 2026-08-31, FIXES.md #3: пустой `linked_chat_username` до сих пор означал сразу
+    # две несовместимые вещи — «у канала нет группы обсуждения» и «мы про неё ещё не
+    # спрашивали». На экране обе выглядели одинаково: ноль сообщений. `linked_checked_at`
+    # разводит их, `linked_joined_at` отвечает на третий вопрос — идёт ли из группы
+    # живой поток: историю публичной супергруппы Telegram отдаёт и без вступления, а
+    # апдейты в реальном времени — только тем, кто в ней состоит. `chat_type` избавляет
+    # от догадок по имени: группа обсуждения заводится отдельной строкой канала, и до
+    # сих пор отличить её от самого канала можно было разве что по суффиксу `_chat`.
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS chat_type VARCHAR(20)",
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked_checked_at TIMESTAMPTZ",
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked_joined_at TIMESTAMPTZ",
 ]
 
 

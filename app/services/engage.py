@@ -25,8 +25,10 @@ API: смена настроек обязана дать новый клиент
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlencode
 
 import httpx
 
@@ -174,3 +176,58 @@ async def action(*, account_id: int, action: str, payload: dict, webhook_url: st
     if r.status_code >= 400:
         raise EngageUnavailable(f"Engage ответил {r.status_code}: {r.text[:200]}")
     return r.json()
+
+
+# ── обратный адрес и опрос результата ─────────────────────────────────────────
+
+def webhook_url(**params) -> str:
+    """Адрес, по которому Engage вернёт результат задачи.
+
+    Живёт здесь, а не в ручке приёма: «куда Engage постучится с ответом» — часть
+    договорённости с Engage, и её нужно знать и приёмнику, и тому, кто ставит
+    задачу из фонового прогона. Секрет в пути, а не в заголовке: у Engage в задаче
+    есть только `webhook_url`, заголовок он поставить не может.
+    """
+    s = get_settings()
+    base = s.SELF_BASE_URL.rstrip("/")
+    return f"{base}/api/v1/ingest/{s.INGEST_TOKEN}?{urlencode(params)}"
+
+
+class EngageTaskFailed(RuntimeError):
+    """Задача выполнена Engage со статусом `failed`. Код причины — в `code`."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def wait_for_task(task_id: str, *, instance: str | None = None,
+                        timeout: float = 300.0, interval: float = 2.0) -> dict:
+    """Дождаться результата задачи опросом `GET /v1/tasks/{id}`.
+
+    Обычный путь результата — вебхук, и он остаётся основным: канал приезжает
+    страницами, каждая двигает цепочку дальше, и ждать их в одном процессе было бы
+    неправильно. Опрос нужен там, где шагов много и они принадлежат ОДНОЙ задаче
+    оператора: разбор шестидесяти групп обсуждения — это один прогон с прогрессом и
+    кнопкой отмены, а не шестьдесят независимых цепочек, о завершении которых никто
+    не знает. Собрать такой прогон на вебхуках можно только счётчиком в общей
+    строке, который правят несколько процессов сразу.
+
+    Опрос дешёвый: чтения у Engage не проходят через хьюманайзер (пауза 60–300 с
+    стоит только на вступлении и реакциях), поэтому карточка чата возвращается за
+    единицы секунд.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        task = await _get(f"/v1/tasks/{task_id}", instance=instance)
+        status = task.get("status")
+        if status == "complete":
+            return task.get("result") or {}
+        if status == "failed":
+            code = task.get("error_code")
+            raise EngageTaskFailed(f"задача Engage не выполнена: {code or 'без кода'}",
+                                   code=code)
+        if asyncio.get_running_loop().time() >= deadline:
+            raise EngageUnavailable(
+                f"Engage не вернул результат за {int(timeout)} с (статус «{status}»)")
+        await asyncio.sleep(interval)

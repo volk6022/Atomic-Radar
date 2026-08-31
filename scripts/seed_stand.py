@@ -42,15 +42,27 @@ PAINS = [
     "нужен админ/подрядчик",
 ]
 
+# На стенде обязаны встречаться все состояния обсуждения, иначе экран Channels
+# выглядит одинаково для случаев, ради различения которых он и переделан
+# (FIXES.md #3): «канал → группа читается», «группа известна, но не читана»,
+# «обсуждения нет» и «не спрашивали». `linked_*` расставлены руками именно за этим.
 CHANNEL_NAMES = [
-    {"title": "VPS Club", "username": "vpsclub", "topic": "Обсуждение хостинга и VPS"},
-    {"title": "DevOps Chat", "username": "devops_chat", "topic": "Админство и DevOps"},
+    # Канал и его группа обсуждения — две строки, как в проде. Сообщения на стенде
+    # раскиданы по всем каналам, поэтому у группы они есть: состояние «история
+    # прочитана, живого потока нет» — то самое, на которое пожаловался Андрей.
+    {"title": "VPS Club", "username": "vpsclub", "topic": "Обсуждение хостинга и VPS",
+     "chat_type": "channel", "linked": "devops_chat", "checked": True},
+    {"title": "DevOps Chat", "username": "devops_chat", "topic": "Админство и DevOps",
+     "chat_type": "supergroup", "linked": "vpsclub", "checked": True},
     {"title": "Мастерская инженера", "username": None, "topic": "Техническое обсуждение"},
+    # Группа известна, а строки для неё нет вовсе — так выглядело 61 из 71 обсуждения.
     {"title": "Инфра для стартапов", "username": "infra_startups",
-     "topic": "Облако и боль"},
+     "topic": "Облако и боль", "chat_type": "channel",
+     "linked": "infra_startups_chat", "checked": True},
     {"title": "VPN и Обход", "username": None, "topic": "Технологии маршрутизации"},
+    # Спросили — обсуждения у канала нет. Это не поломка: таких 149 из 220.
     {"title": "Linux Админы", "username": "linux_admins",
-     "topic": "Системное администрирование"},
+     "topic": "Системное администрирование", "chat_type": "channel", "checked": True},
 ]
 
 MESSAGE_TEMPLATES = [
@@ -165,6 +177,9 @@ async def seed() -> None:
                 username=ch_data["username"],
                 title=ch_data["title"],
                 topic=ch_data["topic"],
+                chat_type=ch_data.get("chat_type"),
+                linked_chat_username=ch_data.get("linked"),
+                linked_checked_at=NOW if ch_data.get("checked") else None,
             )
             db.add(channel)
             channels.append(channel)

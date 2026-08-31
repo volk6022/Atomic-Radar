@@ -158,6 +158,26 @@ class Channel(Base):
     linked_chat_peer_id: Mapped[int | None] = mapped_column(BigInteger)
     linked_chat_username: Mapped[str | None] = mapped_column(String(64))
 
+    # Что это за чат по версии Telegram: `channel` (вещательный) или
+    # `supergroup`/`group`/`forum` (обсуждение). Группа обсуждения живёт отдельной
+    # строкой канала — связи между «Островок Командировки» и «Островок Командировки
+    # Chat» в данных нет никакой, кроме этих полей, и без `chat_type` отличить одно
+    # от другого можно было только гадая по суффиксу имени.
+    chat_type: Mapped[str | None] = mapped_column(String(20))
+
+    # Когда последний раз спрашивали карточку канала у Telegram. Ровно для того,
+    # чтобы пустой `linked_chat_username` перестал значить сразу две вещи: до этой
+    # колонки «у канала нет обсуждения» и «мы ещё не спрашивали» были неразличимы,
+    # и оба показывались как ноль сообщений (FIXES.md #3).
+    linked_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Когда аккаунт вступил в группу обсуждения. Это НЕ то же, что «мы прочитали
+    # её историю»: `get_chat_history` публичную супергруппу отдаёт и постороннему,
+    # а живые апдейты Telegram шлёт только участнику. Пока здесь пусто, комментарии
+    # приезжают разовой выгрузкой и дальше группа молчит — ровно то, на что 29.08
+    # пожаловался Андрей.
+    linked_joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     members: Mapped[int | None] = mapped_column(Integer)
     msgs_per_day: Mapped[int | None] = mapped_column(Integer)
     prefilter_rate: Mapped[float | None] = mapped_column(Numeric(6, 4))
