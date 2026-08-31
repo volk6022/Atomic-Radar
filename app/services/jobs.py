@@ -174,7 +174,7 @@ async def _job_discussions(run_id: int, params: dict) -> dict:
     async with _tracked(run_id) as (report, cancelled):
         async with get_session_maker()() as db:
             channel_ids = await discussions.select_channels(
-                db, scope=params.get("scope") or "unread",
+                db, scope=params.get("scope") or "pending",
                 channel_ids=params.get("channel_ids"))
 
         accounts = list(params.get("account_ids") or [])

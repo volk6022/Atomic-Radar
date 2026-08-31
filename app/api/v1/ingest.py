@@ -740,8 +740,11 @@ async def discussions_summary(db: GetDB, user=requires(Section.CHANNELS)):
 
 class ScanDiscussionsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    # `unread` по умолчанию: это ровно те каналы, из-за которых пункт 3 и появился.
-    scope: str = Field("unread", pattern="^(unread|unknown|all|ids)$")
+    # `pending` по умолчанию — «всё, что не разобрано»: карточку не спрашивали или
+    # группа известна и не прочитана. Порознь эти два множества обманчивы: на 31.08
+    # в проде «известна и не прочитана» — 2 канала при 61 молчащей группе, потому
+    # что у остальных карточку просто ни разу не спрашивали.
+    scope: str = Field("pending", pattern="^(pending|unread|unknown|all|ids)$")
     channel_ids: list[int] = Field(default_factory=list)
     account_ids: list[int] = Field(default_factory=list)
     target: int = Field(PAGE_LIMIT, ge=1, le=10_000)

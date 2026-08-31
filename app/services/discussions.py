@@ -100,9 +100,14 @@ async def select_channels(db, *, scope: str, channel_ids: list[int] | None) -> l
     окажется уже прочитанным.
 
     * `ids` — ровно перечисленные строки, без домысливания;
-    * `unknown` — те, у кого мы ни разу не спрашивали карточку. Первый прогон;
-    * `unread` — группа известна, но её строки в Радаре нет или она пустая. Это и
-      есть те самые «недочитанные»;
+    * `pending` — не разобранные: карточку не спрашивали ИЛИ группа известна и не
+      прочитана. Значение по умолчанию, потому что именно это человек имеет в виду,
+      нажимая «разобрать». Порознь эти два множества почти бесполезны: на 31.08 в
+      проде «не спрашивали» — 141 канал, а «известна и не прочитана» — всего 2, и
+      прогон по второму выглядел бы как «нечего делать» при 61 молчащей группе;
+    * `unknown` — только те, у кого мы ни разу не спрашивали карточку;
+    * `unread` — только те, где группа известна, но её строки в Радаре нет или она
+      пустая;
     * `all` — всё, что отслеживается. Дороже, но переспрашивает и связи, которые
       могли устареть: канал заводит обсуждение или закрывает его когда захочет.
     """
@@ -118,7 +123,7 @@ async def select_channels(db, *, scope: str, channel_ids: list[int] | None) -> l
     rows = (await db.execute(q.order_by(
         Channel.members.desc().nullslast(), Channel.id))).scalars().all()
 
-    if scope != "unread":
+    if scope in ("all", "unknown"):
         return list(rows)
 
     # «Группу не читаем» — это сопоставление двух строк одной и той же таблицы по
@@ -134,7 +139,13 @@ async def select_channels(db, *, scope: str, channel_ids: list[int] | None) -> l
 
     out = []
     for cid in rows:
-        group = by_name.get((by_id[cid].linked_chat_username or "").lower())
+        channel = by_id[cid]
+        if scope == "pending" and channel.linked_checked_at is None:
+            out.append(cid)               # не спрашивали — разбирать в любом случае
+            continue
+        if scope == "pending" and not channel.linked_chat_username:
+            continue                      # спрашивали, обсуждения нет — делать нечего
+        group = by_name.get((channel.linked_chat_username or "").lower())
         if group is None or counts.get(group.id, 0) == 0:
             out.append(cid)
     return out

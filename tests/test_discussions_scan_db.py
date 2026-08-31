@@ -225,3 +225,27 @@ async def test_one_unreachable_channel_does_not_stop_the_rest(db_ready, monkeypa
     assert stats["failed"] == 1          # @zloytam не нашёлся
     assert stats["groups_linked"] == 1   # но пара разобрана
     assert await _message_count("corpostrovokru_chat") == 10
+
+
+async def test_pending_scope_takes_both_the_unasked_and_the_unread(db_ready, monkeypatch):
+    """`pending` — то, что человек имеет в виду, нажимая «разобрать».
+
+    Порознь два множества обманчивы: на проде 31.08 «группа известна и не
+    прочитана» — 2 канала при 61 молчащей группе, потому что у остальных карточку
+    ни разу не спрашивали. Прогон по одному только `unread` выглядел бы как
+    «нечего делать».
+    """
+    async with get_session_maker()() as db:
+        # Один канал уже разобран и без обсуждения — его брать не за чем.
+        done = (await db.execute(
+            select(Channel).where(Channel.username == "zloytam"))).scalar_one()
+        done.linked_checked_at = done.created_at
+        await db.commit()
+
+        pending = await discussions.select_channels(db, scope="pending", channel_ids=None)
+        unknown = await discussions.select_channels(db, scope="unknown", channel_ids=None)
+        unread = await discussions.select_channels(db, scope="unread", channel_ids=None)
+
+    assert done.id not in pending, "спрошенный канал без обсуждения разбирать нечего"
+    assert set(pending) == set(unknown), "остальные два ещё не спрашивались"
+    assert unread == [], "связей ещё нет ни у кого — по одному `unread` работы не видно"
