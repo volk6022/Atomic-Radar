@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
 
 from sqlalchemy import select, update
@@ -38,7 +39,8 @@ from sqlalchemy import select, update
 from app.core import clock
 from app.db.models import Run
 from app.db.session import get_session_maker
-from app.services import alerts, embeddings, llm, queue, reclassify
+from app.services import (alerts, discussions, embeddings, engage, llm, queue,
+                          reclassify)
 
 logger = logging.getLogger("radar.jobs")
 
@@ -50,7 +52,7 @@ ACTIVE = ("queued", "running")
 
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
 # браузера, и запускать по нему произвольную функцию нельзя.
-KINDS = ("reclassify", "backfill", "channel_add", "export")
+KINDS = ("reclassify", "backfill", "channel_add", "export", "discussions")
 
 
 class JobBusy(Exception):
@@ -102,14 +104,15 @@ async def _cancel_requested(run_id: int) -> bool:
 
 # ── сами задачи ───────────────────────────────────────────────────────────────
 
-async def _job_reclassify(run_id: int, params: dict) -> dict:
-    """Прогнать каскад заново. Ступени можно выключать по одной: без модели прогон
-    идёт минуты вместо часа, и это нормальный режим, когда правится только L1."""
-    scope = params.get("scope") or "pending"
-    l2 = embeddings.enabled() and params.get("l2", True)
-    l3 = llm.enabled() and params.get("l3", True)
-    limit = params.get("l3_limit")
+@asynccontextmanager
+async def _tracked(run_id: int):
+    """Дать прогону два инструмента: чем отчитываться и чем спрашивать про отмену.
 
+    Оба нужны каждому длинному прогону и оба неочевидны: прогресс нельзя писать
+    на каждой итерации, а флаг отмены нельзя читать из базы синхронно из глубины
+    цикла. Держать это в каждом прогоне отдельно значило бы, что второй по счёту
+    получит их немного другими.
+    """
     last = {"pct": -1.0}
 
     async def report(pct, note):
@@ -140,13 +143,56 @@ async def _job_reclassify(run_id: int, params: dict) -> dict:
 
     poller = asyncio.create_task(poll_cancel())
     try:
+        yield report, cancelled
+    finally:
+        poller.cancel()
+        _CANCEL_CACHE.pop(run_id, None)
+
+
+async def _job_reclassify(run_id: int, params: dict) -> dict:
+    """Прогнать каскад заново. Ступени можно выключать по одной: без модели прогон
+    идёт минуты вместо часа, и это нормальный режим, когда правится только L1."""
+    scope = params.get("scope") or "pending"
+    l2 = embeddings.enabled() and params.get("l2", True)
+    l3 = llm.enabled() and params.get("l3", True)
+    limit = params.get("l3_limit")
+
+    async with _tracked(run_id) as (report, cancelled):
         async with get_session_maker()() as db:
             return await reclassify.run(db, l2_enabled=l2, l3_enabled=l3,
                                         l3_limit=limit, scope=scope,
                                         report=report, cancelled=cancelled)
-    finally:
-        poller.cancel()
-        _CANCEL_CACHE.pop(run_id, None)
+
+
+async def _job_discussions(run_id: int, params: dict) -> dict:
+    """Разобрать группы обсуждения списком (FIXES.md #3).
+
+    Список каналов и аккаунты раскрываются здесь, а не в ручке: между нажатием
+    кнопки и началом работы прогон может простоять в очереди, и «все, у кого не
+    прочитана группа» обязано считаться на момент старта, а не на момент клика.
+    """
+    async with _tracked(run_id) as (report, cancelled):
+        async with get_session_maker()() as db:
+            channel_ids = await discussions.select_channels(
+                db, scope=params.get("scope") or "unread",
+                channel_ids=params.get("channel_ids"))
+
+        accounts = list(params.get("account_ids") or [])
+        if not accounts:
+            # Аккаунты берём у Engage, а не из настроек: флот меняется, и список,
+            # записанный в параметры задачи месяц назад, увёл бы чтение на
+            # заблокированный аккаунт.
+            accounts = [a["account_id"] for a in await engage.list_accounts()
+                        if a.get("status") == "active"]
+        if not accounts:
+            raise RuntimeError("во флоте Engage нет активных аккаунтов")
+
+        await report(0, f"каналов к разбору {len(channel_ids)}, "
+                        f"аккаунтов {len(accounts)}")
+        return await discussions.scan(
+            channel_ids=channel_ids, account_ids=accounts,
+            target=int(params.get("target") or discussions.PAGE_LIMIT),
+            report=report, cancelled=cancelled)
 
 
 # Кеш флага отмены: опрашивается фоновой корутиной, читается синхронной проверкой
@@ -156,6 +202,7 @@ _CANCEL_CACHE: dict[int, bool] = {}
 
 RUNNERS: dict[str, Callable[[int, dict], Awaitable[dict]]] = {
     "reclassify": _job_reclassify,
+    "discussions": _job_discussions,
 }
 
 

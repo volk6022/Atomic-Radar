@@ -17,7 +17,7 @@ os.environ.setdefault("RADAR_SECRET_KEY", "x" * 32)
 os.environ.setdefault("RADAR_DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
 os.environ.setdefault("RADAR_INGEST_TOKEN", "t" * 24)
 
-from app.api.v1.ingest import _webhook_url  # noqa: E402
+from app.services.engage import webhook_url  # noqa: E402
 
 # Настоящее название той самой группы, на которой всё и сломалось.
 LONG_TITLE = ("ВЭД чат (таможенное оформление, сертификация, грузоперевозки, "
@@ -28,7 +28,7 @@ ENGAGE_WEBHOOK_URL_LIMIT = 500
 
 
 def _history_url() -> str:
-    return _webhook_url(kind="history", peer_id=-1002102849363,
+    return webhook_url(kind="history", peer_id=-1002102849363,
                         username="CentrVED_chat", account_id=5, limit=500,
                         target=2000, prev_cursor=668759, run_id=4)
 
@@ -49,7 +49,7 @@ def test_a_long_cyrillic_title_would_have_broken_the_limit():
     Без неё правку легко откатить «за ненадобностью»: адрес и с названием выглядит
     коротким, пока название латинское и короткое.
     """
-    with_title = _webhook_url(kind="history", peer_id=-1002102849363,
+    with_title = webhook_url(kind="history", peer_id=-1002102849363,
                               username="CentrVED_chat", title=LONG_TITLE,
                               account_id=5, limit=500, target=2000,
                               prev_cursor=668759, run_id=4)

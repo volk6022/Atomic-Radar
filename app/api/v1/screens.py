@@ -37,7 +37,8 @@ from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
                            Lead, LlmTrace, Message, OutboundAttempt,
                            ProfileVersion, User)
-from app.services import cascade_registry, drafting, embeddings, engage, llm, queue
+from app.services import (cascade_registry, discussions, drafting, embeddings,
+                          engage, llm, queue)
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
 
@@ -254,15 +255,28 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
     q = apply_sort(q, p, CHANNEL_SORTS, default="leads_total", tiebreak=Channel.id)
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
 
+    # Счётчики и связи считаются один раз на страницу, а не запросом на строку.
+    # Раньше здесь было два запроса на каждый канал, а состояние обсуждения требует
+    # заглянуть ещё и в ЧУЖУЮ строку — строку группы, которой на этой странице может
+    # не быть вовсе. Пятьдесят строк превратились бы в полторы сотни запросов.
+    counts = dict((await db.execute(
+        select(Message.channel_id, func.count(Message.id))
+        .group_by(Message.channel_id))).all())
+    passed_counts = dict((await db.execute(
+        select(Message.channel_id, func.count(Message.id))
+        .where(Message.cascade_passed.is_(True))
+        .group_by(Message.channel_id))).all())
+    last_at = dict((await db.execute(
+        select(Message.channel_id, func.max(Message.tg_date))
+        .group_by(Message.channel_id))).all())
+    by_username = {c.username.lower(): c for c in (await db.execute(
+        select(Channel).where(Channel.username.isnot(None)))).scalars().all()
+        if c.username}
+
     out = []
     for c in rows:
-        msgs = (await db.execute(
-            select(func.count(Message.id)).where(Message.channel_id == c.id)
-        )).scalar_one()
-        passed = (await db.execute(
-            select(func.count(Message.id))
-            .where(Message.channel_id == c.id, Message.cascade_passed.is_(True))
-        )).scalar_one()
+        msgs = counts.get(c.id, 0)
+        passed = passed_counts.get(c.id, 0)
         out.append({
             "id": c.id, "peer_id": c.peer_id, "title": c.title, "username": c.username,
             "topic": c.topic, "members": c.members,
@@ -274,6 +288,14 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
             "leads_per_1000": round(c.leads_total * 1000 / msgs, 2) if msgs else None,
             "ingest_enabled": c.ingest_enabled, "is_junk": c.is_junk,
             "linked_chat_username": c.linked_chat_username,
+            # Канал это или сама группа обсуждения. До появления колонки отличить
+            # «Островок Командировки» от «Островок Командировки Chat» можно было
+            # только гадая по суффиксу имени (FIXES.md #3).
+            "chat_type": c.chat_type,
+            # Состояние обсуждения: пять значений вместо одинакового «ноль
+            # сообщений» на три разные причины. Расшифровка — в
+            # `app/services/discussions.py`, STATES.
+            "discussion": discussions.discussion_state(c, by_username, counts, last_at),
             # Кем подписан (FIXES.md #7). `None` у каналов, заведённых по старому
             # пути — сами при первом сообщении, никто руками не подключал.
             "subscribed_account_id": c.subscribed_account_id,

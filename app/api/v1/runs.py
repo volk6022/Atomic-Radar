@@ -37,16 +37,21 @@ KIND_CAPABILITY = {
     # не добавляет новое.
     "channel_add": Capability.CHANNEL_ADD,
     "export": Capability.RUN_EXPORT,
+    # Разбор групп обсуждения — тот же бэкфилл, только списком: те же чтения через
+    # тот же дневной бюджет, ничего нового аккаунт при этом не делает.
+    "discussions": Capability.RUN_BACKFILL,
 }
 
 KIND_TITLE = {"reclassify": "Переклассификация", "backfill": "Дочитать историю",
-              "channel_add": "Подключение канала", "export": "Выгрузка"}
+              "channel_add": "Подключение канала", "export": "Выгрузка",
+              "discussions": "Разбор групп обсуждения"}
 
 # Где у вида задачи кнопка. Бэкфиллу и подключению канала нужен выбранный канал
 # (или его username) — оба живут в разделе Channels и оттуда же заводят строку в
 # `runs`, а не через общий `POST /runs`.
 KIND_WHERE = {"reclassify": "runs", "backfill": "channels",
-             "channel_add": "channels", "export": "nowhere"}
+             "channel_add": "channels", "export": "nowhere",
+             "discussions": "channels"}
 
 
 def _row(r: Run) -> dict:
