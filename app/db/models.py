@@ -14,7 +14,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-    Numeric, String, Text, UniqueConstraint, and_, func, or_,
+    Numeric, String, Text, UniqueConstraint, and_, func, or_, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -560,6 +560,76 @@ class Run(Base):
     created_at: Mapped[datetime] = _created()
 
     __table_args__ = (Index("ix_run_kind_status", "kind", "status"),)
+
+
+class BackfillItem(Base):
+    """Строка очереди дочитывания истории канала.
+
+    Очередь — таблица, а не список в параметрах прогона: в неё можно добавлять,
+    пока прогон идёт; она переживает перезапуск процесса; и её видно снаружи —
+    что стоит, что делается, что упало. Кнопка «дочитать всем» на реестре из
+    шестидесяти каналов кладёт сюда шестьдесят строк, а не параметр одной задачи,
+    который вторая кнопка уже не изменит.
+
+    `account_id` — аккаунт Engage, которым канал обязан быть прочитан. Канал,
+    заведённый под конкретный аккаунт, другому может быть недоступен (членство
+    в группе обсуждения), поэтому привязка проверяется при выдаче, а непривязанный
+    канал достаётся любому свободному воркеру. Внешнего ключа на локальную
+    `accounts` нет — та таблица зеркало, источник истины об аккаунтах живёт в
+    Engage; тот же приём, что у `message_readers.account_id`.
+
+    `position` — порядок выдачи, назначается при постановке как максимум плюс
+    один. Не уникален сознательно: две одновременные постановки посчитают один
+    и тот же максимум, и лечится это не схемой, а тай-брейком по `id` в сортировке
+    — порядок всё равно детерминирован. А вот дубль «канал уже стоит» схема
+    запрещает всерьёз: частичный уникальный индекс по активным состояниям не
+    даст второй активной строке доехать до коммита, сколько бы кнопок ни
+    нажали одновременно.
+
+    Состояния: `queued` → `running` → (`done` | `failed`); из `queued` — ещё
+    `canceled`. Повторная постановка запрещена только для активных состояний:
+    законченный канал дочитать ещё раз — законная просьба, не дубль.
+    """
+    __tablename__ = "backfill_queue"
+
+    STATES = ("queued", "running", "done", "failed", "canceled")
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("channels.id"), nullable=False)
+
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+
+    # Кем читать: id аккаунта в Engage или NULL — любой свободный воркер.
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Отложенный запуск: NULL — выдавать сразу.
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Прогон, ради которого элемент поставлен (кнопка «дочитать всем» заводит
+    # один прогон на всю пачку). NULL — элемент поставлен без прогона.
+    run_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("runs.id"))
+
+    requested_by: Mapped[str | None] = mapped_column(String(255))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'running', 'done', 'failed', 'canceled')",
+            name="ck_backfill_state"),
+        # Выдача и «что назрело» идут по (состояние, порядок) — главный запрос
+        # очереди. Отказ от дублей при постановке — по (канал, состояние).
+        Index("ix_backfill_state_position", "state", "position"),
+        Index("ix_backfill_channel_state", "channel_id", "state"),
+        # Один канал — одна активная строка. Частичный, а не полный: законченные
+        # строки остаются в таблице как история, и дубль для них разрешён.
+        Index("uq_backfill_active_channel", "channel_id", unique=True,
+              postgresql_where=text("state IN ('queued', 'running')")),
+    )
 
 
 class LlmTrace(Base):
