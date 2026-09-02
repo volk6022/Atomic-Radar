@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -54,7 +55,28 @@ KIND_WHERE = {"reclassify": "runs", "backfill": "channels",
              "discussions": "channels"}
 
 
+def _aware(dt: datetime | None) -> datetime | None:
+    """Наивную метку считаем локальным временем и делаем aware.
+
+    Из базы (или из тестовой строки) `started_at` приходит и без пояса: вычитание
+    наивного из aware даёт TypeError и гасит весь список прогонов — один кривой ряд
+    не должен стоить экрана. `astimezone()` без аргумента навешивает локальную зону,
+    так что наивная метка означает «столько по настенным часам».
+    """
+    if dt is None or dt.tzinfo is not None:
+        return dt
+    return dt.astimezone()
+
+
 def _row(r: Run) -> dict:
+    started = _aware(r.started_at)
+    finished = _aware(r.finished_at)
+    if started is None:
+        # Не стартовала — длительности нет: 0 читался бы как «отработала мгновенно».
+        duration = None
+    else:
+        end = finished if finished is not None else datetime.now(UTC)
+        duration = (end - started).total_seconds()
     return {
         "id": r.id, "name": r.name, "kind": r.kind, "status": r.status,
         "progress": float(r.progress or 0), "params": r.params or {},
@@ -64,6 +86,7 @@ def _row(r: Run) -> dict:
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "started_at": r.started_at.isoformat() if r.started_at else None,
         "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "duration_seconds": duration,
     }
 
 
