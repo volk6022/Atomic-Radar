@@ -14,9 +14,10 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-    Numeric, String, Text, UniqueConstraint, func,
+    Numeric, String, Text, UniqueConstraint, and_, func, or_,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -314,12 +315,40 @@ class Conversation(Base):
     sent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Момент, когда человек последний раз прочитал нитку. Пусто — не читал вовсе.
+    # Дозоздаётся на существующей базе из `app/db/migrate.py`.
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     waiting_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     handed_off_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 
     events: Mapped[list["ConversationEvent"]] = relationship(back_populates="conversation")
+
+    @hybrid_property
+    def unread(self) -> bool:
+        """Непрочитанность — свойство строки, и правило живёт здесь, в одном месте.
+
+        Диалог непрочитан, если есть входящее, которого человек ещё не видел: либо
+        он не читал вовсе (`read_at` пуст, а входящие были), либо читал, но после
+        прочтения пришло новое (`last_inbound_at > read_at`). Входящих не было —
+        читать нечего, диалог не непрочитан, каким бы ни был `read_at`.
+
+        У гибрида две половины — питоновская для строк и SQL-выражение для
+        запросов, — и они обязаны говорить одно и то же: иначе счётчик значка
+        сойдётся со списком однажды и навсегда разъедется. Список, `total`,
+        значок и флажок в строке — всё ходит через этот атрибут, копий условия
+        в коде нет.
+        """
+        if self.last_inbound_at is None:
+            return False
+        return self.read_at is None or self.last_inbound_at > self.read_at
+
+    @unread.expression
+    @classmethod
+    def unread(cls):
+        return or_(and_(cls.read_at.is_(None), cls.last_inbound_at.isnot(None)),
+                   cls.last_inbound_at > cls.read_at)
 
     __table_args__ = (UniqueConstraint("peer_id", name="uq_conversation_peer"),)
 

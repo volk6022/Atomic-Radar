@@ -409,58 +409,10 @@ async def channel_options(db: GetDB, user=requires(Section.STREAM)):
 # набором чистых заглушек без побочных эффектов.
 
 
-CONVERSATION_STATES = ("new", "awaiting_reply", "replied", "handed_off", "closed")
-
-CONVERSATION_SORTS = {"created": Conversation.created_at, "sent": Conversation.sent_count,
-                      "last": Conversation.last_sent_at, "state": Conversation.state}
-
-
-@router.get("/conversations")
-async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
-                        p: ListParams = Depends(list_params),
-                        state: str | None = None):
-    """Диалоги. Пока система в сухом прогоне, их не будет ни одного — и это
-    не поломка экрана, а главное свойство режима.
-
-    Фильтр по состоянию считается здесь: на клиенте он работал бы только по уже
-    загруженной странице, а диалоги — единственная сущность, которая растёт
-    без ограничений сверху.
-    """
-    if state and state not in CONVERSATION_STATES:
-        raise HTTPException(422, f"неизвестное состояние «{state}», ожидается одно из "
-                                 f"{', '.join(CONVERSATION_STATES)}")
-
-    q = select(Conversation)
-    count_q = select(func.count(Conversation.id))
-    if state:
-        q = q.where(Conversation.state == state)
-        count_q = count_q.where(Conversation.state == state)
-
-    total = (await db.execute(count_q)).scalar_one()
-    q = apply_sort(q, p, CONVERSATION_SORTS, default="created", tiebreak=Conversation.id)
-    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
-    out = []
-    for c in rows:
-        lead = (await db.execute(
-            select(Lead).where(Lead.id == c.lead_id))).scalar_one_or_none()
-        out.append({
-            "id": c.id, "lead_id": c.lead_id,
-            "peer_name": lead.author_name if lead else None,
-            "peer_username": ("@" + lead.author_username)
-                             if lead and lead.author_username else None,
-            "account": c.account_id, "state": c.state, "sent_count": c.sent_count,
-            "last_sent_at": c.last_sent_at.isoformat() if c.last_sent_at else None,
-        })
-    by_state = dict((await db.execute(
-        select(Conversation.state, func.count(Conversation.id))
-        .group_by(Conversation.state))).all())
-
-    return {**p.page(total), "rows": out, "state": state,
-            "states": [{"key": k, "count": by_state.get(k, 0)}
-                       for k in CONVERSATION_STATES],
-            "note": None if out else
-                    ("Диалогов в этом состоянии нет" if state else
-                     "Диалогов нет: в сухом прогоне ни одно сообщение не отправляется")}
+# Экран «Переписки» живёт в `app/api/v1/conversations.py`: у него появилась отметка
+# «прочитано», то есть побочный эффект, и модуль перестал быть чтением — ровно по
+# той причине, по которой сюда раньше переехали тревоги и лиды, только в обратную
+# сторону. Права у него прежние: Section.CONVERSATIONS на каждой ручке.
 
 
 # ── настройка ─────────────────────────────────────────────────────────────────

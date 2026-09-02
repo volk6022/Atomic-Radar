@@ -7,8 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, drafts, ingest, leads, manual_sends, profile,
-                        runs, screens, system, wf_queues)
+from app.api.v1 import (alerts, auth, conversations, drafts, ingest, leads,
+                        manual_sends, profile, runs, screens, system, wf_queues)
 # Псевдоним по той же причине, что и у сценариев ниже: рядом живёт `app.services.events`.
 from app.api.v1 import events as events_api
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
@@ -111,6 +111,9 @@ def create_app() -> FastAPI:
     app.include_router(manual_sends.router)
     app.include_router(runs.router)
     app.include_router(screens.router)
+    # Экран «Переписки» отдельным роутером по той же причине, что и тревоги:
+    # у него есть отметка «прочитано», то есть побочный эффект.
+    app.include_router(conversations.router)
     app.include_router(profile.router)
     app.include_router(workflows_api.router)
     # Данные сценария отдельным роутером: у реестра выше права намеренно слабые
