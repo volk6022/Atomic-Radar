@@ -68,6 +68,12 @@ from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
 from app.services import alerts, cascade_registry, embeddings, jobs, llm, queue
 
+# То же, что и в `app/workers/ingest.py`: arq поднимает этот модуль напрямую, и
+# `basicConfig` из `app/main.py` сюда не доезжает. Без этой строки воркер прогонов
+# молчал на уровне INFO целиком — включая ход реклассификации и перечитку таксономии.
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
 logger = logging.getLogger(__name__)
 
 # Повторов нет. Единица — не «пока не сделали ретраи», а решение: см. докстроку модуля.

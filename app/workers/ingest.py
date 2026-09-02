@@ -46,6 +46,15 @@ from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
 from app.services import alerts, cascade_registry, engage, engage_registry, queue
 
+# Уровень логов настраивается здесь, а не только в `app/main.py`: воркер поднимает
+# arq напрямую по `WorkerSettings`, `app.main` он не импортирует никогда, и потому
+# `basicConfig` оттуда до него не доходит. Корневой логгер оставался на WARNING, и
+# НИ ОДНА info-строка воркера никуда не шла — ни «воркер запустился», ни перечитка
+# таксономии, ни ход бэкфилла. Процесс при этом выглядел исправным: молчание нельзя
+# отличить от «всё хорошо».
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
 logger = logging.getLogger(__name__)
 
 # Сколько раз пробуем событие. Три, а не пять: временный сбой закрывается первым же
