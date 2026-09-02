@@ -239,9 +239,16 @@ CHANNEL_SORTS = {"title": Channel.title, "members": Channel.members,
 
 @router.get("/channels")
 async def channels(db: GetDB, user=requires(Section.CHANNELS),
-                   p: ListParams = Depends(list_params)):
+                   p: ListParams = Depends(list_params),
+                   chat_type: str | None = None,
+                   discussion: str | None = None):
     """Реестр групп. Заводятся сами при первом сообщении из группы — просить оператора
     зарегистрировать канал заранее значило бы терять то, про что он ещё не знает."""
+    if discussion and discussion not in discussions.STATES:
+        raise HTTPException(
+            422, f"неизвестное состояние обсуждения «{discussion}», ожидается одно из "
+                 f"{', '.join(discussions.STATES)}")
+
     q = select(Channel)
     count_q = select(func.count(Channel.id))
 
@@ -251,14 +258,19 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
     q = apply_search(q, p, search)
     count_q = apply_search(count_q, p, search)
 
-    total = (await db.execute(count_q)).scalar_one()
-    q = apply_sort(q, p, CHANNEL_SORTS, default="leads_total", tiebreak=Channel.id)
-    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
+    # Тип чата — хранимая колонка, поэтому фильтр целиком уходит в SQL. Значение
+    # не проверяется по белому списку: типы придумывает Telegram, а не мы, и
+    # закрытого перечня в коде нет и быть не может.
+    if chat_type:
+        q = q.where(Channel.chat_type == chat_type)
+        count_q = count_q.where(Channel.chat_type == chat_type)
 
-    # Счётчики и связи считаются один раз на страницу, а не запросом на строку.
+    # Счётчики и связи считаются один раз на запрос, а не запросом на строку.
     # Раньше здесь было два запроса на каждый канал, а состояние обсуждения требует
     # заглянуть ещё и в ЧУЖУЮ строку — строку группы, которой на этой странице может
     # не быть вовсе. Пятьдесят строк превратились бы в полторы сотни запросов.
+    # Считаются до пагинации, потому что нужны не только отрисовке страницы, но и
+    # фильтру по состоянию обсуждения ниже.
     counts = dict((await db.execute(
         select(Message.channel_id, func.count(Message.id))
         .group_by(Message.channel_id))).all())
@@ -269,9 +281,25 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
     last_at = dict((await db.execute(
         select(Message.channel_id, func.max(Message.tg_date))
         .group_by(Message.channel_id))).all())
-    by_username = {c.username.lower(): c for c in (await db.execute(
-        select(Channel).where(Channel.username.isnot(None)))).scalars().all()
-        if c.username}
+    every = (await db.execute(select(Channel))).scalars().all()
+    by_username = {c.username.lower(): c for c in every if c.username}
+
+    # Состояние обсуждения — вычисление, а не колонка (`app/services/discussions.py`),
+    # поэтому в SQL его не положить. Считаем его по ВСЕМ каналам ровно тем же
+    # способом, что и `discussions_summary` в `app/api/v1/ingest.py`, отбираем
+    # подошедшие id и только потом накладываем фильтр. Резать им уже выданную
+    # страницу нельзя: `total` считался бы без фильтра, и номера страниц разошлись
+    # бы с их содержимым.
+    if discussion:
+        ids = [c.id for c in every
+               if discussions.discussion_state(
+                   c, by_username, counts, last_at)["state"] == discussion]
+        q = q.where(Channel.id.in_(ids))
+        count_q = count_q.where(Channel.id.in_(ids))
+
+    total = (await db.execute(count_q)).scalar_one()
+    q = apply_sort(q, p, CHANNEL_SORTS, default="leads_total", tiebreak=Channel.id)
+    rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
 
     out = []
     for c in rows:
@@ -301,7 +329,12 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
             "subscribed_account_id": c.subscribed_account_id,
             "subscribed_by": c.subscribed_by,
         })
-    return {**p.page(total), "rows": out}
+    return {**p.page(total), "rows": out,
+            # По чему вообще можно сортировать — из CHANNEL_SORTS, а не своя копия
+            # на экране: разъехаться они не должны. Неизвестный ключ всё равно
+            # отвергается с перечнем полей (`apply_sort`), здесь же список отдаётся
+            # заранее, чтобы контролы рисовались без пробного запроса.
+            "sorts": sorted(CHANNEL_SORTS)}
 
 
 # Колонки, по которым разрешено сортировать поток. Белый список, а не «любое поле
