@@ -164,6 +164,68 @@ def message_link(channel: Channel, message: Message) -> str | None:
     return None
 
 
+async def source_links(db, channel: Channel, message: Message) -> dict:
+    """Две ссылки на источник и пометка «это комментарий»: где лежит сообщение и под
+    каким постом канала.
+
+    Лид в публичном сценарии — комментарий под постом канала. Ссылка на сам
+    комментарий открывает ГРУППУ ОБСУЖДЕНИЯ, и человек, который в ней не состоит,
+    видит чужой чат без контекста. Поэтому черновику нужны обе ссылки — на комментарий
+    и на пост, — плюс `is_comment`, чтобы по одной записи отличить одно от другого.
+
+    Комментарий опознаётся по корню ветки: у сообщения есть `thread_id`, и в том же
+    канале лежит сообщение с `tg_message_id == thread_id` и
+    `is_automatic_forward = True` — пост, отзеркаленный в обсуждение. Номер поста
+    внутри канала берётся с ЭТОГО корня (`forward_from_message_id`), не с комментария.
+    У сообщений, приехавших до правки Engage, номера нет — и тогда `post_link` остаётся
+    None, а не собирается наугад: подстановка номера корня уводила бы на чужой пост,
+    потому что нумерация в канале и в группе разная. Неверная ссылка хуже отсутствующей.
+    """
+    comment_link = message_link(channel, message)
+
+    is_comment = False
+    post_link = None
+    post_channel = None
+
+    if message.thread_id is not None:
+        root = (await db.execute(
+            select(Message).where(
+                Message.channel_id == message.channel_id,
+                Message.tg_message_id == message.thread_id,
+                Message.is_automatic_forward.is_(True),
+            ))).scalar_one_or_none()
+        if root is not None:
+            is_comment = True
+            if root.forward_from_chat_id is not None:
+                origin = (await db.execute(
+                    select(Channel).where(
+                        Channel.peer_id == root.forward_from_chat_id)
+                )).scalar_one_or_none()
+                if origin is not None:
+                    post_channel = origin.title
+                if root.forward_from_message_id is not None:
+                    # Арифметика ссылки одна — та же, что для комментария: канал
+                    # с юзернеймом получает t.me/<username>/<id>, без — внутреннюю
+                    # t.me/c/<id>/<msg>. Канал-источник может и не быть в реестре
+                    # (пост отзеркален из чужого канала), тогда имени нет и ссылка
+                    # строится по peer_id, как для приватной группы.
+                    origin_channel = Channel(
+                        peer_id=root.forward_from_chat_id,
+                        username=origin.username if origin else None,
+                        title=post_channel or "",
+                    )
+                    origin_message = Message(
+                        tg_message_id=root.forward_from_message_id)
+                    post_link = message_link(origin_channel, origin_message)
+
+    return {
+        "comment_link": comment_link,
+        "post_link": post_link,
+        "is_comment": is_comment,
+        "post_channel": post_channel,
+    }
+
+
 async def ensure_draft(db, lead: Lead) -> Draft:
     """Черновик по лиду — ровно один, создаётся при первом обращении к очереди."""
     draft = (await db.execute(

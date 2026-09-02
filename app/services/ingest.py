@@ -69,7 +69,10 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
                          author_peer_id: int | None, author_username: str | None,
                          author_name: str | None, author_is_bot: bool,
                          is_automatic_forward: bool, reply_to_message_id: int | None,
-                         thread_id: int | None, now: datetime | None = None,
+                         thread_id: int | None,
+                         forward_from_chat_id: int | None = None,
+                         forward_from_message_id: int | None = None,
+                         now: datetime | None = None,
                          bound: list[targeting.Bound] | None = None,
                          summary: dict | None = None) -> tuple[Message, bool]:
     """Записать сообщение и прогнать его по дешёвым ступеням каскада.
@@ -100,6 +103,11 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
         "author_name": author_name, "author_is_bot": author_is_bot,
         "is_automatic_forward": is_automatic_forward,
         "reply_to_message_id": reply_to_message_id, "thread_id": thread_id,
+        # Пост-источник автопересылки. Как и thread_id, это свойство самого сообщения
+        # в Telegram, а не результат каскада: пишется при вставке и при конфликте не
+        # перезаписывается — первым путём, как и остальные неизменяемые поля.
+        "forward_from_chat_id": forward_from_chat_id,
+        "forward_from_message_id": forward_from_message_id,
         "text": text,
         "cascade_level": verdict["level"], "cascade_passed": verdict["passed"],
         "cascade_detail": verdict["detail"],
@@ -210,6 +218,8 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
         is_automatic_forward=bool(payload.get("is_automatic_forward")),
         reply_to_message_id=payload.get("reply_to_message_id"),
         thread_id=payload.get("message_thread_id"),
+        forward_from_chat_id=payload.get("forward_from_chat_id"),
+        forward_from_message_id=payload.get("forward_from_message_id"),
         bound=await targeting.bind_active(db), summary=summary,
     )
 
@@ -255,6 +265,8 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
             is_automatic_forward=bool(p.get("is_automatic_forward")),
             reply_to_message_id=p.get("reply_to_message_id"),
             thread_id=p.get("message_thread_id"),
+            forward_from_chat_id=p.get("forward_from_chat_id"),
+            forward_from_message_id=p.get("forward_from_message_id"),
             bound=bound, summary=summary,
         )
         message_ids.append(message.id)
