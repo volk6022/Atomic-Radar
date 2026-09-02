@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 
 from app.db.models import Channel, Draft, Lead, Message
 
@@ -224,6 +224,68 @@ async def source_links(db, channel: Channel, message: Message) -> dict:
         "is_comment": is_comment,
         "post_channel": post_channel,
     }
+
+
+async def source_links_many(db, targets: list[tuple[Channel, Message]]) -> list[dict]:
+    """То же, что `source_links`, но на всю страницу: три запроса вместо двух на строку.
+
+    Поштучный вызов на странице в пятьдесят строк — это до сотни лишних походов в базу,
+    и растёт их число молча, вместе с размером страницы.
+
+    ⚠️ Корень ветки ищется парой (канал, номер), а не по одному `thread_id`: номер
+    сообщения уникален внутри чата, а не глобально, и поиск по одному номеру склеил бы
+    ветки разных чатов — комментарий из одной группы получил бы ссылку на пост другой.
+    Тихо и правдоподобно.
+
+    Ответ идёт в порядке входа: страница сопоставляет строки с ним по позиции.
+    """
+    if not targets:
+        return []
+
+    # 1. Корни веток — одним запросом по всем парам (канал, номер ветки).
+    wanted = {(m.channel_id, m.thread_id) for _, m in targets if m.thread_id is not None}
+    roots: dict[tuple[int, int], Message] = {}
+    if wanted:
+        rows = (await db.execute(
+            select(Message).where(
+                tuple_(Message.channel_id, Message.tg_message_id).in_(wanted),
+                Message.is_automatic_forward.is_(True)))).scalars().all()
+        roots = {(r.channel_id, r.tg_message_id): r for r in rows}
+
+    # 2. Каналы-источники постов — тоже одним запросом.
+    origin_peers = {r.forward_from_chat_id for r in roots.values()
+                    if r.forward_from_chat_id is not None}
+    origins: dict[int, Channel] = {}
+    if origin_peers:
+        rows = (await db.execute(
+            select(Channel).where(Channel.peer_id.in_(origin_peers)))).scalars().all()
+        origins = {c.peer_id: c for c in rows}
+
+    out: list[dict] = []
+    for channel, message in targets:
+        root = (roots.get((message.channel_id, message.thread_id))
+                if message.thread_id is not None else None)
+        is_comment = root is not None
+        post_link = None
+        post_channel = None
+        if root is not None and root.forward_from_chat_id is not None:
+            origin = origins.get(root.forward_from_chat_id)
+            if origin is not None:
+                post_channel = origin.title
+            if root.forward_from_message_id is not None:
+                # Арифметика ссылки одна на весь модуль — та же `message_link`, что и
+                # для комментария. Канал-источник может отсутствовать в реестре (пост
+                # отзеркален из чужого канала): тогда имени нет, и ссылка строится по
+                # peer_id, как для приватной группы.
+                post_link = message_link(
+                    Channel(peer_id=root.forward_from_chat_id,
+                            username=origin.username if origin else None,
+                            title=post_channel or ""),
+                    Message(tg_message_id=root.forward_from_message_id))
+        out.append({"comment_link": message_link(channel, message),
+                    "post_link": post_link, "is_comment": is_comment,
+                    "post_channel": post_channel})
+    return out
 
 
 async def ensure_draft(db, lead: Lead) -> Draft:

@@ -51,8 +51,8 @@ from app.core.outbound_gate import OutboundGate, SendRequest
 from app.db.models import (Account, AuditLog, Channel, EngageInstance, ManualSend,
                            Message, MessageReader, WfDraft, WfOutbound, WfTarget,
                            WfVerdict, Workflow)
-from app.services import (manual_sends as manual_sends_service, wf_drafting,
-                          workflows as workflow_service)
+from app.services import (drafting, manual_sends as manual_sends_service,
+                          wf_drafting, workflows as workflow_service)
 
 logger = logging.getLogger("radar")
 
@@ -405,6 +405,29 @@ async def _readers_by_message(db: GetDB, instance_key: str,
     return out
 
 
+async def _source_by_message(db, channel_by_id: dict, targets: list) -> dict:
+    """Ссылки на источник для страницы: по одному набору запросов, а не на строку.
+
+    Возвращает словарь по `message_id`, потому что строка и карточка достают его
+    по-разному, а форма ответа обязана быть одна: разойдись они полем, ссылка на пост
+    была бы видна только в одном из двух мест.
+    """
+    if not targets:
+        return {}
+    messages = {m.id: m for m in (await db.execute(
+        select(Message).where(Message.id.in_([t.message_id for t in targets])))
+    ).scalars()}
+    pairs, order = [], []
+    for t in targets:
+        message = messages.get(t.message_id)
+        channel = channel_by_id.get(t.channel_id)
+        if message is None or channel is None:
+            continue
+        pairs.append((channel, message))
+        order.append(t.message_id)
+    return dict(zip(order, await drafting.source_links_many(db, pairs)))
+
+
 @router.get("/drafts")
 async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
@@ -468,6 +491,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
     readers = await _readers_by_message(
         db, instance_key, [t.message_id for _, t, _ in rows])
+    source = await _source_by_message(db, {c.id: c for _, _, c in rows},
+                                      [t for _, t, _ in rows])
 
     out = [{
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -478,6 +503,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         "channel": c.title, "pain": t.pain, "score": t.score,
         "quote": t.quote,
         "readers": readers.get(t.message_id, []),
+        "source": source.get(t.message_id),
         "variants": d.variants or [],
         "chosen_variant": d.chosen_variant, "final_text": d.final_text,
         "reject_reason": d.reject_reason,
@@ -492,7 +518,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
 
 def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
-         readers: list[dict]) -> dict:
+         readers: list[dict], source: dict | None = None) -> dict:
     """Черновик целиком — для карточки, а не для строки таблицы.
 
     Одна форма на курсорную выдачу и на прямую ссылку: экран у них общий, и разойдись
@@ -511,6 +537,7 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
         "author_username": ("@" + t.author_username) if t.author_username else None,
         "tg_link": _user_link(t.author_username),
         "readers": readers,
+        "source": source,
         "channel": c.title, "pain": t.pain, "score": t.score, "quote": t.quote,
         "score_breakdown": t.score_breakdown or [],
         "disqualifiers": t.disqualifiers or [],
@@ -593,7 +620,9 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
     one = None
     if row is not None:
         readers = await _readers_by_message(db, instance_key, [row[1].message_id])
-        one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []))
+        source = await _source_by_message(db, {row[2].id: row[2]}, [row[1]])
+        one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []),
+                   source.get(row[1].message_id))
 
     # `readers` и `tg_link` продублированы на верхний уровень конверта — как у
     # прямой ссылки на карточку: конверты у ручек обязаны совпадать, экран их не
@@ -634,7 +663,8 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
     d, t = row[0], row[1]
     readers = (await _readers_by_message(
         db, await _instance_key(db, wf), [t.message_id])).get(t.message_id, [])
-    one = _one(wf, d, t, row[2], readers)
+    source = await _source_by_message(db, {row[2].id: row[2]}, [t])
+    one = _one(wf, d, t, row[2], readers, source.get(t.message_id))
     return {"remaining": await _pending(db, wf), "state": d.state,
             "workflow": wf.key,
             "readers": one["readers"], "tg_link": one["tg_link"],
