@@ -192,6 +192,7 @@ async def _job_discussions(run_id: int, params: dict) -> dict:
         return await discussions.scan(
             channel_ids=channel_ids, account_ids=accounts,
             target=int(params.get("target") or discussions.PAGE_LIMIT),
+            check_only=bool(params.get("check_only")),
             report=report, cancelled=cancelled)
 
 

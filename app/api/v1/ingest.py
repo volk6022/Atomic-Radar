@@ -748,12 +748,19 @@ class ScanDiscussionsRequest(BaseModel):
     channel_ids: list[int] = Field(default_factory=list)
     account_ids: list[int] = Field(default_factory=list)
     target: int = Field(PAGE_LIMIT, ge=1, le=10_000)
+    # Только спросить карточки и записать связь, историю не дочитывать. Карте
+    # «где у каналов группа обсуждения вообще есть» чтение не нужно, а стоит оно
+    # дороже всего остального: страницы истории плюс каскад на каждое сообщение.
+    check_only: bool = False
 
 
 @operator_router.post("/discussions/scan", status_code=202)
 async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: GetDB,
                            user=permits(Section.CHANNELS, Capability.RUN_BACKFILL)):
     """Разобрать группы обсуждения списком: связь + история.
+
+    С `check_only=true` — только связь: карточки опрошены, группы заведены,
+    история не читается (граница — в `app/services/discussions.py`, `_scan_one`).
 
     Кнопка «Запустить бэкфилл всем» на экране Channels этого не умеет и не сможет:
     она перебирает строки, которые видит, а у групп, которые мы ни разу не читали,
@@ -769,7 +776,8 @@ async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: G
         raise HTTPException(422, "scope=ids требует непустой channel_ids")
 
     params = {"scope": body.scope, "channel_ids": body.channel_ids,
-              "account_ids": body.account_ids, "target": body.target}
+              "account_ids": body.account_ids, "target": body.target,
+              "check_only": body.check_only}
     try:
         run = await jobs.start(db, kind="discussions", params=params,
                                name="Разбор групп обсуждения", user_email=user.email)
@@ -785,9 +793,13 @@ async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: G
     await db.commit()
     logger.info("discussions_scan_started scope=%s target=%s run=%s by=%s",
                 body.scope, body.target, run.id, user.email)
-    return {"started": True, "run_id": run.id,
-            "note": "разбор идёт в разделе Runs: у каждого канала спрашиваем "
-                    "карточку, заводим его группу обсуждения и дочитываем её историю"}
+    if body.check_only:
+        note = ("разбор идёт в разделе Runs: у каждого канала спрашиваем карточку "
+                "и заводим его группу обсуждения, историю не читаем")
+    else:
+        note = ("разбор идёт в разделе Runs: у каждого канала спрашиваем "
+                "карточку, заводим его группу обсуждения и дочитываем её историю")
+    return {"started": True, "run_id": run.id, "note": note}
 
 
 # ── запуск ────────────────────────────────────────────────────────────────────
