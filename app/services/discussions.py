@@ -215,8 +215,14 @@ async def _read_history(db, account_id: int, *, peer_id: int, username: str | No
 
 
 async def _scan_one(db, channel_id: int, account_id: int, *,
-                    target: int, cancelled) -> dict:
+                    target: int, cancelled, check_only: bool = False) -> dict:
     """Разобрать один канал: карточка → связь → (если это группа) история.
+
+    Граница «проверить / дочитать» проходит по вызову `_read_history`: всё до него —
+    опрос карточек и запись связи (`linked_checked_at`, строка группы), сам же вызов
+    и только он читает историю (`get_chat_history`). При `check_only=True` на этой
+    границе разбор заканчивается: в ответе стоит `checked_only`, а `read` остаётся
+    нулём не потому, что группа пуста, а потому что её не читали.
 
     Ветка по типу чата, а не по имени строки: в `channels` лежат вперемешку каналы
     и их группы обсуждения (`corpostrovokru` и `corpostrovokru_chat` — две
@@ -247,6 +253,8 @@ async def _scan_one(db, channel_id: int, account_id: int, *,
     if chat_type in GROUP_TYPES:
         # Строка сама и есть группа обсуждения. Читаем её напрямую — искать «её
         # группу» некуда, `linked` здесь указывает обратно на канал.
+        if check_only:
+            return {"group_id": channel.id, "own_group": True, "checked_only": True}
         read = await _read_history(db, account_id, peer_id=channel.peer_id,
                                    username=channel.username, title=channel.title,
                                    target=target, cancelled=cancelled)
@@ -275,21 +283,27 @@ async def _scan_one(db, channel_id: int, account_id: int, *,
     have = (await db.execute(select(func.count(Message.id))
                              .where(Message.channel_id == group.id))).scalar_one()
     read = 0
-    if have < target:
+    if not check_only and have < target:
         read = await _read_history(db, account_id, peer_id=group.peer_id,
                                    username=group.username, title=group.title,
                                    target=target - have, cancelled=cancelled)
-    return {"group_id": group.id, "linked": group.username, "read": read,
-            "already_had": have}
+    out = {"group_id": group.id, "linked": group.username, "read": read,
+           "already_had": have}
+    if check_only:
+        out["checked_only"] = True
+    return out
 
 
 async def scan(*, channel_ids: list[int], account_ids: list[int], target: int,
-               report, cancelled) -> dict:
+               report, cancelled, check_only: bool = False) -> dict:
     """Пройти список каналов, разложив их по аккаунтам.
 
     Параллелизм ровно по числу аккаунтов: очередь задач у Engage поаккаунтная, и
     два одновременных чтения одним аккаунтом встанут друг за другом, зато потратят
     дневной бюджет вдвое быстрее без выигрыша по времени.
+
+    При `check_only=True` история не читается вовсе: прогон только спрашивает
+    карточки, записывает связь и заводит строки групп.
 
     Отказ на одном канале не отменяет остальные. Приватная группа, опечатка в имени,
     флуд-контроль на одном аккаунте — обычные события на списке из шестидесяти
@@ -312,7 +326,8 @@ async def scan(*, channel_ids: list[int], account_ids: list[int], target: int,
             try:
                 async with maker() as db:
                     out = await _scan_one(db, channel_id, account_id,
-                                          target=target, cancelled=cancelled)
+                                          target=target, cancelled=cancelled,
+                                          check_only=check_only)
             except Exception as e:  # noqa: BLE001 — один канал не роняет прогон
                 logger.warning("discussion_scan_failed channel=%s account=%s error=%s",
                                channel_id, account_id, e)
@@ -350,6 +365,11 @@ def _note(channel_id: int, out: dict) -> str:
     if out.get("no_group"):
         return f"канал {channel_id}: группы обсуждения нет"
     if out.get("own_group"):
+        if out.get("checked_only"):
+            return f"группа {channel_id}: проверена, история не читалась"
         return f"группа {channel_id}: прочитано {out.get('read', 0)}"
+    if out.get("checked_only"):
+        return (f"канал {channel_id} → @{out.get('linked')}: группа найдена, "
+                f"история не читалась, уже было {out.get('already_had', 0)}")
     return (f"канал {channel_id} → @{out.get('linked')}: прочитано "
             f"{out.get('read', 0)}, уже было {out.get('already_had', 0)}")
