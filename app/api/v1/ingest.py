@@ -213,7 +213,11 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
             raise HTTPException(400, "в webhook_url не передан peer_id группы")
         out = await ingest_service.ingest_history(
             db, chat_id=int(peer_id), chat_username=q.get("username"),
-            chat_title=q.get("title"), posts=result.get("posts") or [])
+            chat_title=q.get("title"), posts=result.get("posts") or [],
+            # Аккаунт, читавший страницу, едет параметром вебхука с самого заказа
+            # страницы (`_request_page`) — истории без читателя не бывает, но
+            # требовать его здесь жёстко значило бы уронить приём старых адресов.
+            account_id=int(q.get("account_id") or 0) or None)
         await db.commit()
         out["next"] = await _continue_backfill(db, out, q)
         return out

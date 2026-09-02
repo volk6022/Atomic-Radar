@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core import cascade
-from app.db.models import Channel, Lead, Message
+from app.db.models import Channel, Lead, Message, MessageReader
 from app.services import embeddings, llm, targeting
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,24 @@ async def _ensure_lead(db, *, channel: Channel, message: Message, verdict: dict)
 
 # ── разбор конвертов Engage ───────────────────────────────────────────────────
 
+async def _mark_readers(db, *, message_ids: list[int], account_id: int) -> None:
+    """Отметить, что аккаунт видел сообщения.
+
+    `ON CONFLICT DO NOTHING`, а не upsert: вебхуки Engage переигрываются при
+    неподтверждённой доставке, и повтор того же события тем же аккаунтом обязан
+    оставить ровно ту же строку — иначе «первый раз увидел» перезатрётся, а
+    список читателей начнёт расти от каждого ретрая.
+
+    Списком, а не по одному сообщению: бэкфилл привозит пачки по двести штук, и
+    запрос на сообщение здесь стоил бы столько же, сколько сам приём пачки.
+    """
+    stmt = (pg_insert(MessageReader)
+            .values([{"message_id": mid, "account_id": account_id}
+                     for mid in message_ids])
+            .on_conflict_do_nothing())
+    await db.execute(stmt)
+
+
 async def ingest_incoming_message(db, payload: dict) -> dict:
     """Событие вотчера: одно новое сообщение."""
     chat_id = payload.get("chat_id")
@@ -183,7 +201,7 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
     tg_date = parse_dt(payload.get("date")) or datetime.now(timezone.utc)
 
     summary: dict = {}
-    _, created = await upsert_message(
+    message, created = await upsert_message(
         db, channel=channel, tg_message_id=payload.get("message_id"),
         tg_date=tg_date, text=payload.get("message"),
         author_peer_id=payload.get("from_peer_id"),
@@ -194,12 +212,26 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
         thread_id=payload.get("message_thread_id"),
         bound=await targeting.bind_active(db), summary=summary,
     )
+
+    # Вотчер кладёт `account_id` в каждое событие — это и есть «кто увидел». Поля
+    # может не быть (старые события, ручной засев): тогда читателей просто нет,
+    # и это не ошибка приёма — сообщение важнее атрибуции.
+    account_id = payload.get("account_id")
+    if account_id:
+        await _mark_readers(db, message_ids=[message.id], account_id=account_id)
+
     return {"accepted": 1, "created": int(created), "workflows": summary}
 
 
 async def ingest_history(db, *, chat_id: int, chat_username: str | None,
-                         chat_title: str | None, posts: list[dict]) -> dict:
-    """Результат `get_chat_history`: пачка сообщений одной группы."""
+                         chat_title: str | None, posts: list[dict],
+                         account_id: int | None = None) -> dict:
+    """Результат `get_chat_history`: пачка сообщений одной группы.
+
+    `account_id` — каким аккаунтом историю читали; истории читает конкретный
+    аккаунт, и без атрибуции выбор «от чьего имени писать» снова гадать нечем.
+    `None` — аккаунт неизвестен (старый засев, тесты), читатели не отмечаются.
+    """
     channel = await get_or_create_channel(
         db, peer_id=chat_id, username=chat_username, title=chat_title)
 
@@ -208,13 +240,14 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
     summary: dict = {}
 
     accepted = 0
+    message_ids: list[int] = []
     for p in posts:
         tg_date = parse_dt(p.get("date"))
         if tg_date is None or p.get("message_id") is None:
             continue
         name = " ".join(x for x in (p.get("from_first_name"),
                                     p.get("from_last_name")) if x) or None
-        await upsert_message(
+        message, _ = await upsert_message(
             db, channel=channel, tg_message_id=p["message_id"], tg_date=tg_date,
             text=p.get("text"), author_peer_id=p.get("from_user_id"),
             author_username=p.get("from_username"), author_name=name,
@@ -224,7 +257,14 @@ async def ingest_history(db, *, chat_id: int, chat_username: str | None,
             thread_id=p.get("message_thread_id"),
             bound=bound, summary=summary,
         )
+        message_ids.append(message.id)
         accepted += 1
+
+    # Читатель ставится всей пачке одним запросом, а не запросом на сообщение:
+    # бэкфилл привозит по двести сообщений, и на каждую пометку свой INSERT
+    # удваивал бы число запросов приёма.
+    if account_id is not None and message_ids:
+        await _mark_readers(db, message_ids=message_ids, account_id=account_id)
 
     # Курсор бэкфилла: с какого id продолжать листать назад.
     ids = [p["message_id"] for p in posts if p.get("message_id")]
