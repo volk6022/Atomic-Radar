@@ -195,6 +195,7 @@ def paths(ids: dict) -> list[tuple[str, str]]:
     экран подставляет туда настоящий id, а проверке важна форма ответа, а не номер.
     """
     d, t, wf_d = ids["draft_id"], ids["target_id"], ids["wf_draft_id"]
+    cv = ids["conversation_id"]
     q = f"?workflow_id={ids['workflow_id']}"
     return [
         ("/auth/me", "/auth/me"),
@@ -214,6 +215,7 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/drafts/reasons", "/drafts/reasons"),
         ("/drafts/{id}", f"/drafts/{d}"),
         ("/conversations", "/conversations"),
+        ("/conversations/{id}", f"/conversations/{cv}"),
         ("/profile", "/profile"),
         ("/profile/versions", "/profile/versions"),
         ("/limits", "/limits"),
@@ -267,7 +269,10 @@ async def main() -> None:
             select(WfTarget).order_by(WfTarget.id))).scalars().first()
         wf = (await db.execute(
             select(Workflow).where(Workflow.key == "cold_dm"))).scalar_one()
+        conversation = (await db.execute(
+            select(Conversation).order_by(Conversation.id))).scalars().first()
         ids = {"draft_id": draft.id, "target_id": target.id,
+               "conversation_id": conversation.id,
                "workflow_id": wf.id, "owner_id": owner.id, "wf_draft_id": None}
     await engine.dispose()
 
