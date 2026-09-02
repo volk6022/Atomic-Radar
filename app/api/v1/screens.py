@@ -35,8 +35,8 @@ from app.core.access import Capability, Section, allows
 from app.core.config import get_settings
 from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
-                           Lead, LlmTrace, Message, OutboundAttempt,
-                           ProfileVersion, User)
+                           Lead, LlmTrace, Message, MessageReader,
+                           OutboundAttempt, ProfileVersion, User)
 from app.services import (cascade_registry, discussions, drafting, embeddings,
                           engage, llm, queue)
 
@@ -389,11 +389,19 @@ async def messages(db: GetDB, user=requires(Section.STREAM),
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).all()
 
     lead_by_message = {}
+    readers_by_message: dict[int, list[int]] = {}
     if rows:
         ids = [m.id for m, _ in rows]
         for lead_id, msg_id in (await db.execute(
                 select(Lead.id, Lead.message_id).where(Lead.message_id.in_(ids)))).all():
             lead_by_message[msg_id] = lead_id
+        # Читатели — одним запросом на страницу, по образцу `lead_by_message`
+        # выше: запрос на строку здесь уже случался в `/channels` и стоил
+        # полутора сотен запросов на страницу в пятьдесят строк.
+        for msg_id, acc_id in (await db.execute(
+                select(MessageReader.message_id, MessageReader.account_id)
+                .where(MessageReader.message_id.in_(ids)))).all():
+            readers_by_message.setdefault(msg_id, []).append(acc_id)
 
     out = []
     for m, c in rows:
@@ -411,6 +419,11 @@ async def messages(db: GetDB, user=requires(Section.STREAM),
             "cascade": cascade.stage_flags(level, ok),
             "cascade_notes": detail,
             "lead_id": lead_by_message.get(m.id),
+            # Кто из аккаунтов видел сообщение (29.08: писать от имени прочитавшего).
+            # Список, потому что читателей может быть несколько; пустой список, а
+            # не None, — честное «неизвестно», по нему кнопка «ЛС» и решит, что
+            # предложить нечего.
+            "readers": sorted(readers_by_message.get(m.id, [])),
         })
     return {**p.page(total), "rows": out}
 

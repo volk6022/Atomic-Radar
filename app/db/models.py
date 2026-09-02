@@ -244,6 +244,34 @@ class Message(Base):
     )
 
 
+class MessageReader(Base):
+    """Аккаунт Engage, видевший сообщение.
+
+    29.08, заказчик: «берем аккаунт который прочитал сообщение и я от его имени
+    пишу» — атрибуция приёма, без которой выбор аккаунта для ответа брать неоткуда.
+
+    Таблица, а не колонка в `messages`: приём идемпотентен по ключу
+    `(channel_id, tg_message_id)`, и одно сообщение, увиденное двумя аккаунтами, —
+    одна строка `messages`. Колонка «кто видел» хранила бы только последнего.
+
+    `account_id` — идентификатор аккаунта в Engage, а не строка локальной `accounts`:
+    та таблица — зеркало, Radar аккаунтами не владеет, и внешнего ключа тут быть
+    не может (как у `engage_account_id` в `manual_sends`).
+    """
+    __tablename__ = "message_readers"
+
+    message_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Время первого появления пары: вставка идемпотентна (`ON CONFLICT DO NOTHING`),
+    # повторная доставка записи не обновляет, поэтому колонка хранит именно
+    # первую встречу, а не последний вебхук.
+    first_seen_at: Mapped[datetime] = _created()
+
+    # По этому индексу выбирают «что видел этот аккаунт» — прямой запрос экрана.
+    __table_args__ = (Index("ix_message_reader_account", "account_id"),)
+
+
 class Lead(Base):
     __tablename__ = "leads"
 

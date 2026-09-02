@@ -195,7 +195,8 @@ async def _read_history(db, account_id: int, *, peer_id: int, username: str | No
         if not posts:
             break
         out = await ingest_service.ingest_history(
-            db, chat_id=peer_id, chat_username=username, chat_title=title, posts=posts)
+            db, chat_id=peer_id, chat_username=username, chat_title=title,
+            posts=posts, account_id=account_id)
         await db.commit()
         accepted += out.get("accepted", 0)
 
