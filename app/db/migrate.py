@@ -83,6 +83,14 @@ STATEMENTS: list[str] = [
     # покроет — частичный индекс по одной ветке планировщик в OR-предикате не
     # использует, и вышел бы индекс для галочки, а не для скорости.
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ",
+
+    # 2026-09-02, ссылки из черновика: у поста, отзеркаленного в группу обсуждения,
+    # запоминаем канал-источник и номер поста внутри него — без них ссылку «под каким
+    # постом» собрать не из чего. Таблица messages на проде уже существует, и
+    # `create_all` новые колонки в неё не добавляет, поэтому досоздаются они только
+    # здесь.
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forward_from_chat_id BIGINT",
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forward_from_message_id BIGINT",
 ]
 
 

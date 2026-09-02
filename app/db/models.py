@@ -228,6 +228,14 @@ class Message(Base):
     reply_to_message_id: Mapped[int | None] = mapped_column(BigInteger)
     thread_id: Mapped[int | None] = mapped_column(BigInteger)
 
+    # Пост канала, из которого сделана автопересылка в группу обсуждения: id чата-
+    # источника и номер поста внутри этого канала. Стоят на корне ветки (у самого
+    # поста-зеркала), не у комментариев. Без них ссылку «под каким постом» собрать
+    # не из чего — а номер корня в группе подставлять нельзя: нумерация канала и
+    # группы разная, и ссылка уводила бы на чужой пост.
+    forward_from_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    forward_from_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
     text: Mapped[str | None] = mapped_column(Text)
 
     # Каскад: на каком уровне сообщение отсеяно и почему. NULL — ещё не обрабатывалось.
