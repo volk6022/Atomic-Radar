@@ -249,7 +249,8 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
                         | None,
                         disqualifiers: Mapping[str, Sequence[str]] | None,
                         noise_prototypes: Mapping[str, Sequence[str]] | None,
-                        actor: str, activate: bool) -> CascadeVersion:
+                        actor: str, activate: bool,
+                        replace: bool = False) -> CascadeVersion:
     """Новая версия таксономии: якоря L1, дисквалификаторы и эталоны L2 — боли и шум.
 
     `pains[label] = (anchors, prototypes_or_none)`, `anchors` — как их ввёл человек,
@@ -257,6 +258,13 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
     значит «эту боль не трогаем на уровне L2» — переносим её прежние эталонные
     фразы вперёд без изменений и без похода к эмбеддеру; пустой список — осознанное
     «эталонов для этой боли больше нет».
+
+    `replace=True` — переданное считается ПОЛНЫМ набором: боли, шум и
+    дисквалификаторы, которых в нём нет, из новой версии исчезают. Нужно для
+    загрузки настроек целиком одним файлом: без этого прежние ярлыки остаются
+    рядом с новыми, и отбор идёт по смеси двух наборов — состояние, которое
+    выглядит рабочим и не является им. По умолчанию False: точечная правка одной
+    боли не должна сносить остальные.
 
     Возвращает новую строку. Активация (или её отсутствие для предложения
     заказчика) решена заранее вызывающим кодом по `Capability.CONFIG_EDIT` /
@@ -282,10 +290,17 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
         bucket.setdefault(r.label, []).append(r.phrase)
         prev_vectors[(r.kind, r.label, r.phrase)] = r.vector
 
-    pain_anchors = {k: list(v) for k, v in (current.pain_anchors if current else {}).items()}
-    disq = {k: list(v) for k, v in (current.disqualifiers if current else {}).items()}
-    positive = dict(prev_positive)
-    negative = dict(prev_negative)
+    if replace:
+        # Полная замена: начинаем с пустого, а не с прежнего снимка. Всё, чего нет
+        # в переданном наборе, в новую версию не попадает.
+        pain_anchors, disq = {}, {}
+        positive, negative = {}, {}
+    else:
+        pain_anchors = {k: list(v)
+                        for k, v in (current.pain_anchors if current else {}).items()}
+        disq = {k: list(v) for k, v in (current.disqualifiers if current else {}).items()}
+        positive = dict(prev_positive)
+        negative = dict(prev_negative)
     changed_labels: set[tuple[str, str]] = set()  # (kind, label) с новым текстом фраз
 
     if pains is not None:
@@ -295,7 +310,11 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
             if protos is not None:
                 normalized = [p.strip() for p in protos if p.strip()]
                 positive[label] = normalized
-                changed_labels.add(("pos", label))
+                # «Изменившимся» ярлык считается только если список фраз ДРУГОЙ.
+                # Иначе загрузка того же набора целиком гоняла бы эмбеддер по всем
+                # фразам заново — минуты GPU за ноль изменений.
+                if normalized != prev_positive.get(label):
+                    changed_labels.add(("pos", label))
 
     if disqualifiers is not None:
         for label, markers in disqualifiers.items():
@@ -308,7 +327,8 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
                 raise TaxonomyValidationError(
                     f"noise_prototypes.{label}: нужна хотя бы одна фраза")
             negative[label] = normalized
-            changed_labels.add(("neg", label))
+            if normalized != prev_negative.get(label):
+                changed_labels.add(("neg", label))
 
     if not pain_anchors:
         raise TaxonomyValidationError("таксономия не может остаться без единой боли")
