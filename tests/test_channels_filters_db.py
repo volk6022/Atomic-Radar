@@ -215,7 +215,10 @@ def test_chat_type_filter_changes_rows_and_total(client):
     ("live", {"alphaclub"}),
     ("none", {"vpstoday"}),
     ("unread", {"corpostrovokru"}),
-    ("unknown", {"alphaclub_chat", "Островок"}),   # у delta username нет
+    # `alphaclub_chat` — сама группа обсуждения, и в состояниях её нет: у неё
+    # отдельный бакет `groups` в сводке и подпись «это группа» на экране.
+    # Раньше она приезжала сюда, и чипс расходился с выдачей.
+    ("unknown", {"Островок"}),   # у delta username нет
 ])
 def test_discussion_filter_changes_rows_and_total(client, state, expected):
     """Каждое состояние отбирает свои строки, total им же и считается, а выданное
@@ -229,19 +232,58 @@ def test_discussion_filter_changes_rows_and_total(client, state, expected):
     assert all(r["discussion"]["state"] == state for r in body["rows"])
 
 
+def test_group_rows_are_never_returned_by_a_state_filter(client):
+    """Ни одно из пяти состояний не возвращает саму группу обсуждения.
+
+    Группа не имеет обсуждения — она им является. Экран подписывает такую строку
+    «это группа», а сводка держит для неё отдельный бакет; если бы фильтр думал
+    иначе, человек кликал бы по одной подписи и получал строки с другой.
+    """
+    for state in ("live", "none", "unread", "history", "unknown"):
+        body = get(client, discussion=state)
+        names = {r["username"] or r["title"] for r in body["rows"]}
+        assert "alphaclub_chat" not in names, (
+            f"фильтр «{state}» вернул саму группу обсуждения")
+
+
+def test_chip_counts_match_what_the_filter_returns(client):
+    """Счётчик у чипса и `total` фильтра — про одно и то же множество.
+
+    Экран берёт числа для чипсов из `/channels/discussions`, а строки — из
+    `/channels?discussion=`. Считались они разными правилами, и расхождение
+    видно было только человеку: чипс говорил одно, список показывал другое.
+    """
+    summary = client.get("/api/v1/channels/discussions").json()
+    for state in ("live", "none", "unread", "history", "unknown"):
+        total = get(client, discussion=state)["total"]
+        assert total == summary[state], (
+            f"состояние «{state}»: в сводке {summary[state]}, фильтр отдал {total}")
+
+
 def test_discussion_filter_applies_to_everything_not_to_the_page(client):
     """Главный грех, ради которого тест: срезать состояние по уже выданной странице.
 
-    unknown — две строки; при лимите 1 обе страницы обязаны показать total=2 и
-    вместе накрыть обе строки. Фильтр по странице выдал бы на второй странице
-    пустоту (на первой остались бы обе, порезанные лимитом) или врал бы total'ом.
+    Порядок по умолчанию — по лидам убыванию, то есть alpha(5), beta(4), gamma(3),
+    delta(2), alpha_chat(1). Единственная строка в состоянии `unknown` — delta
+    («Островок»), и она **четвёртая**: на первую страницу общего списка не
+    попадает вовсе. Значит реализация, которая сначала выдаёт страницу, а потом
+    режет её фильтром, вернула бы здесь пустоту при `total`, взятом непонятно
+    откуда. Правильная сначала отбирает по всей таблице и только потом нарезает.
+
+    Раньше проверка опиралась на две строки под `unknown`, но второй была сама
+    группа обсуждения `alphaclub_chat` — её фильтр состояний больше не возвращает
+    (см. `test_group_rows_are_never_returned_by_a_state_filter`).
     """
     first = get(client, discussion="unknown", limit=1, offset=0)
+    assert first["total"] == 1
+    assert usernames(first) == {"Островок"}, (
+        "строка состояния лежит за первой страницей общего списка — если её здесь "
+        "нет, фильтр применён к странице, а не к таблице")
+
+    # За единственной строкой ничего нет, но `total` от смены страницы не зависит:
+    # он считается по отбору, а не по тому, что уместилось.
     second = get(client, discussion="unknown", limit=1, offset=1)
-    assert first["total"] == second["total"] == 2
-    assert len(first["rows"]) == 1 and len(second["rows"]) == 1
-    assert usernames(first) | usernames(second) == {"alphaclub_chat", "Островок"}
-    assert usernames(first).isdisjoint(usernames(second)), "одна строка на двух страницах"
+    assert second["total"] == 1 and second["rows"] == []
 
 
 def test_unknown_discussion_state_is_rejected_not_silently_empty(client):

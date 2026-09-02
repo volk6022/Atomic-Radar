@@ -291,8 +291,16 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
     # страницу нельзя: `total` считался бы без фильтра, и номера страниц разошлись
     # бы с их содержимым.
     if discussion:
+        # Сами группы обсуждения из отбора исключены — ровно как в
+        # `discussions_summary`, откуда экран берёт счётчики к чипсам. Группа не
+        # ИМЕЕТ обсуждения, она им и является, поэтому у неё отдельный бакет
+        # `groups`, а экран подписывает такую строку «это группа». Пока этой
+        # строчки не было, счётчик и выдача расходились: чипс «история, потока
+        # нет» показывал 1, а фильтр отдавал 2, и вторая строка была подписана
+        # на экране совсем иначе.
         ids = [c.id for c in every
-               if discussions.discussion_state(
+               if c.chat_type not in discussions.GROUP_TYPES
+               and discussions.discussion_state(
                    c, by_username, counts, last_at)["state"] == discussion]
         q = q.where(Channel.id.in_(ids))
         count_q = count_q.where(Channel.id.in_(ids))
