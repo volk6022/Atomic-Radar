@@ -48,8 +48,9 @@ from app.api.v1.system import current_mode
 from app.core import cascade, clock
 from app.core.access import BULK_LIMIT_REVIEWER, Capability, Role, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (AuditLog, Channel, ManualSend, Message, WfDraft, WfOutbound,
-                           WfTarget, WfVerdict, Workflow)
+from app.db.models import (Account, AuditLog, Channel, EngageInstance, ManualSend,
+                           Message, MessageReader, WfDraft, WfOutbound, WfTarget,
+                           WfVerdict, Workflow)
 from app.services import (manual_sends as manual_sends_service, wf_drafting,
                           workflows as workflow_service)
 
@@ -316,11 +317,100 @@ async def pains(db: GetDB, wf: Workflow = GetWorkflow, user=requires(Section.LEA
 
 # ── черновики сценария ────────────────────────────────────────────────────────
 
+def _user_link(username: str | None) -> str | None:
+    """Ссылка на адресата в Telegram — для кнопки «открыть диалог».
+
+    Собирает сервер, а не экран: иначе форма ссылки разойдётся по экранам, и
+    «у цели без юзернейма ссылки нет» один экран понял бы как `null`, а другой —
+    как битый `t.me/None`. Публичной цели (`react`, `reply`) ссылки не нужно, и
+    там честный `null` — не ошибка.
+    """
+    if not username:
+        return None
+    return f"https://t.me/{username.removeprefix('@')}"
+
+
+async def _instance_key(db: GetDB, wf: Workflow) -> str:
+    """Ключ инстанса Engage, из которого сценарий берёт аккаунты.
+
+    Аккаунты адресуются парой (инстанс, engage_account_id) — один и тот же номер
+    в двух инстансах это два разных аккаунта, поэтому фильтр и подписи читателей
+    считаются по инстансу сценария, а не по всему зеркалу `accounts`.
+    """
+    return (await db.execute(
+        select(EngageInstance.key)
+        .where(EngageInstance.id == wf.engage_instance_id))).scalar_one()
+
+
+async def _check_account(db: GetDB, instance_key: str,
+                         account_id: int | None) -> None:
+    """Фильтр по аккаунту — отказ по закрытому списку, в стиле `_check`.
+
+    Закрытый список — зеркало `accounts` инстанса сценария: фильтр на экране
+    строится из того же реестра, и значения в нём заведомо оттуда. Молча отдать
+    весь список при опечатке хуже отказа: человек решит, что видит свой срез.
+    """
+    if account_id is None:
+        return
+    known = set((await db.execute(
+        select(Account.engage_account_id)
+        .where(Account.engage_instance == instance_key))).scalars())
+    if account_id not in known:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"неизвестный аккаунт «{account_id}» в инстансе «{instance_key}», "
+            f"ожидается один из {', '.join(str(a) for a in sorted(known)) or '—'}")
+
+
+def _seen_by(account_id: int):
+    """Условие «исходное сообщение этой цели видел данный аккаунт».
+
+    EXISTS, а не JOIN: у сообщения может быть несколько читателей, и соединение
+    умножило бы строку черновика на каждого — `total` молча поехал бы, а вместе с
+    ним и сводка состояний.
+    """
+    return select(MessageReader.account_id).where(
+        MessageReader.message_id == WfTarget.message_id,
+        MessageReader.account_id == account_id).exists()
+
+
+async def _readers_by_message(db: GetDB, instance_key: str,
+                              message_ids: list[int]) -> dict[int, list[dict]]:
+    """Кто из аккаунтов видел исходные сообщения — одним запросом на страницу.
+
+    Запрос на строку здесь уже случался в соседних ручках и стоил полутора сотен
+    запросов на страницу в пятьдесят строк; образец пакетной доборки — `readers_by_message`
+    в `screens.messages()`. Подпись берётся внешним соединением к зеркалу `accounts`
+    по паре (инстанс, engage_account_id) — тем же запросом, без второй ходки.
+
+    Читатель, которого зеркало ещё не догнало, остаётся в выдаче с запасной
+    подписью: исчезнувший читатель хуже безымянного, атрибуция приёма не должна
+    пропадать из-за отставания кеша. Порядок — по номеру аккаунта: он одинаков
+    для строки и карточки, иначе экраны разошлись бы порядком одного и того же
+    списка.
+    """
+    if not message_ids:
+        return {}
+    out: dict[int, list[dict]] = {}
+    for msg_id, acc_id, label in (await db.execute(
+            select(MessageReader.message_id, MessageReader.account_id, Account.label)
+            .outerjoin(Account, (Account.engage_instance == instance_key)
+                       & (Account.engage_account_id == MessageReader.account_id))
+            .where(MessageReader.message_id.in_(message_ids))
+            .order_by(MessageReader.message_id, MessageReader.account_id))).all():
+        out.setdefault(msg_id, []).append({
+            "account_id": acc_id,
+            "label": label or f"аккаунт {acc_id}",
+        })
+    return out
+
+
 @router.get("/drafts")
 async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
                  p: ListParams = Depends(list_params),
-                 state: str | None = None):
+                 state: str | None = None,
+                 account_id: int | None = None):
     """Очередь заготовок сценария.
 
     **Ручка не только читает** — она достраивает очередь: целям без черновика заводит
@@ -330,8 +420,20 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
     Сказано это вслух, потому что `GET`, меняющий данные, — то, что читатель кода
     вправе не ожидать. Когда появится генератор на модели, достройка уедет в воркер.
+
+    **Строка называет аккаунт приёма.** Человек рассылает руками и с одного
+    аккаунта; написать адресату с аккаунта, не читавшего группу, — прийти к нему
+    «ниоткуда». Поэтому каждая строка несёт `readers` (кто видел исходное
+    сообщение) и готовую ссылку `tg_link` на адресата.
+
+    Фильтр `account_id` режет ту же очередь: он применяется **до пагинации** и
+    одинаково к строкам, `total` и сводке `states`. Сводка «вообще», а выборка
+    «в срезе» — дефект, уже пойманный на `/channels`: чипс говорил 1, фильтр
+    отдавал 2.
     """
     _check(state, DRAFT_STATES, "статус")
+    instance_key = await _instance_key(db, wf)
+    await _check_account(db, instance_key, account_id)
 
     created = await wf_drafting.ensure_queue(db, wf)
     if created:
@@ -345,24 +447,37 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     count_q = (select(func.count(WfDraft.id))
                .join(WfTarget, WfDraft.target_id == WfTarget.id)
                .where(WfDraft.workflow_id == wf.id))
+    states_q = (select(WfDraft.state, func.count(WfDraft.id))
+                .join(WfTarget, WfDraft.target_id == WfTarget.id)
+                .where(WfDraft.workflow_id == wf.id))
     if state:
         q = q.where(WfDraft.state == state)
         count_q = count_q.where(WfDraft.state == state)
+    if account_id is not None:
+        seen = _seen_by(account_id)
+        q = q.where(seen)
+        count_q = count_q.where(seen)
+        states_q = states_q.where(seen)
 
     total = (await db.execute(count_q)).scalar_one()
     q = apply_sort(q, p, DRAFT_SORTS, default="created", tiebreak=WfDraft.id)
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).all()
 
     by_state = dict((await db.execute(
-        select(WfDraft.state, func.count(WfDraft.id))
-        .where(WfDraft.workflow_id == wf.id).group_by(WfDraft.state))).all())
+        states_q.group_by(WfDraft.state))).all())
+
+    readers = await _readers_by_message(
+        db, instance_key, [t.message_id for _, t, _ in rows])
 
     out = [{
         "id": d.id, "target_id": t.id, "state": d.state,
         "addressing": _addressing(t),
         "author_name": t.author_name or "—",
+        "author_username": ("@" + t.author_username) if t.author_username else None,
+        "tg_link": _user_link(t.author_username),
         "channel": c.title, "pain": t.pain, "score": t.score,
         "quote": t.quote,
+        "readers": readers.get(t.message_id, []),
         "variants": d.variants or [],
         "chosen_variant": d.chosen_variant, "final_text": d.final_text,
         "reject_reason": d.reject_reason,
@@ -376,12 +491,17 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
             "states": [{"key": k, "count": by_state.get(k, 0)} for k in DRAFT_STATES]}
 
 
-def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel) -> dict:
+def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
+         readers: list[dict]) -> dict:
     """Черновик целиком — для карточки, а не для строки таблицы.
 
     Одна форма на курсорную выдачу и на прямую ссылку: экран у них общий, и разойдись
     эти два ответа хоть одним полем, карточка, открытая из таблицы, отличалась бы от
     той же карточки, до которой дошли стрелкой.
+
+    Атрибуция приёма (`readers`) и ссылка на адресата (`tg_link`) — те же поля, что
+    у строки списка, по той же причине: карточка и строка это один экран, и аккаунт
+    должен быть виден в обоих местах, а не только в одном из них.
     """
     return {
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -389,6 +509,8 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel) -> dict:
         "addressing": _addressing(t),
         "author_name": t.author_name or "—",
         "author_username": ("@" + t.author_username) if t.author_username else None,
+        "tg_link": _user_link(t.author_username),
+        "readers": readers,
         "channel": c.title, "pain": t.pain, "score": t.score, "quote": t.quote,
         "score_breakdown": t.score_breakdown or [],
         "disqualifiers": t.disqualifiers or [],
@@ -414,7 +536,8 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel) -> dict:
 @router.get("/drafts/next")
 async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
                      user=requires(Section.DRAFTS),
-                     after: int | None = None, state: str = "pending"):
+                     after: int | None = None, state: str = "pending",
+                     account_id: int | None = None):
     """Следующий черновик сценария в выбранном срезе очереди.
 
     Курсор, а не страница списка: экран показывает по одному и двигается стрелками,
@@ -424,11 +547,17 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
     черновик обязан оставаться доступным для просмотра, иначе решение оператора
     исчезает с глаз сразу после того, как принято.
 
+    `account_id` сужает тот же срез, что и у списка: и обход (`after`), и счётчик
+    `remaining` остаются внутри него. Курсор, который шагает сквозь фильтр,
+    увозит из среза молча.
+
     Пусто — это `draft: null`, а не 404: разобранная очередь нормальное состояние
     экрана, а не ошибка запроса.
     """
     if state != "all":
         _check(state, DRAFT_STATES, "статус")
+    instance_key = await _instance_key(db, wf)
+    await _check_account(db, instance_key, account_id)
 
     created = await wf_drafting.ensure_queue(db, wf)
     if created:
@@ -443,6 +572,13 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
     if state != "all":
         base = base.where(WfDraft.state == state)
         count_q = count_q.where(WfDraft.state == state)
+    if account_id is not None:
+        seen = _seen_by(account_id)
+        base = base.where(seen)
+        # Соединение с целями нужно только под фильтром: условие `_seen_by`
+        # коррелирует по `WfTarget.message_id`.
+        count_q = (count_q.join(WfTarget, WfDraft.target_id == WfTarget.id)
+                   .where(seen))
 
     remaining = (await db.execute(count_q)).scalar_one()
 
@@ -454,9 +590,19 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
         # Дойдя до конца, заворачиваем на начало — так же ведёт себя старая очередь.
         row = (await db.execute(base.order_by(WfDraft.id).limit(1))).first()
 
+    one = None
+    if row is not None:
+        readers = await _readers_by_message(db, instance_key, [row[1].message_id])
+        one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []))
+
+    # `readers` и `tg_link` продублированы на верхний уровень конверта — как у
+    # прямой ссылки на карточку: конверты у ручек обязаны совпадать, экран их не
+    # различает. При пустом срезе честные пустые значения, а не отсутствующие ключи.
     return {"remaining": remaining, "state": state, "workflow": wf.key,
             "action": wf.action,
-            "draft": _one(wf, *row) if row is not None else None}
+            "readers": one["readers"] if one else [],
+            "tg_link": one["tg_link"] if one else None,
+            "draft": one}
 
 
 @router.get("/drafts/{draft_id}")
@@ -472,6 +618,10 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
     контура и на оба входа — стрелкой и по прямой ссылке из таблицы. Отдай эта ручка
     голый объект, и экрану пришлось бы различать, откуда он открыт, — а это ровно то
     место, где потом обнаруживается, что счётчик «осталось» показывает ноль.
+
+    `readers` и `tg_link` лежат и на верхнем уровне конверта, и внутри `draft`:
+    верхний уровень читает экран карточки, внутренний — общий код отрисовки, и
+    держать их разными значило бы завести второе место, где атрибуция разъедется.
     """
     row = (await db.execute(
         select(WfDraft, WfTarget, Channel)
@@ -481,9 +631,14 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             f"черновик {draft_id} в сценарии {wf.key!r} не найден")
-    d = row[0]
+    d, t = row[0], row[1]
+    readers = (await _readers_by_message(
+        db, await _instance_key(db, wf), [t.message_id])).get(t.message_id, [])
+    one = _one(wf, d, t, row[2], readers)
     return {"remaining": await _pending(db, wf), "state": d.state,
-            "workflow": wf.key, "draft": _one(wf, *row)}
+            "workflow": wf.key,
+            "readers": one["readers"], "tg_link": one["tg_link"],
+            "draft": one}
 
 
 # ── решения по целям ──────────────────────────────────────────────────────────

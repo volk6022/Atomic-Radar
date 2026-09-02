@@ -206,7 +206,7 @@ def rows_by_quote_id(data):
 # ── атрибуция: кто это видел ──────────────────────────────────────────────────
 
 def test_row_names_the_accounts_that_saw_the_source_message(client):
-    rows = rows_by_quote_id(get(client, size=50))
+    rows = rows_by_quote_id(get(client, limit=50))
     assert [a["account_id"] for a in rows[1]["readers"]] == [ACC1]
     assert [a["account_id"] for a in rows[2]["readers"]] == [ACC2]
     assert [a["account_id"] for a in rows[3]["readers"]] == [ACC1, ACC2]
@@ -214,13 +214,13 @@ def test_row_names_the_accounts_that_saw_the_source_message(client):
 
 def test_reader_carries_the_human_label_not_only_the_number(client):
     """Андрей знает свои аккаунты как «acc-1», а не как 101."""
-    rows = rows_by_quote_id(get(client, size=50))
+    rows = rows_by_quote_id(get(client, limit=50))
     assert [a["label"] for a in rows[3]["readers"]] == ["acc-1", "acc-2"]
 
 
 def test_reader_missing_from_the_mirror_is_still_shown(client):
     """Зеркало `accounts` может отстать от Engage. Читатель при этом не исчезает."""
-    rows = rows_by_quote_id(get(client, size=50))
+    rows = rows_by_quote_id(get(client, limit=50))
     readers = rows[5]["readers"]
     assert [a["account_id"] for a in readers] == [ACC_UNMIRRORED]
     assert readers[0]["label"], "у безымянного читателя должна быть хоть какая-то подпись"
@@ -228,7 +228,7 @@ def test_reader_missing_from_the_mirror_is_still_shown(client):
 
 def test_draft_nobody_saw_has_an_empty_list_and_does_not_vanish(client):
     """Записи до атрибуции приёма остаются в очереди — просто без аккаунта."""
-    rows = rows_by_quote_id(get(client, size=50))
+    rows = rows_by_quote_id(get(client, limit=50))
     assert 4 in rows, "черновик без читателей пропал из очереди"
     assert rows[4]["readers"] == []
 
@@ -237,13 +237,13 @@ def test_draft_nobody_saw_has_an_empty_list_and_does_not_vanish(client):
 
 def test_row_carries_username_and_a_ready_telegram_link(client):
     """Адрес собирает сервер, а не экран: иначе форма ссылки разойдётся по экранам."""
-    row = rows_by_quote_id(get(client, size=50))[1]
+    row = rows_by_quote_id(get(client, limit=50))[1]
     assert row["author_username"] == "@user"
     assert row["tg_link"] == "https://t.me/user"
 
 
 def test_target_without_a_username_has_no_link_rather_than_a_broken_one(client):
-    row = rows_by_quote_id(get(client, size=50))[5]
+    row = rows_by_quote_id(get(client, limit=50))[5]
     assert row["author_username"] is None
     assert row["tg_link"] is None
 
@@ -251,13 +251,13 @@ def test_target_without_a_username_has_no_link_rather_than_a_broken_one(client):
 # ── фильтр по аккаунту ────────────────────────────────────────────────────────
 
 def test_filter_returns_only_what_this_account_saw(client):
-    got = set(rows_by_quote_id(get(client, size=50, account_id=ACC1)))
+    got = set(rows_by_quote_id(get(client, limit=50, account_id=ACC1)))
     assert got == {1, 3}
 
 
 def test_filter_applies_to_everything_not_to_the_page(client):
     """Срез считается до страницы. Иначе фильтр — украшение текущей выдачи."""
-    data = get(client, size=1, account_id=ACC2)
+    data = get(client, limit=1, account_id=ACC2)
     assert data["total"] == 2, "в срезе acc-2 два черновика (msg 2 и msg 3)"
     assert len(data["rows"]) == 1
 
@@ -268,7 +268,7 @@ def test_state_counts_are_computed_in_the_same_slice_as_the_rows(client):
     У acc-1 два черновика: `pending` (msg 1) и `approved` (msg 3). Счётчик, посчитанный
     без учёта фильтра, показал бы четыре `pending`.
     """
-    data = get(client, size=50, account_id=ACC1)
+    data = get(client, limit=50, account_id=ACC1)
     counts = {s["key"]: s["count"] for s in data["states"]}
     assert counts["pending"] == 1
     assert counts["approved"] == 1
@@ -277,9 +277,9 @@ def test_state_counts_are_computed_in_the_same_slice_as_the_rows(client):
 
 def test_each_state_count_matches_what_that_state_filter_returns(client):
     """Инвариант целиком: по каждому состоянию число из сводки равно числу строк."""
-    data = get(client, size=50, account_id=ACC1)
+    data = get(client, limit=50, account_id=ACC1)
     for s in data["states"]:
-        got = get(client, size=50, account_id=ACC1, state=s["key"])
+        got = get(client, limit=50, account_id=ACC1, state=s["key"])
         assert got["total"] == s["count"], (
             f"состояние «{s['key']}»: в сводке {s['count']}, фильтр отдал {got['total']}")
 
@@ -305,7 +305,7 @@ def test_cursor_stays_inside_the_account_slice(client):
 def test_single_draft_carries_the_same_attribution_as_the_row(client):
     """Карточка и строка — один экран. Разойдись они полем, аккаунт был бы виден
     только в одном из двух мест, и это заметили бы не сразу."""
-    row = rows_by_quote_id(get(client, size=50))[3]
+    row = rows_by_quote_id(get(client, limit=50))[3]
     one = client.get(f"/api/v1/workflows/cold_dm/drafts/{row['id']}")
     assert one.status_code == 200, one.text
     body = one.json()
