@@ -75,6 +75,14 @@ STATEMENTS: list[str] = [
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS chat_type VARCHAR(20)",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked_checked_at TIMESTAMPTZ",
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS linked_joined_at TIMESTAMPTZ",
+
+    # 2026-09-02, экран «Переписки»: непрочитанные считаются в базе (фильтр списка,
+    # total и значок в боковой панели), для этого нужен момент последнего прочтения
+    # нитки. NULL — не прочитано. Индекс под условие не заводим: оно сравнивает две
+    # колонки одной строки (`last_inbound_at > read_at`), обычный btree его не
+    # покроет — частичный индекс по одной ветке планировщик в OR-предикате не
+    # использует, и вышел бы индекс для галочки, а не для скорости.
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ",
 ]
 
 
