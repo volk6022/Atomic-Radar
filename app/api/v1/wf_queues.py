@@ -342,19 +342,56 @@ async def _instance_key(db: GetDB, wf: Workflow) -> str:
         .where(EngageInstance.id == wf.engage_instance_id))).scalar_one()
 
 
-async def _check_account(db: GetDB, instance_key: str,
+async def _filter_accounts(db: GetDB, wf: Workflow,
+                           instance_key: str) -> dict[int, dict]:
+    """Аккаунты, по которым можно резать очередь этого сценария, и их вес.
+
+    Источников ДВА, и это не избыточность.
+
+    **Кто действительно читал** — `message_readers` по целям сценария. Это
+    единственный источник, который на проде вообще есть: зеркало `accounts`
+    заполняет только посев стенда, боевого пути записи в него нет ни одного
+    (проверено 03.09: на проде 0 строк при 322 записях о прочтении). Строй список
+    из одного зеркала — и фильтр, ради которого всё делалось, оказался бы пуст,
+    а `_check_account` отвергал бы каждый аккаунт с 422.
+
+    **Зеркало `accounts`** — за подписью и за теми аккаунтами, что сегодня не
+    прочитали ничего: пустой срез и отсутствующий пункт читаются одинаково, но
+    первый хотя бы правда — человек видит, что вошёл в аккаунт, которому писать
+    некому. Зеркало берётся по инстансу сценария: один и тот же номер в двух
+    инстансах — два разных человека за клавиатурой.
+
+    Читатель без подписи не выбрасывается, а называет себя номером: отставание
+    кеша не повод прятать аккаунт, которым сообщение заведомо получено.
+    """
+    counts = dict((await db.execute(
+        select(MessageReader.account_id, func.count(func.distinct(WfDraft.id)))
+        .join(WfTarget, WfTarget.message_id == MessageReader.message_id)
+        .join(WfDraft, WfDraft.target_id == WfTarget.id)
+        .where(WfDraft.workflow_id == wf.id)
+        .group_by(MessageReader.account_id))).all())
+
+    labels = dict((await db.execute(
+        select(Account.engage_account_id, Account.label)
+        .where(Account.engage_instance == instance_key))).all())
+
+    return {acc_id: {"account_id": acc_id,
+                     "label": labels.get(acc_id) or f"аккаунт {acc_id}",
+                     "drafts": counts.get(acc_id, 0)}
+            for acc_id in set(counts) | set(labels)}
+
+
+async def _check_account(db: GetDB, wf: Workflow, instance_key: str,
                          account_id: int | None) -> None:
     """Фильтр по аккаунту — отказ по закрытому списку, в стиле `_check`.
 
-    Закрытый список — зеркало `accounts` инстанса сценария: фильтр на экране
-    строится из того же реестра, и значения в нём заведомо оттуда. Молча отдать
-    весь список при опечатке хуже отказа: человек решит, что видит свой срез.
+    Список тот же, что предлагает `/drafts/accounts`: выпадающий список, значение
+    которого ручка отвергнет, хуже отсутствующего. Молча отдать весь список при
+    опечатке тоже нельзя — человек решит, что видит свой срез.
     """
     if account_id is None:
         return
-    known = set((await db.execute(
-        select(Account.engage_account_id)
-        .where(Account.engage_instance == instance_key))).scalars())
+    known = await _filter_accounts(db, wf, instance_key)
     if account_id not in known:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -456,7 +493,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     """
     _check(state, DRAFT_STATES, "статус")
     instance_key = await _instance_key(db, wf)
-    await _check_account(db, instance_key, account_id)
+    await _check_account(db, wf, instance_key, account_id)
 
     created = await wf_drafting.ensure_queue(db, wf)
     if created:
@@ -584,7 +621,7 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
     if state != "all":
         _check(state, DRAFT_STATES, "статус")
     instance_key = await _instance_key(db, wf)
-    await _check_account(db, instance_key, account_id)
+    await _check_account(db, wf, instance_key, account_id)
 
     created = await wf_drafting.ensure_queue(db, wf)
     if created:
@@ -637,45 +674,25 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
 @router.get("/drafts/accounts")
 async def draft_accounts(db: GetDB, wf: Workflow = GetWorkflow,
                          user=requires(Section.DRAFTS)):
-    """Аккаунты, из которых строится фильтр очереди, — зеркало инстанса сценария.
+    """Аккаунты, из которых строится фильтр очереди.
 
-    Ровно тот же закрытый список, по которому `_check_account` выносит отказ.
-    Выпадающий список, предлагающий значение, которое ручка отвергнет, хуже
-    отсутствующего: человек выбирает аккаунт и получает 422 вместо среза.
+    Ровно тот же закрытый список, по которому `_check_account` выносит отказ, —
+    см. `_filter_accounts` о том, почему источников два.
 
-    **Зеркало, а не живой Engage.** Соседняя `/manual-sends/accounts` спрашивает флот
-    по сети и при недоступности отдаёт пустой список — там это уместно, поле
-    необязательное. Здесь фильтр — единственный способ разобрать очередь по-человечески,
-    и он не должен исчезать вместе с сетью до Софии.
+    **Не живой Engage.** Соседняя `/manual-sends/accounts` спрашивает флот по сети
+    и при недоступности отдаёт пустой список — там это уместно, поле необязательное.
+    Здесь фильтр — единственный способ разобрать очередь по-человечески, и он не
+    должен исчезать вместе с сетью до Софии.
 
-    Аккаунт без черновиков остаётся в списке с нулём: пустой срез и отсутствующий
-    пункт читаются одинаково, но первый хотя бы правда — человек видит, что вошёл
-    в аккаунт, которому сегодня писать некому.
+    Порядок — по номеру аккаунта: он одинаков для строки и для фильтра, иначе
+    экраны разошлись бы порядком одного и того же списка.
 
     ⚠️ Объявлено ВЫШЕ `/drafts/{draft_id}`: маршруты разбираются по порядку, и иначе
     «accounts» уехало бы в номер черновика, а ручка отвечала бы 422.
     """
     instance_key = await _instance_key(db, wf)
-
-    # Считаем по черновикам, а не по целям: в списке стоит то же число, что покажет
-    # фильтр, а он режет именно очередь. `distinct` — потому что одно сообщение
-    # может быть прочитано несколькими аккаунтами, и без него строки перемножились бы.
-    counts = dict((await db.execute(
-        select(MessageReader.account_id, func.count(func.distinct(WfDraft.id)))
-        .join(WfTarget, WfTarget.message_id == MessageReader.message_id)
-        .join(WfDraft, WfDraft.target_id == WfTarget.id)
-        .where(WfDraft.workflow_id == wf.id)
-        .group_by(MessageReader.account_id))).all())
-
-    rows = (await db.execute(
-        select(Account.engage_account_id, Account.label)
-        .where(Account.engage_instance == instance_key)
-        .order_by(Account.engage_account_id))).all()
-
-    return {"rows": [{"account_id": acc_id,
-                      "label": label or f"аккаунт {acc_id}",
-                      "drafts": counts.get(acc_id, 0)}
-                     for acc_id, label in rows]}
+    rows = await _filter_accounts(db, wf, instance_key)
+    return {"rows": [rows[k] for k in sorted(rows)]}
 
 
 @router.get("/drafts/{draft_id}")

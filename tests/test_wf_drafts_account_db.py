@@ -350,24 +350,39 @@ def test_options_are_exactly_what_the_filter_accepts(client):
             f"фильтр отверг аккаунт {row['account_id']}, который сам же предложен")
 
 
-def test_options_are_the_instance_mirror_not_the_whole_fleet(client):
-    """Аккаунт другого инстанса — другой человек за клавиатурой, ему здесь не место."""
+def test_options_do_not_leak_accounts_of_another_instance(client):
+    """Один и тот же номер в двух инстансах — два разных человека за клавиатурой."""
     ids = [r["account_id"] for r in options(client)]
-    assert ids == [ACC1, ACC2]
     assert ACC_OTHER_INSTANCE not in ids
 
 
-def test_options_carry_the_human_label(client):
-    assert [r["label"] for r in options(client)] == ["acc-1", "acc-2"]
+def test_options_include_a_reader_the_mirror_does_not_know(client):
+    """Список строится по тем, кто ЧИТАЛ, а не только по зеркалу `accounts`.
+
+    Причина не теоретическая: на проде зеркало пусто целиком — заполняет его только
+    посев стенда, боевого пути записи нет ни одного. Строй список из одного зеркала,
+    и фильтр, ради которого всё делалось, оказался бы пустым, а отбор по любому
+    аккаунту отвергался бы как «неизвестный».
+    """
+    ids = [r["account_id"] for r in options(client)]
+    assert ids == [ACC1, ACC2, ACC_UNMIRRORED]
+
+
+def test_reader_without_a_label_names_itself_by_number(client):
+    """Отставание зеркала — не повод прятать аккаунт, которым сообщение получено."""
+    by_id = {r["account_id"]: r["label"] for r in options(client)}
+    assert by_id[ACC1] == "acc-1"
+    assert by_id[ACC_UNMIRRORED] and str(ACC_UNMIRRORED) in by_id[ACC_UNMIRRORED]
 
 
 def test_options_say_how_many_drafts_each_account_saw(client):
     """Число рядом с аккаунтом — единственный способ понять, с какого входить.
 
-    У acc-1 два черновика (msg 1 и msg 3), у acc-2 тоже два (msg 2 и msg 3).
+    У acc-1 два черновика (msg 1 и msg 3), у acc-2 тоже два (msg 2 и msg 3),
+    у незеркального читателя один (msg 5).
     """
     by_id = {r["account_id"]: r["drafts"] for r in options(client)}
-    assert by_id == {ACC1: 2, ACC2: 2}
+    assert by_id == {ACC1: 2, ACC2: 2, ACC_UNMIRRORED: 1}
 
 
 def test_counts_agree_with_what_the_filter_returns(client):
