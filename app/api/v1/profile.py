@@ -31,8 +31,9 @@ from sqlalchemy import func, select
 from app.api.deps import GetDB, permits, requires
 from app.core import cascade
 from app.core.access import Capability, Section, allows
-from app.db.models import AuditLog, CascadeVersion, L3Prompt, LlmTrace, ProfileVersion
-from app.services import cascade_registry
+from app.db.models import (AuditLog, CascadeVersion, ConfigFile, L3Prompt,
+                           LlmTrace, ProfileVersion)
+from app.services import cascade_registry, config_bundle
 
 logger = logging.getLogger("radar.profile_api")
 router = APIRouter(prefix="/api/v1/profile", tags=["profile"])
@@ -203,3 +204,125 @@ async def stale_l3_verdict_count(db) -> int:
         select(func.count(LlmTrace.id))
         .where(LlmTrace.stage == "l3", LlmTrace.prompt_version.isnot(None),
               LlmTrace.prompt_version != active.version))).scalar_one()
+
+
+# ── настройки одним файлом ────────────────────────────────────────────────────
+#
+# Внешняя единица работы — файл, а не версия. Версии остались историей под капотом
+# (см. `app/services/config_bundle.py`), но человек забирает настройки целиком,
+# правит их в редакторе и заливает обратно; отдельного шага «включить» нет, потому
+# что именно он и превращал экран в лесенку кнопок.
+
+def _file_row(row: ConfigFile, current_id: int | None) -> dict:
+    return {"id": row.id, "name": row.name,
+            "created_at": row.created_at.isoformat(),
+            "created_by": row.created_by,
+            "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+            "is_current": row.id == current_id,
+            **config_bundle.summarize(row.body)}
+
+
+async def _current_file_id(db) -> int | None:
+    """Применённый последним — он и «текущий».
+
+    Совпадение с живыми настройками отсюда не следует и следовать не может: их
+    можно поправить и мимо файлов (`POST /proposals`). Поэтому пометка честно
+    означает «этим файлом настройки приводили в порядок последний раз», а не
+    «настройки равны файлу».
+    """
+    return (await db.execute(
+        select(ConfigFile.id).where(ConfigFile.applied_at.isnot(None))
+        .order_by(ConfigFile.applied_at.desc(), ConfigFile.id.desc()).limit(1))
+    ).scalar_one_or_none()
+
+
+@router.get("/config")
+async def export_config(db: GetDB, user=requires(Section.PROFILE)):
+    """Текущие настройки в том виде, в каком их принимает загрузка."""
+    return await config_bundle.export_bundle(db)
+
+
+@router.get("/config/files")
+async def list_config_files(db: GetDB, user=requires(Section.PROFILE)):
+    rows = (await db.execute(
+        select(ConfigFile).order_by(ConfigFile.id.desc()))).scalars().all()
+    current = await _current_file_id(db)
+    return {"files": [_file_row(r, current) for r in rows]}
+
+
+@router.get("/config/files/{file_id}")
+async def read_config_file(file_id: int, db: GetDB, user=requires(Section.PROFILE)):
+    """Отдаётся ровно то, что загрузили: файл правят снаружи, и возвращать надо то
+    же самое тело, а не пересобранное из таблиц."""
+    row = await db.get(ConfigFile, file_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            f"набор настроек {file_id} не найден")
+    return row.body
+
+
+@router.post("/config/files", status_code=status.HTTP_201_CREATED)
+async def upload_config_file(body: dict, request: Request, db: GetDB,
+                             user=permits(Section.PROFILE, Capability.CONFIG_EDIT)):
+    """Загрузить набор и применить его целиком и сразу.
+
+    Право то же, что на включение версии, и это не строгость ради строгости:
+    загрузка меняет правила отбора для следующего же сообщения.
+    """
+    try:
+        row = await config_bundle.store(db, body, actor=user.email)
+    except config_bundle.BundleError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
+    try:
+        applied = await config_bundle.apply_stored(db, row.id, actor=user.email)
+    except config_bundle.BundleError as e:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"файл сохранён, но применить его не удалось: {e}") from e
+
+    db.add(AuditLog(user_id=user.id, user_email=user.email, action="config_file_apply",
+                    detail={"file_id": row.id, "name": row.name, **applied},
+                    ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("config_file_applied id=%s name=%s by=%s", row.id, row.name, user.email)
+    return {"file_id": row.id, "name": row.name, "applied": applied,
+            "reclassify_suggested": True}
+
+
+@router.post("/config/files/{file_id}/apply")
+async def apply_config_file(file_id: int, request: Request, db: GetDB,
+                            user=permits(Section.PROFILE, Capability.CONFIG_EDIT)):
+    """Переключиться на ранее загруженный набор."""
+    try:
+        applied = await config_bundle.apply_stored(db, file_id, actor=user.email)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    except config_bundle.BundleError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
+    db.add(AuditLog(user_id=user.id, user_email=user.email, action="config_file_apply",
+                    detail={"file_id": file_id, **applied},
+                    ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("config_file_applied id=%s by=%s", file_id, user.email)
+    return {"file_id": file_id, "applied": applied, "reclassify_suggested": True}
+
+
+@router.delete("/config/files/{file_id}")
+async def delete_config_file(file_id: int, request: Request, db: GetDB,
+                             user=permits(Section.PROFILE, Capability.CONFIG_EDIT)):
+    """Убрать набор из списка. Живых настроек это не касается: файл — снимок, а не
+    источник работы, и удаление снимка не должно останавливать классификацию."""
+    row = await db.get(ConfigFile, file_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            f"набор настроек {file_id} не найден")
+    name = row.name
+    await db.delete(row)
+    db.add(AuditLog(user_id=user.id, user_email=user.email, action="config_file_delete",
+                    detail={"file_id": file_id, "name": name},
+                    ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("config_file_deleted id=%s name=%s by=%s", file_id, name, user.email)
+    return {"deleted": True, "file_id": file_id}

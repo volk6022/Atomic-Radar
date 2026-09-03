@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from app.db.models import L2Prototype, L3Prompt
+from app.db.models import ConfigFile, L2Prototype, L3Prompt
 from app.services import cascade_registry, llm
 
 logger = logging.getLogger(__name__)
@@ -179,4 +179,52 @@ async def import_bundle(db, bundle, *, actor: str) -> dict:
            + sum(len(v) for v in noise.values())}
     logger.info("config_bundle_imported name=%s pains=%s prompts=%s by=%s",
                 out["name"], out["pains"], ",".join(out["prompts"]), actor)
+    return out
+
+
+# ── файлы настроек: сохранить, применить, перечислить ─────────────────────────
+
+def summarize(bundle) -> dict:
+    """Сводка для списка наборов: сколько чего внутри, не открывая файл."""
+    pains = bundle.get("pains") or {}
+    noise = bundle.get("noise") or {}
+    return {
+        "pains": len(pains),
+        "prototypes": sum(len(b.get("prototypes") or []) for b in pains.values())
+        + sum(len(v) for v in noise.values()),
+        "noise": len(noise),
+        "disqualifiers": len(bundle.get("disqualifiers") or {}),
+        "prompts": sorted((bundle.get("l3_prompts") or {}).keys()),
+    }
+
+
+async def store(db, bundle, *, actor: str) -> ConfigFile:
+    """Проверить файл и сохранить его ДО попытки применить.
+
+    Порядок здесь не стилистический. `cascade_registry.save_taxonomy` при отказе
+    эмбеддера откатывает транзакцию сессии целиком — строка файла, добавленная в ту
+    же сессию, исчезла бы вместе с ней, и человек потерял бы набор, который только
+    что собрал снаружи, из-за поломки, к которой не имеет отношения. Поэтому файл
+    фиксируется своим коммитом, и неудачное применение его не уносит.
+    """
+    validate(bundle)
+    name = str(bundle.get("name") or "без имени").strip()[:200] or "без имени"
+    row = ConfigFile(name=name, body=bundle, created_by=actor)
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    logger.info("config_file_stored id=%s name=%s by=%s", row.id, name, actor)
+    return row
+
+
+async def apply_stored(db, file_id: int, *, actor: str) -> dict:
+    """Применить сохранённый набор. Отметка о применении ставится только после
+    успеха: файл, не доехавший до настроек, не должен выглядеть работающим."""
+    row = await db.get(ConfigFile, file_id)
+    if row is None:
+        raise LookupError(f"набор настроек {file_id} не найден")
+    out = await import_bundle(db, row.body, actor=actor)
+    row = await db.get(ConfigFile, file_id)
+    row.applied_at = datetime.now(timezone.utc)
+    await db.commit()
     return out

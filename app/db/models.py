@@ -523,6 +523,35 @@ class L3Prompt(Base):
     __table_args__ = (Index("ix_l3_prompt_active", "prompt_key", "is_active"),)
 
 
+class ConfigFile(Base):
+    """Сохранённый набор настроек отбора — ровно тот JSON, которым его залили.
+
+    Снимок, а не источник работы: отбором управляют активные строки
+    `cascade_versions` / `profile_versions` / `l3_prompts`, а здесь лежит файл,
+    которым их в последний раз привели в это состояние. Отсюда два следствия,
+    неочевидных по имени таблицы: удаление файла НЕ меняет отбор, а применение
+    файла заводит новые версии, а не переписывает старые.
+
+    Хранится целиком, а не разобранным по полям: человек правит его снаружи в
+    редакторе, и вернуть ему нужно то же самое, что он загрузил, — включая порядок
+    ключей и собственное имя набора. Разбор по таблицам этот круг разомкнул бы.
+
+    `applied_at = NULL` — файл принят и проверен, но применить его не удалось
+    (обычно молчит эмбеддер). Такой файл сознательно не выбрасывается: человек уже
+    собрал его снаружи, и заставлять собирать заново из-за чужой поломки незачем.
+    """
+    __tablename__ = "config_files"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (Index("ix_config_file_applied", "applied_at"),)
+
+
 class Run(Base):
     """Длинная операция: бэкфилл, переклассификация, выгрузка.
 

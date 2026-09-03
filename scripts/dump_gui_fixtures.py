@@ -32,7 +32,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -54,7 +54,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
-from app.db.models import (Account, Alert, Attribution, Conversation,  # noqa: E402
+from app.db.models import (Account, Alert, Attribution, ConfigFile,  # noqa: E402
+                           Conversation,  # noqa: E402
                            ConversationEvent, Draft, EngageInstance, Evaluation,
                            Lead, LlmTrace, OutboundAttempt, ProfileVersion, Run,
                            User, WfTarget, Workflow)
@@ -104,6 +105,20 @@ async def extras(db) -> None:
         select(WfTarget).order_by(WfTarget.id))).scalars().first()
     wf = (await db.execute(
         select(Workflow).where(Workflow.key == "cold_dm"))).scalar_one()
+
+    # Один сохранённый набор настроек: без него список наборов на экране
+    # Profile & Prompts всегда пуст, и `sc-for` по нему не проверяется вовсе.
+    db.add(ConfigFile(
+        name="курс-сентябрь", created_by=owner.email if owner else "owner@local",
+        applied_at=datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc),
+        body={"format": "atomic-radar-config", "version": 1, "name": "курс-сентябрь",
+              "business": {"description": "КУРС — оплата счетов зарубежных поставщиков."},
+              "pains": {"банк не пропускает платеж": {
+                  "anchors": ["валютный контроль"],
+                  "prototypes": ["банк завернул платёж"]}},
+              "noise": {"офтоп": ["всем привет"]},
+              "disqualifiers": {"вакансия": ["вакансия"]},
+              "l3_prompts": {"dm_v1": "Ты — фильтр сообщений. Ответь JSON."}}))
 
     account = Account(engage_account_id=12, engage_instance=instance.key,
                       label="acc-12", status="active", phone_country="RU",
@@ -218,6 +233,8 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/conversations/{id}", f"/conversations/{cv}"),
         ("/profile", "/profile"),
         ("/profile/versions", "/profile/versions"),
+        ("/profile/config", "/profile/config"),
+        ("/profile/config/files", "/profile/config/files"),
         ("/limits", "/limits"),
         ("/system/mode", "/system/mode"),
         ("/evaluations", "/evaluations"),
