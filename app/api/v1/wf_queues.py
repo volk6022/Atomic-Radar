@@ -375,10 +375,27 @@ async def _filter_accounts(db: GetDB, wf: Workflow,
         select(Account.engage_account_id, Account.label)
         .where(Account.engage_instance == instance_key))).all())
 
+    known = set(counts) | set(labels)
+
+    # Третий источник — все, кто вообще что-то читал, и он нужен из-за перекоса во
+    # времени: атрибуция приёма пишется с 02.09, а целями пока становятся сообщения
+    # СТАРОГО бэкфилла, прочитанные до неё. На проде 03.09 это давало 322 записи о
+    # прочтении и ровно ноль пересечений с очередью — то есть пустой фильтр при
+    # пяти работающих аккаунтах. Человек, вошедший в свой аккаунт, обязан найти его
+    # в списке и увидеть честный пустой срез, а не отсутствие пункта.
+    #
+    # ⚠️ Берётся только когда инстанс в реестре ОДИН: `message_readers` хранит номер
+    # аккаунта без инстанса, и при двух инстансах этот источник смешал бы чужие
+    # аккаунты со своими. Тогда список сужается до первых двух — то есть до заведомо
+    # своих. Ветка на два инстанса тестами не покрыта: в реестре его сегодня один.
+    if (await db.execute(select(func.count(EngageInstance.id)))).scalar_one() == 1:
+        known |= set((await db.execute(
+            select(MessageReader.account_id).distinct())).scalars())
+
     return {acc_id: {"account_id": acc_id,
                      "label": labels.get(acc_id) or f"аккаунт {acc_id}",
                      "drafts": counts.get(acc_id, 0)}
-            for acc_id in set(counts) | set(labels)}
+            for acc_id in known}
 
 
 async def _check_account(db: GetDB, wf: Workflow, instance_key: str,

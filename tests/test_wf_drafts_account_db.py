@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("RADAR_SECRET_KEY", "test-secret-key-not-for-production")
@@ -162,6 +162,28 @@ async def _seed() -> dict:
 
     await engine.dispose()
     return out
+
+
+async def _add_lone_reader(account_id: int) -> None:
+    """Читатель у сообщения, которое ни одной целью не стало."""
+    engine = create_async_engine(DB_URL, poolclass=None)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as db:
+        channel_id = (await db.execute(
+            select(Channel.id).order_by(Channel.id))).scalars().first()
+        # Сообщение заводится своё: в засеве каждое уже стало целью, а нужен
+        # прочитанный аккаунтом текст, до очереди НЕ доехавший, — ровно та
+        # ситуация, что на проде.
+        message = Message(channel_id=channel_id, tg_message_id=9001, tg_date=NOW,
+                          author_peer_id=901, author_username="lone",
+                          author_name="Имя", author_is_bot=False,
+                          is_automatic_forward=False, text="ещё не разобрано",
+                          processed_at=None)
+        db.add(message)
+        await db.flush()
+        db.add(MessageReader(message_id=message.id, account_id=account_id))
+        await db.commit()
+    await engine.dispose()
 
 
 @pytest.fixture
@@ -366,6 +388,22 @@ def test_options_include_a_reader_the_mirror_does_not_know(client):
     """
     ids = [r["account_id"] for r in options(client)]
     assert ids == [ACC1, ACC2, ACC_UNMIRRORED]
+
+
+def test_account_that_read_something_is_offered_even_without_drafts(client):
+    """Перекос во времени: атрибуция моложе очереди.
+
+    На проде 03.09 записей о прочтении было 322, а пересечений с очередью — ноль:
+    целями пока становятся сообщения старого бэкфилла, прочитанные до атрибуции.
+    Аккаунт, которым человек вошёл, обязан быть в списке и показать честный пустой
+    срез — иначе фильтр выглядит сломанным ровно тогда, когда он нужнее всего.
+    """
+    seen = ACC1 + ACC2 + ACC_UNMIRRORED + 1000  # заведомо новый номер
+    asyncio.run(_add_lone_reader(seen))
+    row = [r for r in options(client) if r["account_id"] == seen]
+    assert row, "аккаунт, что-то прочитавший, не предложен в фильтре"
+    assert row[0]["drafts"] == 0
+    assert client.get(URL, params={"account_id": seen, "limit": 1}).status_code == 200
 
 
 def test_reader_without_a_label_names_itself_by_number(client):
