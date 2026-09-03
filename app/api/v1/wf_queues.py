@@ -342,6 +342,40 @@ async def _instance_key(db: GetDB, wf: Workflow) -> str:
         .where(EngageInstance.id == wf.engage_instance_id))).scalar_one()
 
 
+async def _fleet_labels(instance_key: str) -> dict[int, str]:
+    """Подписи аккаунтов из ЖИВОГО флота Engage: «аккаунт 3 · +4474•••3586».
+
+    Одна на весь модуль, потому что подпись обязана быть одинаковой в фильтре и в
+    карточке: человек выбирает аккаунт в списке, а потом читает «получено
+    аккаунтами» — разные подписи одного и того же аккаунта в двух местах он
+    прочитает как два разных аккаунта.
+
+    Не из зеркала `accounts`: его не наполняет ни один боевой путь (на проде 0
+    строк), и подпись оттуда была бы вечным номером.
+
+    Ключ аккаунта в ответе — `account_id`; на `id` лежит номер прокси внутри
+    `proxy`. Номер маскируется: экран смотрят и с чужих экранов.
+
+    Отказ Engage гасится здесь, а не общим обработчиком: атрибуция и список
+    аккаунтов — условие работы, подпись — удобство. Ронять первое ради второго
+    нельзя, поэтому наверх уходит пустой словарь, а не исключение.
+    """
+    out: dict[int, str] = {}
+    try:
+        rows = await engage.list_accounts(instance=instance_key)
+    except engage.EngageUnavailable as e:
+        logger.info("fleet_labels_unavailable instance=%s: %s", instance_key, e)
+        return out
+    for a in rows:
+        acc_id = a.get("account_id")
+        if acc_id is None:
+            continue
+        phone = engage.mask_phone(a.get("phone"))
+        out[int(acc_id)] = (f"аккаунт {acc_id} · {phone}" if phone != "—"
+                            else f"аккаунт {acc_id}")
+    return out
+
+
 async def _filter_accounts(db: GetDB, wf: Workflow,
                            instance_key: str) -> dict[int, dict]:
     """Аккаунты, по которым можно резать очередь этого сценария, и их вес.
@@ -403,24 +437,7 @@ async def _filter_accounts(db: GetDB, wf: Workflow,
         known |= set((await db.execute(
             select(MessageReader.account_id).distinct())).scalars())
 
-    # Живой флот — только за подписью. Отказ Engage гасится здесь, а не общим
-    # обработчиком: список аккаунтов — условие работы (без него человек не отберёт
-    # свои черновики), а подпись — удобство. Ронять первое ради второго нельзя.
-    fleet: dict[int, str] = {}
-    try:
-        for a in await engage.list_accounts(instance=instance_key):
-            # Ключ называется `account_id` — так его читает и экран флота
-            # (`screens.accounts`). На `id` в этом ответе лежит НОМЕР ПРОКСИ,
-            # вложенный в `proxy`, и подпись по нему молча не находилась бы ни для
-            # одного аккаунта: список остаётся, номера остаются, телефона нет.
-            acc_id = a.get("account_id")
-            if acc_id is None:
-                continue
-            phone = engage.mask_phone(a.get("phone"))
-            fleet[int(acc_id)] = (f"аккаунт {acc_id} · {phone}" if phone != "—"
-                                  else f"аккаунт {acc_id}")
-    except engage.EngageUnavailable as e:
-        logger.info("drafts_accounts_fleet_unavailable instance=%s: %s", instance_key, e)
+    fleet = await _fleet_labels(instance_key)
 
     return {acc_id: {"account_id": acc_id,
                      "label": (fleet.get(acc_id) or labels.get(acc_id)
@@ -465,8 +482,12 @@ async def _readers_by_message(db: GetDB, instance_key: str,
 
     Запрос на строку здесь уже случался в соседних ручках и стоил полутора сотен
     запросов на страницу в пятьдесят строк; образец пакетной доборки — `readers_by_message`
-    в `screens.messages()`. Подпись берётся внешним соединением к зеркалу `accounts`
-    по паре (инстанс, engage_account_id) — тем же запросом, без второй ходки.
+    в `screens.messages()`.
+
+    Подпись — та же `_fleet_labels`, что и у фильтра: человек выбирает аккаунт в
+    списке, а потом читает «получено аккаунтами» здесь, и две разные подписи
+    одного аккаунта он прочитает как два разных аккаунта. Зеркало `accounts`
+    остаётся вторым запасом (внешним соединением, без второй ходки в базу).
 
     Читатель, которого зеркало ещё не догнало, остаётся в выдаче с запасной
     подписью: исчезнувший читатель хуже безымянного, атрибуция приёма не должна
@@ -476,6 +497,7 @@ async def _readers_by_message(db: GetDB, instance_key: str,
     """
     if not message_ids:
         return {}
+    fleet = await _fleet_labels(instance_key)
     out: dict[int, list[dict]] = {}
     for msg_id, acc_id, label in (await db.execute(
             select(MessageReader.message_id, MessageReader.account_id, Account.label)
@@ -485,7 +507,7 @@ async def _readers_by_message(db: GetDB, instance_key: str,
             .order_by(MessageReader.message_id, MessageReader.account_id))).all():
         out.setdefault(msg_id, []).append({
             "account_id": acc_id,
-            "label": label or f"аккаунт {acc_id}",
+            "label": fleet.get(acc_id) or label or f"аккаунт {acc_id}",
         })
     return out
 

@@ -541,3 +541,25 @@ def test_account_absent_from_the_fleet_still_names_itself(client, monkeypatch):
     by_id = {r["account_id"]: r["label"] for r in options(client)}
     assert ACC_UNMIRRORED in by_id
     assert str(ACC_UNMIRRORED) in by_id[ACC_UNMIRRORED]
+
+
+def test_card_and_filter_name_the_account_the_same_way(client, monkeypatch):
+    """Подпись одна на оба места, иначе один аккаунт читается как два.
+
+    Человек выбирает аккаунт в фильтре («аккаунт 3 · +4474•••3586»), а потом
+    открывает карточку и читает «получено аккаунтами». Если там просто «аккаунт 3»,
+    он не может быть уверен, что это тот же самый, — а от этой уверенности зависит,
+    с какого аккаунта он пойдёт писать человеку.
+    """
+    _fleet(monkeypatch, [_fleet_row(ACC1, "+12159021784")])
+
+    in_filter = {r["account_id"]: r["label"] for r in options(client)}
+
+    r = client.get("/api/v1/workflows/cold_dm/drafts?limit=50")
+    assert r.status_code == 200, r.text
+    on_cards = {a["account_id"]: a["label"]
+                for row in r.json()["rows"] for a in (row.get("readers") or [])}
+
+    assert ACC1 in on_cards, "читатель обязан быть на карточке"
+    assert on_cards[ACC1] == in_filter[ACC1]
+    assert "+1215•••1784" in on_cards[ACC1]
