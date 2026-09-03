@@ -458,3 +458,72 @@ def test_options_are_closed_to_the_guest_like_the_queue_itself(client, seeded):
         {"uid": seeded["uids"]["viewer"], "totp_ok": True})
     client.cookies.set(get_settings().SESSION_COOKIE, token)
     assert client.get(OPTIONS_URL).status_code == 403
+
+
+# ── подпись аккаунта: живой флот вместо мёртвого зеркала ─────────────────────
+#
+# «аккаунт 3» — это номер строки в чужой базе. Человек, которому предстоит войти
+# в Telegram и написать, опознаёт аккаунт по телефону, а не по нему. Зеркало
+# `accounts` подписью служить не может: боевого пути записи в него нет ни одного,
+# на проде 03.09 в нём было 0 строк. Поэтому подпись берётся из ЖИВОГО флота
+# Engage — того же источника, которым живёт экран флота.
+#
+# Полный номер при этом наружу не уходит: маскировка та же, что на экране флота.
+
+def _fleet(monkeypatch, rows):
+    from app.api.v1 import wf_queues
+
+    async def fake(*a, **kw):
+        return rows
+
+    monkeypatch.setattr(wf_queues.engage, "list_accounts", fake)
+
+
+def test_label_names_the_account_by_its_phone(client, monkeypatch):
+    """Подпись опознаёт аккаунт так, как его опознаёт человек, — по номеру."""
+    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"},
+                         {"id": ACC2, "phone": "+33750664952"}])
+    by_id = {r["account_id"]: r["label"] for r in options(client)}
+    assert "+1215•••1784" in by_id[ACC1]
+    assert str(ACC1) in by_id[ACC1], "номер аккаунта тоже нужен: по нему идёт отбор"
+
+
+def test_label_does_not_leak_the_full_phone(client, monkeypatch):
+    """Наружу уходит опознавалка, а не сам номер: экран смотрят и с чужих экранов."""
+    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"}])
+    by_id = {r["account_id"]: r["label"] for r in options(client)}
+    assert "9021" not in by_id[ACC1]
+
+
+def test_fleet_outage_leaves_the_filter_working(client, monkeypatch):
+    """Engage недоступен — подпись беднее, но фильтр цел.
+
+    Список аккаунтов — условие работы: без него человек не отберёт свои черновики.
+    Ставить его в зависимость от доступности соседнего сервиса значит выключать
+    работу из-за украшения.
+    """
+    from app.api.v1 import wf_queues
+
+    async def boom(*a, **kw):
+        raise wf_queues.engage.EngageUnavailable("флот недоступен")
+
+    monkeypatch.setattr(wf_queues.engage, "list_accounts", boom)
+    rows = options(client)
+    assert [r["account_id"] for r in rows] == [ACC1, ACC2, ACC_UNMIRRORED]
+    # Подпись беднее, но не пустая: без флота остаётся зеркало, а без зеркала —
+    # номер. Пункт без подписи выбирать вслепую.
+    assert all(r["label"] for r in rows)
+    by_id = {r["account_id"]: r["label"] for r in rows}
+    assert str(ACC_UNMIRRORED) in by_id[ACC_UNMIRRORED]
+
+
+def test_account_absent_from_the_fleet_still_names_itself(client, monkeypatch):
+    """Читатель, которого флот не знает, не выбрасывается из списка.
+
+    Сообщение им заведомо получено — значит войти в него человек может, и прятать
+    пункт нельзя. Отставание справочника не отменяет факта прочтения.
+    """
+    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"}])
+    by_id = {r["account_id"]: r["label"] for r in options(client)}
+    assert ACC_UNMIRRORED in by_id
+    assert str(ACC_UNMIRRORED) in by_id[ACC_UNMIRRORED]

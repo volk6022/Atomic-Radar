@@ -131,6 +131,24 @@ async def list_accounts(*, instance: str | None = None) -> list[dict]:
     return (await _get("/v1/accounts/", instance=instance)).get("accounts", [])
 
 
+def mask_phone(phone: str | None) -> str:
+    """`+12159021784` → `+1215•••1784`.
+
+    Аккаунт нужно опознавать, а полный номер для этого не требуется. Экран смотрят
+    и с чужих экранов тоже; отдавать наружу то, что не нужно для работы, — лишний риск.
+
+    Живёт здесь, а не рядом с экраном флота: подпись аккаунта нужна и очереди
+    черновиков, а маскировка обязана быть ОДНА — две разные означали бы, что на
+    одном экране номер закрыт, а на соседнем нет.
+    """
+    if not phone:
+        return "—"
+    digits = phone.lstrip("+")
+    if len(digits) <= 8:
+        return phone
+    return f"+{digits[:4]}•••{digits[-4:]}"
+
+
 async def safety_config(*, instance: str | None = None) -> dict:
     """Конфиг безопасности: из него берутся дневные потолки прогрева по сценариям."""
     return await _get("/v1/admin/safety", instance=instance)
