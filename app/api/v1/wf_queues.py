@@ -409,7 +409,11 @@ async def _filter_accounts(db: GetDB, wf: Workflow,
     fleet: dict[int, str] = {}
     try:
         for a in await engage.list_accounts(instance=instance_key):
-            acc_id = a.get("id")
+            # Ключ называется `account_id` — так его читает и экран флота
+            # (`screens.accounts`). На `id` в этом ответе лежит НОМЕР ПРОКСИ,
+            # вложенный в `proxy`, и подпись по нему молча не находилась бы ни для
+            # одного аккаунта: список остаётся, номера остаются, телефона нет.
+            acc_id = a.get("account_id")
             if acc_id is None:
                 continue
             phone = engage.mask_phone(a.get("phone"))

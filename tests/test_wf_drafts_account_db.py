@@ -471,6 +471,14 @@ def test_options_are_closed_to_the_guest_like_the_queue_itself(client, seeded):
 # Полный номер при этом наружу не уходит: маскировка та же, что на экране флота.
 
 def _fleet(monkeypatch, rows):
+    """Ответ флота подделывается ТОЛЬКО в форме настоящего ответа Engage.
+
+    Ключ аккаунта там `account_id`, а не `id`: на `id` внутри `proxy` лежит номер
+    прокси. Первая версия этих тестов подавала `id`, код под неё и написали — на
+    проде флот отвечал 200, а подпись не находилась ни для одного аккаунта и
+    молча оставалась номером. Поэтому форма берётся из общей фикстуры флота, а не
+    сочиняется здесь заново.
+    """
     from app.api.v1 import wf_queues
 
     async def fake(*a, **kw):
@@ -479,10 +487,16 @@ def _fleet(monkeypatch, rows):
     monkeypatch.setattr(wf_queues.engage, "list_accounts", fake)
 
 
+def _fleet_row(account_id: int, phone: str) -> dict:
+    from tests.test_fleet import ENGAGE_ACCOUNTS
+
+    return dict(ENGAGE_ACCOUNTS[0], account_id=account_id, phone=phone)
+
+
 def test_label_names_the_account_by_its_phone(client, monkeypatch):
     """Подпись опознаёт аккаунт так, как его опознаёт человек, — по номеру."""
-    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"},
-                         {"id": ACC2, "phone": "+33750664952"}])
+    _fleet(monkeypatch, [_fleet_row(ACC1, "+12159021784"),
+                         _fleet_row(ACC2, "+33750664952")])
     by_id = {r["account_id"]: r["label"] for r in options(client)}
     assert "+1215•••1784" in by_id[ACC1]
     assert str(ACC1) in by_id[ACC1], "номер аккаунта тоже нужен: по нему идёт отбор"
@@ -490,7 +504,7 @@ def test_label_names_the_account_by_its_phone(client, monkeypatch):
 
 def test_label_does_not_leak_the_full_phone(client, monkeypatch):
     """Наружу уходит опознавалка, а не сам номер: экран смотрят и с чужих экранов."""
-    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"}])
+    _fleet(monkeypatch, [_fleet_row(ACC1, "+12159021784")])
     by_id = {r["account_id"]: r["label"] for r in options(client)}
     assert "9021" not in by_id[ACC1]
 
@@ -523,7 +537,7 @@ def test_account_absent_from_the_fleet_still_names_itself(client, monkeypatch):
     Сообщение им заведомо получено — значит войти в него человек может, и прятать
     пункт нельзя. Отставание справочника не отменяет факта прочтения.
     """
-    _fleet(monkeypatch, [{"id": ACC1, "phone": "+12159021784"}])
+    _fleet(monkeypatch, [_fleet_row(ACC1, "+12159021784")])
     by_id = {r["account_id"]: r["label"] for r in options(client)}
     assert ACC_UNMIRRORED in by_id
     assert str(ACC_UNMIRRORED) in by_id[ACC_UNMIRRORED]
