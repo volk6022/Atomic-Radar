@@ -48,7 +48,7 @@ NOW = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
 # Аккаунты Engage. Третий намеренно НЕ заводится в зеркале `accounts`: приём пишет
 # `account_id` со слов Engage, и зеркало может отстать. Читатель, которого нет в
 # зеркале, обязан остаться видимым — исчезнувший читатель хуже безымянного.
-ACC1, ACC2, ACC_UNMIRRORED = 101, 102, 103
+ACC1, ACC2, ACC_UNMIRRORED, ACC_OTHER_INSTANCE = 101, 102, 103, 104
 
 
 async def _seed() -> dict:
@@ -81,6 +81,10 @@ async def _seed() -> dict:
                     label="acc-1", status="active", tz_offset=0),
             Account(engage_account_id=ACC2, engage_instance="default",
                     label="acc-2", status="active", tz_offset=0),
+            # Аккаунт чужого инстанса: пара (инстанс, номер) адресует аккаунт, и
+            # один и тот же номер в двух инстансах — два разных человека за клавиатурой.
+            Account(engage_account_id=ACC_OTHER_INSTANCE, engage_instance="other",
+                    label="чужой", status="active", tz_offset=0),
         ])
 
         dm = Workflow(key="cold_dm", title="Личные сообщения", target_kind="user",
@@ -311,3 +315,93 @@ def test_single_draft_carries_the_same_attribution_as_the_row(client):
     body = one.json()
     assert [a["account_id"] for a in body["readers"]] == [ACC1, ACC2]
     assert body["tg_link"] == "https://t.me/user"
+
+
+# ── список аккаунтов для фильтра ──────────────────────────────────────────────
+#
+# Выпадающий список на экране обязан строиться из того же реестра, по которому ручка
+# выносит отказ. Список, предлагающий значение, которое сервер отвергнет, хуже
+# отсутствующего: человек выбирает аккаунт и получает 422 вместо среза.
+
+OPTIONS_URL = "/api/v1/workflows/cold_dm/drafts/accounts"
+
+
+def options(client):
+    r = client.get(OPTIONS_URL)
+    assert r.status_code == 200, r.text
+    return r.json()["rows"]
+
+
+def test_accounts_route_is_not_swallowed_by_the_draft_id_route(client):
+    """`/drafts/accounts` объявлен ВЫШЕ `/drafts/{draft_id}`.
+
+    Иначе FastAPI разбирает «accounts» как номер черновика и отвечает 422 —
+    отказом, по которому не догадаться, что ручка вообще существует.
+    """
+    r = client.get(OPTIONS_URL)
+    assert r.status_code == 200, r.text
+
+
+def test_options_are_exactly_what_the_filter_accepts(client):
+    """Главный инвариант: что предложено, то и принимается."""
+    for row in options(client):
+        got = client.get(URL, params={"account_id": row["account_id"], "limit": 1})
+        assert got.status_code == 200, (
+            f"фильтр отверг аккаунт {row['account_id']}, который сам же предложен")
+
+
+def test_options_are_the_instance_mirror_not_the_whole_fleet(client):
+    """Аккаунт другого инстанса — другой человек за клавиатурой, ему здесь не место."""
+    ids = [r["account_id"] for r in options(client)]
+    assert ids == [ACC1, ACC2]
+    assert ACC_OTHER_INSTANCE not in ids
+
+
+def test_options_carry_the_human_label(client):
+    assert [r["label"] for r in options(client)] == ["acc-1", "acc-2"]
+
+
+def test_options_say_how_many_drafts_each_account_saw(client):
+    """Число рядом с аккаунтом — единственный способ понять, с какого входить.
+
+    У acc-1 два черновика (msg 1 и msg 3), у acc-2 тоже два (msg 2 и msg 3).
+    """
+    by_id = {r["account_id"]: r["drafts"] for r in options(client)}
+    assert by_id == {ACC1: 2, ACC2: 2}
+
+
+def test_counts_agree_with_what_the_filter_returns(client):
+    """Число в списке и `total` фильтра считаются по-разному — значит могут разойтись.
+
+    Ровно на этом уже поймали чипсы каналов, поэтому равенство проверяется явно.
+    """
+    for row in options(client):
+        got = get(client, limit=50, account_id=row["account_id"])
+        assert got["total"] == row["drafts"], (
+            f"аккаунт {row['account_id']}: в списке {row['drafts']}, "
+            f"фильтр отдал {got['total']}")
+
+
+def test_account_that_saw_nothing_is_still_offered(client):
+    """Аккаунт без черновиков остаётся в списке с нулём.
+
+    Убрать его — значит спрятать от человека, что он вошёл в аккаунт, которому
+    сегодня писать некому: пустой срез и отсутствующий пункт читаются одинаково
+    плохо, но первый хотя бы правда.
+    """
+    r = client.get("/api/v1/workflows/cold_dm/drafts", params={"limit": 50})
+    assert r.status_code == 200
+    rows = options(client)
+    assert all("drafts" in row for row in rows)
+
+
+def test_options_are_closed_to_the_guest_like_the_queue_itself(client, seeded):
+    """Список аккаунтов — часть очереди черновиков, а не отдельная витрина.
+
+    Гостю раздел закрыт целиком; открыть ему справочник аккаунтов флота значило бы
+    выдать наружу состав флота через боковую дверь.
+    """
+    token = SessionSigner(get_settings().SECRET_KEY).dumps(
+        {"uid": seeded["uids"]["viewer"], "totp_ok": True})
+    client.cookies.set(get_settings().SESSION_COOKIE, token)
+    assert client.get(OPTIONS_URL).status_code == 403

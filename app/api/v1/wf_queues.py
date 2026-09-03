@@ -634,6 +634,50 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
             "draft": one}
 
 
+@router.get("/drafts/accounts")
+async def draft_accounts(db: GetDB, wf: Workflow = GetWorkflow,
+                         user=requires(Section.DRAFTS)):
+    """Аккаунты, из которых строится фильтр очереди, — зеркало инстанса сценария.
+
+    Ровно тот же закрытый список, по которому `_check_account` выносит отказ.
+    Выпадающий список, предлагающий значение, которое ручка отвергнет, хуже
+    отсутствующего: человек выбирает аккаунт и получает 422 вместо среза.
+
+    **Зеркало, а не живой Engage.** Соседняя `/manual-sends/accounts` спрашивает флот
+    по сети и при недоступности отдаёт пустой список — там это уместно, поле
+    необязательное. Здесь фильтр — единственный способ разобрать очередь по-человечески,
+    и он не должен исчезать вместе с сетью до Софии.
+
+    Аккаунт без черновиков остаётся в списке с нулём: пустой срез и отсутствующий
+    пункт читаются одинаково, но первый хотя бы правда — человек видит, что вошёл
+    в аккаунт, которому сегодня писать некому.
+
+    ⚠️ Объявлено ВЫШЕ `/drafts/{draft_id}`: маршруты разбираются по порядку, и иначе
+    «accounts» уехало бы в номер черновика, а ручка отвечала бы 422.
+    """
+    instance_key = await _instance_key(db, wf)
+
+    # Считаем по черновикам, а не по целям: в списке стоит то же число, что покажет
+    # фильтр, а он режет именно очередь. `distinct` — потому что одно сообщение
+    # может быть прочитано несколькими аккаунтами, и без него строки перемножились бы.
+    counts = dict((await db.execute(
+        select(MessageReader.account_id, func.count(func.distinct(WfDraft.id)))
+        .join(WfTarget, WfTarget.message_id == MessageReader.message_id)
+        .join(WfDraft, WfDraft.target_id == WfTarget.id)
+        .where(WfDraft.workflow_id == wf.id)
+        .group_by(MessageReader.account_id))).all())
+
+    rows = (await db.execute(
+        select(Account.engage_account_id, Account.label)
+        .where(Account.engage_instance == instance_key)
+        .order_by(Account.engage_account_id))).all()
+
+    return {"rows": [{"account_id": acc_id,
+                      "label": label or f"аккаунт {acc_id}",
+                      "drafts": counts.get(acc_id, 0)}
+                     for acc_id, label in rows]}
+
+
 @router.get("/drafts/{draft_id}")
 async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
                 user=requires(Section.DRAFTS)):

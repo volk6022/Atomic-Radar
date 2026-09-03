@@ -54,11 +54,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
-from app.db.models import (Account, Alert, Attribution, ConfigFile,  # noqa: E402
-                           Conversation,  # noqa: E402
+from app.db.models import (Account, Alert, Attribution, Channel,  # noqa: E402
+                           ConfigFile, Conversation,  # noqa: E402
                            ConversationEvent, Draft, EngageInstance, Evaluation,
-                           Lead, LlmTrace, OutboundAttempt, ProfileVersion, Run,
-                           User, WfTarget, Workflow)
+                           Lead, LlmTrace, Message, MessageReader, OutboundAttempt,
+                           ProfileVersion, Run, User, WfTarget, Workflow)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.services import manual_sends  # noqa: E402
 
@@ -191,6 +191,8 @@ async def extras(db) -> None:
 
     await db.commit()
 
+    await _attribution_and_comment(db, account)
+
     # Ручные отправки заводятся настоящим сервисом: пара «что предложили → что
     # человек написал» и есть то, ради чего форма существует, и подделывать её
     # записью в таблицу значит проверять не тот путь.
@@ -200,6 +202,75 @@ async def extras(db) -> None:
                               text="Привет. Судя по описанию, дело в конфиге.")
     await manual_sends.record(db, workflow=wf, recorded_by=owner.email,
                               text="Ответил человеку из чата, которого Radar не находил")
+    await db.commit()
+
+
+async def _attribution_and_comment(db, first_account: Account) -> None:
+    """Кто прочитал сообщение и что из этого пришло комментарием под постом.
+
+    Обе вещи выглядят как украшение строки, а на деле это то, ради чего очередь
+    черновиков вообще открывают: человек рассылает руками, входит в ОДИН аккаунт и
+    обязан писать именно с него. Без посева здесь `readers` у всех строк пустой,
+    `source.is_comment` всегда `false` — и смоук проверяет мир, в котором этой
+    половины экрана просто нет.
+
+    Второй аккаунт заводится **в зеркале**, а не только в подменённом ответе Engage:
+    выпадающий фильтр строится из зеркала, и с одним аккаунтом в нём выбирать не из
+    чего.
+
+    ⚠️ Посев идёт по ВСЕМ целям по остатку от деления, а не по нескольким свежим.
+    Очередь достраивается уже после этого шага (`ensure_queue` при первом чтении
+    ручки), и какие цели попадут на первую страницу, отсюда не видно: посев «на
+    восемь последних» дал страницу, где `readers` пуст у всех пяти строк. Остаток
+    гарантирует смесь на любой странице: и две подписи, и одна, и ни одной.
+    """
+    db.add(Account(engage_account_id=13, engage_instance=first_account.engage_instance,
+                   label="acc-13", status="warmup", phone_country="RU",
+                   proxy_country="RU", tz_offset=3, limit_day=20, limit_hour=4))
+
+    targets = (await db.execute(select(WfTarget))).scalars().all()
+    messages = {m.id: m for m in (await db.execute(
+        select(Message).where(
+            Message.id.in_([t.message_id for t in targets])))).scalars()}
+
+    READERS = {0: (12, 13), 1: (12,), 2: (13,), 3: ()}
+    seeded: set[tuple[int, int]] = set()
+    for t in targets:
+        for account_id in READERS[t.id % 4]:
+            # Одно сообщение может стоять целью сразу двух сценариев, а ключ таблицы
+            # составной: без этой проверки посев падал бы на дубликате.
+            if (t.message_id, account_id) in seeded:
+                continue
+            seeded.add((t.message_id, account_id))
+            db.add(MessageReader(message_id=t.message_id, account_id=account_id))
+
+    # ── комментарии под постами ───────────────────────────────────────────────
+    #
+    # Найти сообщение в группе и найти его в канале — разные вещи, когда в группу
+    # ещё не вступили. Поэтому у комментария кроме ссылки на него самого должна быть
+    # ссылка на пост. Собирается это из корня ветки: у зеркала поста в группе стоят
+    # `forward_from_chat_id` и `forward_from_message_id`, и только по ним ссылка
+    # ведёт в канал, а не в группу — нумерация у них разная.
+    origin = Channel(peer_id=-1009001, username="andrey_channel",
+                     title="Канал про закупки", chat_type="channel")
+    db.add(origin)
+
+    for n, message in enumerate(
+            sorted((messages[t.message_id] for t in targets
+                    if t.message_id in messages), key=lambda m: m.id)):
+        if message.thread_id is not None or message.tg_message_id % 3:
+            continue
+        root_id = message.tg_message_id + 10_000
+        db.add(Message(channel_id=message.channel_id, tg_message_id=root_id,
+                       tg_date=NOW - timedelta(hours=6), author_peer_id=None,
+                       author_username=None, author_name=None, author_is_bot=True,
+                       is_automatic_forward=True,
+                       forward_from_chat_id=origin.peer_id,
+                       forward_from_message_id=400 + n,
+                       text="Пост канала, автоматически отзеркаленный в обсуждение.",
+                       processed_at=NOW - timedelta(hours=6)))
+        message.thread_id = root_id
+
     await db.commit()
 
 
@@ -252,6 +323,8 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/workflows/{key}/pains", "/workflows/public_reply/pains"),
         ("/workflows/{key}/drafts", "/workflows/public_reply/drafts?limit=5"),
         ("/workflows/{key}/drafts/next", "/workflows/public_reply/drafts/next"),
+        ("/workflows/{key}/drafts/accounts",
+         "/workflows/public_reply/drafts/accounts"),
         ("/workflows/{key}/drafts/{id}", f"/workflows/public_reply/drafts/{wf_d}"),
         # Активность снимается с публичного сценария: у ЛС этого раздела нет вовсе
         # (см. `SECTIONS_BY_ACTION`), и снимок с `cold_dm` описывал бы экран, который
