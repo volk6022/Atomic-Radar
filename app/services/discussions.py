@@ -36,7 +36,7 @@ import logging
 from sqlalchemy import func, select
 
 from app.core import clock
-from app.db.models import Channel, Message
+from app.db.models import Channel, Message, MessageReader
 from app.db.session import get_session_maker
 from app.services import engage
 from app.services import ingest as ingest_service
@@ -374,3 +374,192 @@ def _note(channel_id: int, out: dict) -> str:
                 f"история не читалась, уже было {out.get('already_had', 0)}")
     return (f"канал {channel_id} → @{out.get('linked')}: прочитано "
             f"{out.get('read', 0)}, уже было {out.get('already_had', 0)}")
+
+
+# ── вступление в группы (план 1.6, шаг 7) ─────────────────────────────────────
+
+# Сколько вступлений в сутки разрешено одному аккаунту. Значение из
+# `fleet_manager/config/safety.yaml`, профиль `public_reply`: `joins_per_day: 3`.
+# Продублировано здесь осознанно и как потолок, а не запрошено у Engage: Engage при
+# исчерпанном бюджете задачу не отвергает, а ОТКЛАДЫВАЕТ на час и переносит, пока не
+# сменятся сутки. Пачка из сорока вступлений, заказанная разом, безопаснее от этого
+# не станет — она превратится в сорок задач, которые сутками стучатся в планировщик.
+# Резать пачку здесь дешевле, и остаток виден в отчёте прогона.
+JOINS_PER_ACCOUNT_PER_DAY = 3
+
+# Сколько ждать результата вступления. Пауза хьюманайзера у `join_group` — 60–300 с
+# (у чтений её нет вовсе), и перед ней задача ещё стоит в поаккаунтной очереди Engage
+# за предыдущей. Штатных 300 с `wait_for_task` на это не хватает.
+JOIN_WAIT_SECONDS = 900.0
+
+
+async def select_groups_to_join(db, *, scope: str, channel_ids: list[int] | None
+                                ) -> list[int]:
+    """Строки групп, в которые стоит вступить. Порядок — по убыванию аудитории:
+    прерванный прогон оставит недоделанным мелкое.
+
+    Отбор намеренно узкий, и каждое условие отсекает свой класс ошибок:
+
+    * `chat_type` из `GROUP_TYPES` — вступают в группу обсуждения, а не в канал: на
+      канал аккаунт подписывается при подключении, и «вступление» в него потратило бы
+      лимит на уже сделанное;
+    * `username is not null` — **только открытые группы**. Вступление идёт по имени
+      (`join_chat("@name")`); у закрытой группы имени нет, и попасть туда можно только
+      заявкой по ссылке-приглашению. Заявка — это след, который видит администратор,
+      и решение, которое принимает человек, а не прогон;
+    * `linked_joined_at is null` — уже вступили, второй раз лимит тратить не на что;
+    * `ingest_enabled` — снятый с отслеживания чат оператор выключил сам.
+
+    `scope="ids"` фильтруется теми же правилами, а не доверяет списку с экрана:
+    кнопка «вступить» на строке приватной группы — ошибка интерфейса, и отработать её
+    отказом здесь дешевле, чем потом объяснять заявку в чужой чат.
+    """
+    q = (select(Channel.id)
+         .where(Channel.ingest_enabled.is_(True),
+                Channel.chat_type.in_(GROUP_TYPES),
+                Channel.username.isnot(None),
+                Channel.linked_joined_at.is_(None)))
+    if scope == "ids":
+        q = q.where(Channel.id.in_(list(channel_ids or []) or [0]))
+    return list((await db.execute(
+        q.order_by(Channel.members.desc().nullslast(), Channel.id))).scalars().all())
+
+
+async def _readers_of(db, group_ids: list[int]) -> dict[int, int]:
+    """Кто из аккаунтов прочитал в группе больше всего — по одному на группу.
+
+    Живой поток пойдёт через того, кто вступил, а Андрей отвечает из одного аккаунта.
+    Если группу читал третий, а вступит первый, наводка и ответ уедут на разные
+    аккаунты, и адресат получит сообщение «ниоткуда» — ровно та причина, по которой в
+    очереди черновиков появилась колонка аккаунта приёма.
+    """
+    if not group_ids:
+        return {}
+    seen = func.count(MessageReader.message_id)
+    rows = (await db.execute(
+        select(Message.channel_id, MessageReader.account_id, seen)
+        .join(MessageReader, MessageReader.message_id == Message.id)
+        .where(Message.channel_id.in_(group_ids))
+        .group_by(Message.channel_id, MessageReader.account_id)
+        .order_by(Message.channel_id, seen.desc(), MessageReader.account_id))).all()
+    best: dict[int, int] = {}
+    for channel_id, account_id, _count in rows:
+        best.setdefault(channel_id, account_id)
+    return best
+
+
+def plan_joins(group_ids: list[int], account_ids: list[int], *, per_account: int,
+               preferred: dict[int, int]) -> dict[int, list[int]]:
+    """Разложить группы по аккаунтам, не превышая суточный потолок ни у кого.
+
+    Сначала группе предлагается тот аккаунт, который её читал; если у него на сегодня
+    места нет, группа уходит к самому свободному. Что не поместилось — не уходит
+    никуда: остаток честно виден в отчёте как «осталось на следующий раз».
+    """
+    cap = max(0, min(per_account, JOINS_PER_ACCOUNT_PER_DAY))
+    plan: dict[int, list[int]] = {a: [] for a in account_ids}
+    if not account_ids or cap == 0:
+        return plan
+    for group_id in group_ids:
+        want = preferred.get(group_id)
+        if want in plan and len(plan[want]) < cap:
+            plan[want].append(group_id)
+            continue
+        free = min(plan, key=lambda a: (len(plan[a]), a))
+        if len(plan[free]) >= cap:
+            break
+        plan[free].append(group_id)
+    return plan
+
+
+async def _join_one(db, group_id: int, account_id: int, *, subscribed_by: str) -> dict:
+    """Вступить в одну группу. Историю здесь не читаем ни при каких условиях:
+    «вступить» и «дочитать» — два разных решения оператора и два разных бюджета.
+
+    Отметка ставится в строку САМОЙ ГРУППЫ, а не канала, которому она принадлежит:
+    именно её читает `discussion_state`, и именно про эту строку правда «мы в этом
+    чате состоим». Живой поток Telegram шлёт участнику того чата, в который вступили.
+    """
+    group = await db.get(Channel, group_id)
+    if group is None or not group.username:
+        return {"skipped": "нет username — закрытая группа"}
+    if group.linked_joined_at is not None:
+        return {"skipped": "уже вступали"}
+
+    task = await engage.action(
+        account_id=account_id, action="join_group",
+        payload={"target": group.username},
+        webhook_url=engage.webhook_url(kind="polled"))
+    await engage.wait_for_task(task["task_id"], timeout=JOIN_WAIT_SECONDS)
+
+    group.linked_joined_at = clock.utcnow()
+    group.subscribed_account_id = account_id
+    group.subscribed_by = subscribed_by
+    group.subscribed_at = clock.utcnow()
+    await db.commit()
+    logger.info("group_joined group=%s username=%s account=%s by=%s",
+                group.id, group.username, account_id, subscribed_by)
+    return {"joined": True, "username": group.username, "account_id": account_id}
+
+
+async def join_groups(*, group_ids: list[int], account_ids: list[int],
+                      per_account: int, subscribed_by: str, report, cancelled) -> dict:
+    """Вступить списком, по потоку на аккаунт.
+
+    Параллелизм ровно по числу аккаунтов: очередь у Engage поаккаунтная, и два
+    вступления одним аккаунтом всё равно встанут друг за другом.
+
+    Отказ на одной группе не отменяет остальные — приватность, флуд-контроль и
+    «слишком много каналов» на списке из сорока штук встречаются каждый раз.
+    """
+    async with get_session_maker()() as db:
+        preferred = await _readers_of(db, group_ids)
+    plan = plan_joins(group_ids, account_ids, per_account=per_account,
+                      preferred=preferred)
+    planned = sum(len(v) for v in plan.values())
+    stats = {"total": len(group_ids), "planned": planned,
+             "left": len(group_ids) - planned, "done": 0, "joined": 0,
+             "failed": 0, "deferred": 0, "skipped": 0}
+    lock = asyncio.Lock()
+
+    async def worker(account_id: int) -> None:
+        maker = get_session_maker()
+        for group_id in plan[account_id]:
+            if cancelled():
+                return
+            try:
+                async with maker() as db:
+                    out = await _join_one(db, group_id, account_id,
+                                          subscribed_by=subscribed_by)
+            except engage.EngageTaskDeferred as e:
+                logger.warning("group_join_deferred group=%s account=%s error=%s",
+                               group_id, account_id, e)
+                out = {"deferred": str(e)}
+            except Exception as e:  # noqa: BLE001 — одна группа не роняет прогон
+                logger.warning("group_join_failed group=%s account=%s error=%s",
+                               group_id, account_id, e)
+                out = {"failed": f"{type(e).__name__}: {e}"}
+
+            async with lock:
+                stats["done"] += 1
+                for key in ("joined", "failed", "deferred", "skipped"):
+                    if out.get(key):
+                        stats[key] += 1
+                done, note = stats["done"], _join_note(group_id, account_id, out)
+            await report(100.0 * done / planned if planned else 100.0,
+                         f"[{done}/{planned}] {note}")
+
+    await asyncio.gather(*(worker(a) for a in account_ids))
+    stats["cancelled"] = cancelled() and stats["done"] < planned
+    return stats
+
+
+def _join_note(group_id: int, account_id: int, out: dict) -> str:
+    if out.get("joined"):
+        return f"аккаунт {account_id} вступил в @{out.get('username')}"
+    if out.get("deferred"):
+        return (f"группа {group_id}: у аккаунта {account_id} кончился дневной лимит "
+                f"вступлений — {out['deferred']}")
+    if out.get("skipped"):
+        return f"группа {group_id} пропущена: {out['skipped']}"
+    return f"группа {group_id}: {out.get('failed')}"

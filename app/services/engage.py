@@ -219,8 +219,21 @@ class EngageTaskFailed(RuntimeError):
         self.code = code
 
 
+class EngageTaskDeferred(EngageTaskFailed):
+    """Задача отложена Engage: дневной лимит аккаунта исчерпан.
+
+    Наследник `EngageTaskFailed`, чтобы вызывающий, которому разница не важна,
+    ловил одно исключение. Разница важна там, где по итогу что-то записывают:
+    отказ — это «сюда нельзя», отложенная задача — «можно, но не сегодня», и
+    отметку о выполнении не заслуживает ни та, ни другая, а вот в отчёте прогона
+    они значат разное. Engage при исчерпанном бюджете именно откладывает, а не
+    отказывает (`app/workers/base_task.py`, ветка `_consume_write_budget`).
+    """
+
+
 async def wait_for_task(task_id: str, *, instance: str | None = None,
-                        timeout: float = 300.0, interval: float = 2.0) -> dict:
+                        timeout: float = 300.0, interval: float = 2.0,
+                        stop_on_deferred: bool = True) -> dict:
     """Дождаться результата задачи опросом `GET /v1/tasks/{id}`.
 
     Обычный путь результата — вебхук, и он остаётся основным: канал приезжает
@@ -245,6 +258,14 @@ async def wait_for_task(task_id: str, *, instance: str | None = None,
             code = task.get("error_code")
             raise EngageTaskFailed(f"задача Engage не выполнена: {code or 'без кода'}",
                                    code=code)
+        if status == "deferred" and stop_on_deferred:
+            # Отложенную задачу ждать бессмысленно: Engage перепланирует её через
+            # час и будет переносить, пока не сменится сутки бюджета. Без этой
+            # ветки прогон стоял бы здесь до собственного таймаута, а в отчёте
+            # исчерпанный лимит был бы неотличим от неотвечающего Engage.
+            code = task.get("error_code")
+            raise EngageTaskDeferred(
+                f"Engage отложил задачу: {code or 'дневной лимит'}", code=code)
         if asyncio.get_running_loop().time() >= deadline:
             raise EngageUnavailable(
                 f"Engage не вернул результат за {int(timeout)} с (статус «{status}»)")

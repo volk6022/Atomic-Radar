@@ -41,18 +41,23 @@ KIND_CAPABILITY = {
     # Разбор групп обсуждения — тот же бэкфилл, только списком: те же чтения через
     # тот же дневной бюджет, ничего нового аккаунт при этом не делает.
     "discussions": Capability.RUN_BACKFILL,
+    # Вступление — не чтение: аккаунт появляется в чужой группе списком участников,
+    # тратит другой дневной бюджет и оставляет след, который видит администратор.
+    # Поэтому право владельца, то же самое, что у `POST /channels/discussions/join`.
+    "group_join": Capability.CHANNEL_JOIN,
 }
 
 KIND_TITLE = {"reclassify": "Переклассификация", "backfill": "Дочитать историю",
               "channel_add": "Подключение канала", "export": "Выгрузка",
-              "discussions": "Разбор групп обсуждения"}
+              "discussions": "Разбор групп обсуждения",
+              "group_join": "Вступление в группы обсуждения"}
 
 # Где у вида задачи кнопка. Бэкфиллу и подключению канала нужен выбранный канал
 # (или его username) — оба живут в разделе Channels и оттуда же заводят строку в
 # `runs`, а не через общий `POST /runs`.
 KIND_WHERE = {"reclassify": "runs", "backfill": "channels",
              "channel_add": "channels", "export": "nowhere",
-             "discussions": "channels"}
+             "discussions": "channels", "group_join": "channels"}
 
 
 def _aware(dt: datetime | None) -> datetime | None:

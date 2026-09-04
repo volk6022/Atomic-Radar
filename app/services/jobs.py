@@ -52,7 +52,8 @@ ACTIVE = ("queued", "running")
 
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
 # браузера, и запускать по нему произвольную функцию нельзя.
-KINDS = ("reclassify", "backfill", "channel_add", "export", "discussions")
+KINDS = ("reclassify", "backfill", "channel_add", "export", "discussions",
+         "group_join")
 
 
 class JobBusy(Exception):
@@ -201,9 +202,42 @@ async def _job_discussions(run_id: int, params: dict) -> dict:
 # await ради одного булева значения только мешал бы.
 _CANCEL_CACHE: dict[int, bool] = {}
 
+async def _job_group_join(run_id: int, params: dict) -> dict:
+    """Вступить в группы обсуждения списком (план 1.6, шаг 7).
+
+    Список считается на момент старта, а не на момент нажатия, — по той же причине,
+    что и у разбора: между ними прогон может простоять в очереди, и за это время
+    в какую-то группу уже могли вступить.
+    """
+    async with _tracked(run_id) as (report, cancelled):
+        async with get_session_maker()() as db:
+            group_ids = await discussions.select_groups_to_join(
+                db, scope=params.get("scope") or "pending",
+                channel_ids=params.get("channel_ids"))
+
+        accounts = list(params.get("account_ids") or [])
+        if not accounts:
+            # Флот спрашиваем у Engage: список, записанный в параметры месяц назад,
+            # увёл бы вступление на заблокированный аккаунт.
+            accounts = [a["account_id"] for a in await engage.list_accounts()
+                        if a.get("status") == "active"]
+        if not accounts:
+            raise RuntimeError("во флоте Engage нет активных аккаунтов")
+
+        per_account = int(params.get("per_account")
+                          or discussions.JOINS_PER_ACCOUNT_PER_DAY)
+        await report(0, f"групп без вступления {len(group_ids)}, "
+                        f"аккаунтов {len(accounts)}, потолок {per_account} на аккаунт")
+        return await discussions.join_groups(
+            group_ids=group_ids, account_ids=accounts, per_account=per_account,
+            subscribed_by=params.get("subscribed_by") or "",
+            report=report, cancelled=cancelled)
+
+
 RUNNERS: dict[str, Callable[[int, dict], Awaitable[dict]]] = {
     "reclassify": _job_reclassify,
     "discussions": _job_discussions,
+    "group_join": _job_group_join,
 }
 
 

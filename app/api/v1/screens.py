@@ -324,6 +324,11 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
             # сообщений» на три разные причины. Расшифровка — в
             # `app/services/discussions.py`, STATES.
             "discussion": discussions.discussion_state(c, by_username, counts, last_at),
+            # Состоим ли мы в ЭТОМ чате. У строки канала поле пустует (в канал
+            # подписываются, а не вступают), у строки группы это единственный
+            # способ отличить «читаем её историю» от «получаем комментарии живьём»:
+            # состояние `discussion` для самой группы не считается вовсе.
+            "joined_at": c.linked_joined_at.isoformat() if c.linked_joined_at else None,
             # Кем подписан (FIXES.md #7). `None` у каналов, заведённых по старому
             # пути — сами при первом сообщении, никто руками не подключал.
             "subscribed_account_id": c.subscribed_account_id,

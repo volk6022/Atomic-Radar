@@ -424,12 +424,25 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
             channel.linked_chat_peer_id = peer_id
             if username:
                 channel.linked_chat_username = username
-            # Момент вступления, а не просто «мы знаем про группу». Именно с него у
-            # канала появляется живой поток комментариев: историю Telegram отдаёт и
-            # постороннему, апдейты — только участнику (FIXES.md #3).
-            channel.linked_joined_at = clock.utcnow()
             channel.linked_checked_at = clock.utcnow()
-            await db.commit()
+        # Момент вступления ставится в строку ГРУППЫ, а не канала: `discussion_state`
+        # читает `linked_joined_at` именно у неё, и до 05.09 писатель и читатель
+        # имели в виду разные строки — состояние канала оставалось «история» после
+        # успешного вступления, а повторный запуск тратил лимит заново. Не всплывало
+        # только потому, что вступлений не делали вовсе: на проде колонка пуста у всех.
+        if peer_id:
+            group = await ingest_service.get_or_create_channel(
+                db, peer_id=peer_id, username=username, title=result.get("title"))
+            group.chat_type = result.get("type") or group.chat_type
+            group.linked_chat_peer_id = channel.peer_id if channel is not None else None
+            group.linked_chat_username = (channel.username if channel is not None
+                                          else group.linked_chat_username)
+            group.linked_joined_at = clock.utcnow()
+            group.linked_checked_at = clock.utcnow()
+            group.subscribed_account_id = account_id
+            group.subscribed_by = subscribed_by
+            group.subscribed_at = clock.utcnow()
+        await db.commit()
         if run_id:
             await jobs.finish(
                 run_id, status="done",
@@ -739,6 +752,14 @@ async def discussions_summary(db: GetDB, user=requires(Section.CHANNELS)):
             continue
         state = discussions_service.discussion_state(c, by_name, counts)["state"]
         out[state] = out.get(state, 0) + 1
+
+    # Сколько групп возьмёт вступление. Считается ТОЙ ЖЕ функцией, что и сам прогон,
+    # а не выводится из `history` на экране: состояния считаются по каналам, а
+    # вступают в группы, и два числа неизбежно разошлись бы на закрытых группах и
+    # на группах без канала-владельца. Предупреждение, врущее на единицу, хуже
+    # отсутствующего — по нему принимают решение потратить дневной лимит.
+    out["to_join"] = len(await discussions_service.select_groups_to_join(
+        db, scope="pending", channel_ids=None))
     return out
 
 
@@ -772,9 +793,9 @@ async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: G
     отдельный прогон: он идёт от каналов, а не от того, что уже лежит в базе.
 
     Вступление в группу сюда не входит намеренно. Оно меняет поведение аккаунта в
-    Telegram, а не наши данные, живёт в подключении канала (FIXES.md #7) и упирается
-    в профиль безопасности флота. Разбор же — только чтение, публичную супергруппу
-    Telegram отдаёт и постороннему.
+    Telegram, а не наши данные, тратит другой бюджет и требует других прав — для него
+    отдельная ручка `POST /channels/discussions/join`. Разбор же — только чтение,
+    публичную супергруппу Telegram отдаёт и постороннему.
     """
     if body.scope == "ids" and not body.channel_ids:
         raise HTTPException(422, "scope=ids требует непустой channel_ids")
@@ -804,6 +825,75 @@ async def scan_discussions(body: ScanDiscussionsRequest, request: Request, db: G
         note = ("разбор идёт в разделе Runs: у каждого канала спрашиваем "
                 "карточку, заводим его группу обсуждения и дочитываем её историю")
     return {"started": True, "run_id": run.id, "note": note}
+
+
+class JoinDiscussionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # `pending` — все открытые группы обсуждения, в которых аккаунтов ещё нет.
+    # Отбор целиком в `discussions.select_groups_to_join`, и `ids` проходит через
+    # те же условия: список с экрана здесь не команда, а пожелание.
+    scope: str = Field("pending", pattern="^(pending|ids)$")
+    channel_ids: list[int] = Field(default_factory=list)
+    account_ids: list[int] = Field(default_factory=list)
+    # Потолок вступлений на аккаунт за прогон. Больше суточного лимита Engage
+    # (`joins_per_day: 3` у профиля `public_reply`) поставить нельзя — сверх него
+    # Engage задачу откладывает, а не выполняет.
+    per_account: int = Field(discussions_service.JOINS_PER_ACCOUNT_PER_DAY, ge=1,
+                             le=discussions_service.JOINS_PER_ACCOUNT_PER_DAY)
+
+
+@operator_router.post("/discussions/join", status_code=202)
+async def join_discussions(body: JoinDiscussionsRequest, request: Request, db: GetDB,
+                           user=permits(Section.CHANNELS, Capability.CHANNEL_JOIN)):
+    """Вступить в группы обсуждения, историю которых мы уже читаем.
+
+    Зачем отдельно от разбора: историю публичной супергруппы Telegram отдаёт кому
+    угодно, а апдейты в реальном времени — только участнику. Поэтому группа, из
+    которой всё прочитано, дальше молчит, и на экране это состояние называется
+    «история». Подключение НОВОГО канала вступает в его группу само (FIXES.md #7),
+    а для уже заведённых дороги не было вовсе.
+
+    Границы прогона, и каждая из них — решение, а не умолчание:
+
+    * **только открытые группы.** Вступаем по `@username`; у закрытой группы имени
+      нет, и попасть туда можно лишь заявкой, которую рассматривает администратор.
+      Заявок отсюда не уходит ни одной.
+    * **только вступление.** Ни одной страницы истории: «вступить» и «дочитать» —
+      разные решения оператора и разные бюджеты Engage.
+    * **лимит соблюдается на нашей стороне.** Сверх `joins_per_day` Engage задачу
+      откладывает на час и переносит, пока не сменятся сутки; заказать сорок
+      вступлений разом — значит получить сорок задач, сутками стучащихся в
+      планировщик. Прогон берёт не больше `per_account` на аккаунт, остальное
+      честно показывает в отчёте как остаток.
+    * **вступает тот, кто читал.** Живой поток пойдёт через вступивший аккаунт, и
+      разъезд «читал третий, вступил первый» ломает выбор аккаунта для ответа.
+    """
+    if body.scope == "ids" and not body.channel_ids:
+        raise HTTPException(422, "scope=ids требует непустой channel_ids")
+
+    params = {"scope": body.scope, "channel_ids": body.channel_ids,
+              "account_ids": body.account_ids, "per_account": body.per_account,
+              "subscribed_by": user.email}
+    try:
+        run = await jobs.start(db, kind="group_join", params=params,
+                               name="Вступление в группы обсуждения",
+                               user_email=user.email)
+    except jobs.JobBusy as e:
+        raise HTTPException(409, str(e)) from e
+    except jobs.JobQueueDown as e:
+        raise HTTPException(503, str(e)) from e
+
+    db.add(AuditLog(
+        user_id=user.id, user_email=user.email, action="discussions_join_started",
+        detail={**params, "run_id": run.id},
+        ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("discussions_join_started scope=%s per_account=%s run=%s by=%s",
+                body.scope, body.per_account, run.id, user.email)
+    return {"started": True, "run_id": run.id,
+            "note": ("вступление идёт в разделе Runs: аккаунт заходит в группу с "
+                     "паузой хьюманайзера, история не читается. Комментарии из "
+                     "группы начнут приходить сами сразу после вступления")}
 
 
 # ── запуск ────────────────────────────────────────────────────────────────────
