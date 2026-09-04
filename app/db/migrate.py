@@ -91,6 +91,16 @@ STATEMENTS: list[str] = [
     # здесь.
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forward_from_chat_id BIGINT",
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forward_from_message_id BIGINT",
+
+    # 2026-09-05, автоматическое дочитывание: у элемента очереди появляется своя
+    # глубина (не больше 2000 сообщений и не глубже месяца — правила Ивана) плюс
+    # два счётчика, без которых итог работы виден только в логе прогона. Таблица
+    # backfill_queue на проде уже создана `create_all`, новые колонки в неё
+    # добавляются только отсюда.
+    "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS target INTEGER",
+    "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS min_date TIMESTAMPTZ",
+    "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS read_total INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
 ]
 
 

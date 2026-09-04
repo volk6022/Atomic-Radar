@@ -636,6 +636,24 @@ class BackfillItem(Base):
     # Отложенный запуск: NULL — выдавать сразу.
     scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Глубина дочитывания — по элементу, а не по коду прогона. Правила Ивана от
+    # 04.09: не больше 2000 сообщений и не глубже месяца.
+    #
+    # `min_date`, а не «сколько дней назад»: граница обязана считаться на момент
+    # ПОСТАНОВКИ. Элемент, простоявший в очереди неделю, с относительной глубиной
+    # дочитал бы на неделю больше, чем было обещано человеку при нажатии, — и
+    # разница эта нигде бы не всплыла.
+    target: Mapped[int | None] = mapped_column(Integer)
+    min_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Сколько сообщений принято по этому элементу. Без колонки итог виден только
+    # в логе прогона, то есть до первой ротации логов.
+    read_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Сколько раз элемент брали в работу. Нужен, чтобы канал, падающий каждый
+    # раз, закрывался `failed`, а не возвращался в очередь вечно.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # Прогон, ради которого элемент поставлен (кнопка «дочитать всем» заводит
     # один прогон на всю пачку). NULL — элемент поставлен без прогона.
     run_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("runs.id"))
