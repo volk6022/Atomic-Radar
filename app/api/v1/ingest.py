@@ -547,6 +547,13 @@ async def _continue_backfill(db, out: dict, q) -> str:
             await backfill_drain.close_chain(
                 db, item_id=item_id, ok=ok, reason=reason,
                 read_total=max(0, total_now - read0))
+            # Коммит здесь, а не у вызывающего: приём коммитит страницу ДО
+            # продолжения цепочки и после уже ничего не коммитит, а `finish_item`
+            # только правит объект в сессии. 05.09 из-за этого элемент #2 отработал
+            # целиком (2032 сообщения) и остался `running` с `read_total = 0`:
+            # закрытие жило в откатившейся транзакции. Тесты этого не поймали,
+            # потому что коммитили сами — заглушка была щедрее вызывающего.
+            await db.commit()
         return reason
 
     if not account_id or not target:

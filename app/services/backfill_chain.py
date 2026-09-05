@@ -37,6 +37,13 @@ async def request_page(*, peer_id: int, username: str | None,
     самого `get_chat_history`, и постфильтр означал бы, что страницы за
     пределами окна всё равно прочитаны и списаны с дневного бюджета.
 
+    Та же граница едет и в адрес возврата — иначе она действует ровно на одну
+    страницу. Цепочку двигает приём (`_continue_backfill`), а он знает о цепочке
+    только то, что написано в адресе: 05.09 окно лежало в одном payload, приём
+    читал его из пустого места, и заказ «не глубже месяца» дочитал канал до
+    ноября 2020 года — 2032 сообщения вместо трёх десятков, все через каскад.
+    Окно — свойство цепочки, а не первой страницы.
+
     `item_id` и `read0` — принадлежность элементу очереди дочитывания и счётчик
     сообщений на момент старта цепочки. Без первого приёмная ручка не знает,
     какой элемент закрывать на конце цепочки; без второго `read_total`
@@ -57,10 +64,12 @@ async def request_page(*, peer_id: int, username: str | None,
         payload["max_id"] = max_id
     if min_date:
         payload["min_date"] = min_date
+    back: dict = {"kind": "history", "peer_id": peer_id,
+                  "username": username or "", "account_id": account_id,
+                  "limit": limit, "target": target, "prev_cursor": cursor,
+                  "run_id": run_id, "item_id": item_id, "read0": read0}
+    if min_date:
+        back["min_date"] = min_date
     await engage.action(
         account_id=account_id, action="get_chat_history", payload=payload,
-        webhook_url=engage.webhook_url(kind="history", peer_id=peer_id,
-                                       username=username or "",
-                                       account_id=account_id, limit=limit,
-                                       target=target, prev_cursor=cursor,
-                                       run_id=run_id, item_id=item_id, read0=read0))
+        webhook_url=engage.webhook_url(**back))

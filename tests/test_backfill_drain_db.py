@@ -364,7 +364,11 @@ def test_finished_chain_closes_the_item_with_what_was_actually_read(db_ready,
                      "backfill_cursor": None},
                 {"account_id": "1", "target": "2000", "item_id": str(ids[0]),
                  "read0": "10"})
-            await db.commit()
+            # Коммита здесь намеренно нет: закрытие элемента обязан сохранить сам
+            # приём. Приём коммитит страницу ДО продолжения цепочки и после уже
+            # ничего не коммитит — тест, коммитящий за него, описывал бы мир, где
+            # у вызывающего есть шаг, которого у него нет (так `running` с нулём
+            # и доехал до прода 05.09).
         return ids[0], reason
 
     item_id, reason = asyncio.run(go())
@@ -405,7 +409,7 @@ def test_broken_chain_closes_the_item_failed(db_ready, monkeypatch):
                      "backfill_cursor": 900},
                 {"account_id": "1", "target": "2000", "prev_cursor": "1000",
                  "item_id": str(ids[0]), "read0": "0", "limit": "500"})
-            await db.commit()
+            # Коммита здесь нет по той же причине, что и выше.
         return ids[0]
 
     item_id = asyncio.run(go())
@@ -433,3 +437,48 @@ def test_unbound_channel_goes_to_any_free_account(db_ready, monkeypatch):
 
     assert stats["started"] == 1, f"непривязанный канал обязан уехать: {stats}"
     assert calls[0]["account_id"] == 3
+
+
+def test_the_next_page_keeps_the_depth_window(db_ready, monkeypatch):
+    """Окно глубины едет со страницы на страницу, а не действует на первую.
+
+    05.09 `min_date` лежал только в payload первой страницы: продолжение
+    собирается из адреса возврата, окна там не было, и заказ «не глубже месяца»
+    дочитал канал до ноября 2020-го — 2032 сообщения через каскад вместо трёх
+    десятков. Проверяется именно ВТОРАЯ страница: на первой параметр выглядел
+    живым и в тестах, и глазами.
+    """
+    from app.api.v1 import ingest
+
+    asked: list[dict] = []
+
+    async def spy(**kw):
+        asked.append(kw)
+
+    monkeypatch.setattr(ingest, "_request_page", spy)
+
+    window = HORIZON.isoformat()
+
+    async def go():
+        ids = await _enqueue([{"username": "chat_one", "account_id": 1,
+                               "state": "running", "attempts": 1,
+                               "started_at": NOW}])
+        async with get_session_maker()() as db:
+            channel = (await db.execute(select(Channel).where(
+                Channel.username == "chat_one"))).scalar_one()
+            db.add(Message(channel_id=channel.id, tg_message_id=1, tg_date=NOW,
+                           text="сообщение", author_peer_id=7))
+            await db.commit()
+            await ingest._continue_backfill(
+                db, {"accepted": 500, "channel_id": channel.id,
+                     "backfill_cursor": 900},
+                {"account_id": "1", "target": "2000", "prev_cursor": "1500",
+                 "item_id": str(ids[0]), "read0": "0", "limit": "500",
+                 "min_date": window})
+        return ids[0]
+
+    asyncio.run(go())
+
+    assert asked, "цепочка обязана попросить следующую страницу"
+    assert asked[0].get("min_date") == window, (
+        f"окно потерялось на второй странице: {asked[0].get('min_date')!r}")
