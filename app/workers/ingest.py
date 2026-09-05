@@ -39,12 +39,13 @@ from __future__ import annotations
 
 import logging
 
+from arq import cron
 from fastapi import HTTPException
 
 from app.api.v1.ingest import process_event
 from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
-from app.services import alerts, cascade_registry, engage, engage_registry, queue
+from app.services import alerts, backfill_drain, cascade_registry, engage, engage_registry, queue
 
 # Уровень логов настраивается здесь, а не только в `app/main.py`: воркер поднимает
 # arq напрямую по `WorkerSettings`, `app.main` он не импортирует никогда, и потому
@@ -118,6 +119,34 @@ async def ingest_event(ctx: dict, body: dict, q: dict) -> dict:
             raise
 
 
+async def backfill_drain_tick(ctx: dict) -> dict:
+    """Один удар исполнителя очереди дочитывания — обёртка над `backfill_drain.tick`.
+
+    Удар бьётся каждые несколько минут круглые сутки, и падать ему нельзя на том,
+    что буднями считается погодой: пустая очередь — обычное дело, недоступный
+    Engage — тоже. Исключение на ровном месте залило бы журнал воркера ложными
+    отказами, среди которых настоящий отказ уже не заметить. Поэтому недоступный
+    Engage здесь логируется и превращается в пустой итог, а не в неудачную
+    работу: элементы очереди при этом не трогаются вовсе.
+
+    Живёт у воркера приёма, а не у воркера прогонов: у прогонов `max_jobs = 1` и
+    `job_timeout` в четыре часа — удар, попавший туда во время часовой
+    переклассификации, простоял бы этот час, и очередь дочитывания встала бы
+    ровно тогда, когда занято и так. Воркер приёма живёт короткими задачами и
+    именно он уже ведёт цепочки страниц — стартовать их из того же процесса
+    честнее, чем из чужого.
+    """
+    try:
+        stats = await backfill_drain.tick()
+    except engage.EngageUnavailable as e:
+        logger.warning("backfill_drain_tick_engage_unavailable error=%s", e)
+        return {"started": 0, "requeued": 0, "failed": 0, "busy": 0}
+    logger.info("backfill_drain_tick started=%s requeued=%s failed=%s busy=%s",
+                stats.get("started"), stats.get("requeued"),
+                stats.get("failed"), stats.get("busy"))
+    return stats
+
+
 async def startup(ctx: dict) -> None:
     """То же, что делает `lifespan` API, минус всё, что относится к ручкам.
 
@@ -159,6 +188,18 @@ class WorkerSettings:
     on_shutdown = shutdown
     max_tries = MAX_TRIES
     job_timeout = 300
+    # Первая задача Радара по времени: до неё всё начиналось нажатием человека,
+    # и очередь дочитывания без расписания автоматическим не бывала. Каждые пять
+    # минут: реже — освобождённый аккаунт ждёт зря, чаще — удары по Engage и базе
+    # без новой работы. `run_at_startup=False`, потому что на старте воркера
+    # реестр инстансов ещё не поднят и список аккаунтов взять неоткуда.
+    #
+    # `minute` — именно множество, а не range: arq принимает число или
+    # контейнер с проверкой вхождения, и range в `arq.cron.calculate_next`
+    # валит воркер RuntimeError на первом же ударе сердца — уже после успешной
+    # выкатки. Именно так 05.09 лег крон Engage.
+    cron_jobs = [cron(backfill_drain_tick, minute=set(range(0, 60, 5)),
+                      second=0, run_at_startup=False)]
     # Результат держится сутки. Он же — ключ от повторной доставки: `_job_id` считается
     # по содержимому события, и пока результат жив, тот же вебхук второй раз не
     # разбирается. Сутки — с запасом больше любого разумного окна ретраев Engage.

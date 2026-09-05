@@ -43,17 +43,17 @@ from app.core.config import get_settings
 from app.db.models import AuditLog, Channel, Message
 from app.services import alerts, channels as channels_service
 from app.services import discussions as discussions_service
-from app.services import engage
+from app.services import backfill_drain, engage
 from app.services import ingest as ingest_service
 from app.services import jobs, queue
+from app.services.backfill_chain import PAGE_LIMIT, request_page as _request_page
 
 logger = logging.getLogger(__name__)
 
-# Сколько сообщений просить за один вызов. Потолок Engage — 1000, но каждая страница
-# приезжает одним вебхуком, и на тысяче постов это уже мегабайт JSON в одном запросе.
-# 500 — компромисс: страниц вдвое больше, зато ни один ответ не становится проблемой
-# сам по себе. Дневной бюджет чтений (2000 вызовов на аккаунт) при этом не жмёт.
-PAGE_LIMIT = 500
+# Заказ страницы живёт в сервисном модуле (`backfill_chain`) — им пользуется и
+# эта цепочка, и исполнитель очереди дочитывания. Здесь остаётся локальное имя
+# `_request_page`: вызов через него читает модульную глобаль при каждом звонке,
+# поэтому подмена в тестах и возможные обёртки поверх ручки продолжают работать.
 
 # Две поверхности с разной аудиторией, поэтому и роутера два.
 #
@@ -498,34 +498,6 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
     return {"accepted": 1, "channel_id": channel.id, "peer_id": peer_id, "username": username}
 
 
-async def _request_page(*, peer_id: int, username: str | None,
-                        account_id: int, limit: int, target: int,
-                        max_id: int, cursor: int, run_id: int = 0) -> None:
-    """Заказать одну страницу истории. `cursor` едет обратно для защиты от зацикливания.
-
-    `run_id` едет туда же: цепочку двигает Engage, а не наш процесс, и связать
-    приехавшую страницу с задачей в `runs` можно только через адрес вебхука.
-
-    Названия группы в адресе нет намеренно, и это не экономия. `tasks.webhook_url` у
-    Engage — `varchar(500)`, а кириллическое название в percent-encoding раздувается
-    вшестеро: у «ВЭД чат (таможенное оформление, сертификация, грузоперевозки, экспорт,
-    импорт)» одно только название заняло больше четырёхсот символов, адрес не влез, и
-    Engage ответил `500` на вставку задачи. Цепочка вставала на первой же странице —
-    29.08 так потерялся весь бэкфилл @CentrVED. Название и не нужно: строка канала уже
-    заведена шагом `chat_info`, а `get_or_create_channel` при пустом названии берёт
-    существующее. В адрес возврата кладём только то, без чего страницу не привязать.
-    """
-    payload = {"username": username or str(peer_id), "limit": limit}
-    if max_id:
-        payload["max_id"] = max_id
-    await engage.action(
-        account_id=account_id, action="get_chat_history", payload=payload,
-        webhook_url=engage.webhook_url(kind="history", peer_id=peer_id,
-                                 username=username or "",
-                                 account_id=account_id, limit=limit, target=target,
-                                 prev_cursor=cursor, run_id=run_id))
-
-
 async def _continue_backfill(db, out: dict, q) -> str:
     """Решить, просить ли следующую страницу, и попросить.
 
@@ -537,10 +509,20 @@ async def _continue_backfill(db, out: dict, q) -> str:
     * курсор не сдвинулся — Telegram отдал то же самое, и следующий запрос
       отдаст то же ещё раз. Именно так выглядела бы старая грабля с `offset_id`,
       поэтому проверка остаётся навсегда, а не «на время отладки».
+
+    Цепочка, заказанная исполнителем очереди (`item_id` в параметрах), на
+    остановке закрывает ещё и элемент очереди: без этого молчащий `running`
+    неотличим от идущей работы, и аккаунт держался бы до отбора просроченных.
+
+    `min_date`, `item_id` и `read0` переезжают со страницы на страницу: окно
+    глубины и принадлежность элементу — свойства цепочки, а не первой страницы.
     """
     account_id = int(q.get("account_id") or 0)
     target = int(q.get("target") or 0)
     run_id = int(q.get("run_id") or 0)
+    item_id = int(q.get("item_id") or 0)
+    read0 = int(q.get("read0") or 0)
+    min_date = q.get("min_date") or None
 
     async def stop(reason: str, *, ok: bool = True) -> str:
         """Закрыть задачу и вернуть причину остановки одним и тем же текстом.
@@ -548,14 +530,23 @@ async def _continue_backfill(db, out: dict, q) -> str:
         Причина обязана быть видна и в логе задачи, и в ответе на вебхук: «бэкфилл
         встал» без неё превращается в гадание, а причин ровно три и они разные.
         """
-        if run_id:
+        total_now = 0
+        if run_id or item_id:
             total_now = (await db.execute(
                 select(func.count(Message.id))
                 .where(Message.channel_id == out.get("channel_id", 0)))).scalar_one()
+        if run_id:
             await jobs.finish(run_id, status="done" if ok else "failed",
                               result={"reason": reason, "messages": total_now,
                                       "target": target},
                               error=None if ok else reason, note=reason)
+        if item_id:
+            # Элементу очереди — разница, а не полный счётчик канала: канал мог
+            # быть дочитан наполовину раньше, и полный счётчик приписал бы этому
+            # элементу чужую работу.
+            await backfill_drain.close_chain(
+                db, item_id=item_id, ok=ok, reason=reason,
+                read_total=max(0, total_now - read0))
         return reason
 
     if not account_id or not target:
@@ -590,7 +581,8 @@ async def _continue_backfill(db, out: dict, q) -> str:
         await _request_page(
             peer_id=channel.peer_id, username=channel.username,
             account_id=account_id, limit=int(q.get("limit") or PAGE_LIMIT),
-            target=target, max_id=cursor - 1, cursor=cursor, run_id=run_id)
+            target=target, max_id=cursor - 1, cursor=cursor, run_id=run_id,
+            min_date=min_date, item_id=item_id, read0=read0)
     except engage.EngageUnavailable as e:
         # Отвечаем 200: сообщения этой страницы уже записаны, и переигрывать доставку
         # вебхука незачем — повтор только заново попросил бы ту же страницу.
