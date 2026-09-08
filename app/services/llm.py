@@ -248,12 +248,17 @@ def build_prompt(*, text: str, context: list[str]) -> str:
 
 
 def _extract(payload: dict) -> str:
-    """Достать содержательную часть ответа, чем бы её ни назвала модель."""
+    """Достать содержательную часть ответа, чем бы её ни назвала модель.
+
+    Под грамматикой это не запасной путь, а основной: шаблон Qwen открывает `<think>`
+    сам, грамматика закрыть его не даёт, и llama.cpp кладёт ВЕСЬ ответ — то есть
+    готовый JSON — в `reasoning_content`, оставляя `content` пустым. Проверено
+    07.09 на сорока запросах: пустой `content` во всех сорока.
+    """
     choice = (payload.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     content = (msg.get("content") or "").strip()
     if not content:
-        # Целиком ушло в размышление — значит, ответ надо искать там.
         content = (msg.get("reasoning_content") or "").strip()
     return _THINK.sub("", content).strip()
 

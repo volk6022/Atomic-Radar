@@ -91,6 +91,30 @@ def test_unknown_value_spec_gives_no_grammar():
     assert grammar_for('Ответь так: {"a": true|false, "b": 0..10}') is None
 
 
+def test_answer_under_grammar_is_read_from_reasoning_content():
+    """Под грамматикой llama.cpp кладёт весь ответ в `reasoning_content`, а `content`
+    оставляет пустым: шаблон Qwen открывает `<think>`, а закрыть его грамматика не
+    даёт. Это не запасной путь, а единственный, и держаться он должен на проверке, а
+    не на удаче — иначе первый же рефакторинг `_extract` обнулит весь L3.
+    """
+    answer = '{"real_problem": false, "is_seller": false, ' \
+             '"answering_someone_else": false, "urgency": "low", ' \
+             '"pain": null, "why": "объявление, а не вопрос"}'
+    payload = {"choices": [{"message": {"content": "", "reasoning_content": answer}}]}
+    parsed = llm.parse_verdict(llm._extract(payload))
+    assert parsed["real_problem"] is False
+    assert parsed["why"]
+
+
+def test_answer_in_content_still_wins_over_reasoning():
+    """Без грамматики ответ приходит в `content`, и рассуждение не должно его
+    подменять — иначе выключатель `RADAR_LLM_GRAMMAR` менял бы не только скорость."""
+    payload = {"choices": [{"message": {
+        "content": '{"real_problem": true, "why": "прямой вопрос об инвойсе"}',
+        "reasoning_content": "долгое рассуждение без JSON"}}]}
+    assert llm.parse_verdict(llm._extract(payload))["real_problem"] is True
+
+
 def test_verdict_shape_of_the_dm_contour_matches_what_cascade_reads():
     """Пример ответа, который грамматика разрешает, должен разбираться и содержать
     ровно те наблюдения, на которые смотрит `cascade.level3`."""
