@@ -27,6 +27,7 @@ from typing import Mapping
 import httpx
 
 from app.core.config import get_settings
+from app.services import llm_grammar
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,12 @@ async def verdict(*, text: str, context: list[str],
         "temperature": 0.0,
         "max_tokens": s.LLM_MAX_TOKENS,
     }
+    if s.LLM_GRAMMAR:
+        grammar = llm_grammar.grammar_for(asked.system)
+        if grammar is None:
+            logger.warning("l3_grammar_skipped prompt=%s version=%s", asked.key, asked.version)
+        else:
+            body["grammar"] = grammar
 
     started = time.monotonic()
     try:
