@@ -69,6 +69,29 @@ def test_nullable_field_allows_null():
     assert 'strnull ::= str | "null"' in grammar
 
 
+def test_enumeration_may_contain_null():
+    """Форма боевого промпта `l3-verdict-v6`: перечисление вместе с `null`.
+
+    Она не разбиралась, и одно такое поле отменяло грамматику всего промпта — на
+    проде это давало 8 вердиктов L3 из 8 в обход быстрого пути, с единственным
+    предупреждением в лог. Проверяется и то, что `null` идёт голым: закавычь его —
+    и модель ответит строкой «null», на которой `parse_verdict` даст не то поле.
+    """
+    grammar = grammar_for(
+        'Ответь так: {"real_problem": true|false, '
+        '"disqualified": null|"vacancy"|"ad"|"spam"}')
+    assert grammar is not None
+    root = grammar.splitlines()[0]
+    assert '( "null" | "\\"vacancy\\"" | "\\"ad\\"" | "\\"spam\\"" )' in root
+    assert root.count("(") == root.count(")")
+
+
+def test_null_without_any_literal_still_gives_no_grammar():
+    """Страховка от того, чтобы разрешение `null` не превратилось в разрешение чего
+    угодно: перечисление без единого значения — это не поле, а опечатка."""
+    assert grammar_for('Ответь так: {"a": true|false, "b": null|null}') is None
+
+
 def test_string_rule_forbids_raw_control_characters():
     """Грамматика, разрешающая сырой перевод строки внутри строки, пропускала бы
     ответы, на которых потом падает `json.loads`."""

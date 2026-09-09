@@ -74,12 +74,19 @@ def _rule_for(name: str, spec: str) -> str:
         return "bool"
     if len(alts) == 1 and alts[0].startswith('"<') and alts[0].endswith('>"'):
         return "strnull" if "null" in alts[0] else "str"
-    if len(alts) > 1 and all(len(a) > 2 and a.startswith('"') and a.endswith('"')
-                             and "<" not in a for a in alts):
+    # `null` рядом с закавыченными значениями — не экзотика, а обычная запись поля,
+    # которого может не быть: боевой промпт `l3-verdict-v6` так описывает и
+    # `disqualified`, и `pain`. Пока эта форма не разбиралась, одно такое поле роняло
+    # разбор всего шаблона, и промпт оставался вовсе без грамматики — на проде это
+    # было 8 вердиктов L3 из 8 в обход быстрого пути.
+    lits = [a for a in alts if a != "null"]
+    if len(alts) > 1 and lits and all(len(a) > 2 and a.startswith('"') and a.endswith('"')
+                                      and "<" not in a for a in lits):
         # Скобки обязательны: в GBNF `|` разделяет альтернативы всего правила, и
         # перечисление, вставленное в `root` без группировки, означало бы «либо всё
         # начало объекта, либо одно слово „medium“».
-        return "( " + " | ".join('"\\"%s\\""' % a[1:-1] for a in alts) + " )"
+        return "( " + " | ".join(
+            '"null"' if a == "null" else '"\\"%s\\""' % a[1:-1] for a in alts) + " )"
     raise GrammarError(f"поле «{name}»: непонятное описание значения «{spec}»")
 
 
