@@ -195,11 +195,35 @@ PUBLIC_SYSTEM = (
 
 PUBLIC_V1 = Prompt(key="public_v1", version="l3-public-v3", system=PUBLIC_SYSTEM)
 
+# Вопрос контура channel_fit_v1 (оценка кандидата из поиска похожих каналов).
+# Заполнитель `{business_description}` подставляет вызывающий код в момент вызова,
+# а не при сохранении промпта: правка описания бизнеса обязана менять вопрос модели
+# сразу, и «отдельно сочинённый текст» не может молча разойтись с описанием.
+# Подстановка — `.replace`, не `.format`: в шаблоне ответа литеральные фигурные
+# скобки, и `.format` на этом тексте падает.
+CHANNEL_FIT_SYSTEM = (
+    "Ты помогаешь решить, стоит ли подключать Telegram-канал для поиска клиентов.\n"
+    "Описание бизнеса заказчика:\n{business_description}\n\n"
+    "Тебе дают карточку канала и выборку последних сообщений.\n"
+    "Твоя работа — наблюдение, а не решение.\n\n"
+    "Ответь ТОЛЬКО объектом JSON, без пояснений вокруг:\n"
+    '{"verdict": "fit"|"unfit"|"unclear", "score": "<целое от 0 до 100>", '
+    '"reason": "<одно-два предложения по-русски>"}\n\n'
+    "verdict — fit: тематика и аудитория соответствуют описанию бизнеса выше; unfit — не "
+    "соответствуют; unclear — по выборке понять нельзя.\n"
+    "score — насколько уверенно подходит канал, от 0 до 100.\n"
+    "reason — почему ты так решил, по-русски. Без этого поля ответ считается негодным."
+)
+
+CHANNEL_FIT_V1 = Prompt(key="channel_fit_v1", version="channel-fit-v1",
+                        system=CHANNEL_FIT_SYSTEM)
+
 # Приватный изменяемый словарь плюс публичный вид только на чтение поверх него.
 # `prompt()` читает `_PROMPTS` напрямую и поэтому видит правку сразу; снаружи
 # модуля виден только `PROMPTS` — `MappingProxyType` не даёт положить в реестр
 # что-то в обход `apply_prompt`, у которого есть с чем сверить ключ.
-_PROMPTS: dict[str, Prompt] = {DM_V1.key: DM_V1, PUBLIC_V1.key: PUBLIC_V1}
+_PROMPTS: dict[str, Prompt] = {DM_V1.key: DM_V1, PUBLIC_V1.key: PUBLIC_V1,
+                               CHANNEL_FIT_V1.key: CHANNEL_FIT_V1}
 PROMPTS: Mapping[str, Prompt] = MappingProxyType(_PROMPTS)
 
 DEFAULT_PROMPT = DM_V1.key
@@ -278,17 +302,27 @@ def parse_verdict(raw: str) -> dict:
 
 
 async def verdict(*, text: str, context: list[str],
-                  prompt_key: str = DEFAULT_PROMPT) -> tuple[dict, dict]:
+                  prompt_key: str = DEFAULT_PROMPT,
+                  system: str | None = None,
+                  user: str | None = None) -> tuple[dict, dict]:
     """Вердикт модели по одному сообщению в вопросе одного контура.
 
     Возвращает (разобранный ответ, трейс).
+
+    `system` и `user` — полные тексты сообщений для контура, чей вход собирается
+    по-другому (оценка канала подставляет описание бизнеса в системный промпт и шлёт
+    карточку вместо «разбираемого сообщения»). Заданы — идут в запрос как есть,
+    а `system` вдобавок становится источником грамматики: она обязана описывать
+    ответ на тот вопрос, который реально слышит модель. Версия в трейсе при этом
+    по-прежнему из реестра: контуры различаются по ней, а не по подменённому тексту.
     """
     s = get_settings()
     asked = prompt(prompt_key)
-    user_text = build_prompt(text=text, context=context)
+    asked_system = asked.system if system is None else system
+    user_text = build_prompt(text=text, context=context) if user is None else user
     body = {
         "model": s.LLM_MODEL,
-        "messages": [{"role": "system", "content": asked.system},
+        "messages": [{"role": "system", "content": asked_system},
                      {"role": "user", "content": user_text}],
         # Ноль, а не «поменьше»: одно и то же сообщение обязано получать один и тот же
         # вердикт, иначе перезапуск разметки меняет выборку и калибровать нечего.
@@ -296,7 +330,7 @@ async def verdict(*, text: str, context: list[str],
         "max_tokens": s.LLM_MAX_TOKENS,
     }
     if s.LLM_GRAMMAR:
-        grammar = llm_grammar.grammar_for(asked.system)
+        grammar = llm_grammar.grammar_for(asked_system)
         if grammar is None:
             logger.warning("l3_grammar_skipped prompt=%s version=%s", asked.key, asked.version)
         else:

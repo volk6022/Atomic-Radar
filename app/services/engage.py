@@ -173,8 +173,10 @@ async def action(*, account_id: int, action: str, payload: dict, webhook_url: st
     # Radar и списком каналов, которые слушают аккаунты. Список остальных действий
     # закрытый по той же причине, что и был: `send_message` из этого клиента
     # невозможен физически.
+    # Поиск похожих каналов и публичных чатов — тоже чтение: Telegram они ничего не пишут.
     allowed = {"get_chat_info", "get_chat_history", "get_chat_admins",
-               "resolve_username", "get_dialogs", "join_group"}
+               "resolve_username", "get_dialogs", "join_group",
+               "get_similar_channels", "search_public_chats"}
     if action not in allowed:
         raise ValueError(
             f"действие {action!r} недоступно из Radar: разрешены только чтения и "

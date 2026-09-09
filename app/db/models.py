@@ -679,6 +679,145 @@ class BackfillItem(Base):
     )
 
 
+class ChannelCandidate(Base):
+    """Кандидат в каналы из сценария B: поиск похожих → карточка → живость →
+    модель → решение оператора.
+
+    `username` уникален и при этом допускает NULL: кандидата без имени поиск
+    тоже находит, и их может быть много — Postgres в уникальном ограничении
+    NULL дубликатом не считает. Повторный поиск существующего кандидата НЕ
+    трогает его `decision` и `llm_*` (отказ — это данные): идемпотентность
+    вставки по `username` — свойство схемы, и перетереть решение повторным
+    сканом она не даёт.
+
+    `found_by_account_id` — id аккаунта в Engage, без внешнего ключа: локальная
+    `accounts` — зеркало, источник истины об аккаунтах живёт в Engage; тот же
+    приём, что у `BackfillItem.account_id`.
+
+    `linked_chat_username` — сверх списка B.2, осознанно: карточка отдаёт имя
+    группы обсуждения, и без него шаг живости не знает, какую группу читать.
+    Заводить строку в `channels` нельзя — кандидат ещё не канал.
+
+    `decision_reason` — Text, а не String(120): сюда попадают и тексты ошибок
+    Engage (по образцу `BackfillItem.error`).
+    """
+    __tablename__ = "channel_candidates"
+
+    SOURCES = ("similar", "search", "manual")
+    VERDICTS = ("fit", "unfit", "unclear")
+    DECISIONS = ("pending", "approved", "rejected", "connected")
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    peer_id: Mapped[int | None] = mapped_column(BigInteger)
+    members: Mapped[int | None] = mapped_column(Integer)
+    chat_type: Mapped[str | None] = mapped_column(String(20))
+
+    source: Mapped[str] = mapped_column(String(8), nullable=False)
+    # От какого канала пришёл кандидат — для «похожих», NULL у прочих источников.
+    seed_channel_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("channels.id"))
+    # Кем найден: id аккаунта в Engage (не связь — см. докстринг).
+    found_by_account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    found_at: Mapped[datetime] = _created()
+
+    # Шаг «живость»: посты канала и сообщения группы обсуждения за 7 суток.
+    liveness_posts_7d: Mapped[int | None] = mapped_column(Integer)
+    liveness_comments_7d: Mapped[int | None] = mapped_column(Integer)
+    liveness_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Вердикт модели. `llm_score` ограничен схемой, а не только кодом: модель
+    # отдаёт строку, int() может разобрать в что угодно.
+    llm_verdict: Mapped[str | None] = mapped_column(String(8))
+    llm_score: Mapped[int | None] = mapped_column(Integer)
+    llm_reason: Mapped[str | None] = mapped_column(Text)
+    llm_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    decision: Mapped[str] = mapped_column(String(12), nullable=False,
+                                          default="pending")
+    decided_by: Mapped[str | None] = mapped_column(String(255))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+
+    # Сверх списка B.2, осознанно: без имени группы обсуждения шаг живости
+    # не знает, какую группу читать (докстринг).
+    linked_chat_username: Mapped[str | None] = mapped_column(String(64))
+
+    updated_at: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        # NULL-имена друг другу не мешают — кандидатов без username много.
+        UniqueConstraint("username", name="uq_candidate_username"),
+        # Очередь проверок и фильтр состояния — единственные два запроса таблицы.
+        Index("ix_candidate_decision_created", "decision", "found_at"),
+        CheckConstraint(
+            "source IN ('similar', 'search', 'manual')",
+            name="ck_candidate_source"),
+        CheckConstraint(
+            "llm_verdict IN ('fit', 'unfit', 'unclear')",
+            name="ck_candidate_verdict"),
+        CheckConstraint(
+            "decision IN ('pending', 'approved', 'rejected', 'connected')",
+            name="ck_candidate_decision"),
+        CheckConstraint(
+            "llm_score IS NULL OR (llm_score >= 0 AND llm_score <= 100)",
+            name="ck_candidate_score"),
+    )
+
+
+class DiscoveryQuery(Base):
+    """Один запуск поиска кандидатов: «похожие» от семени или поиск по строке.
+
+    Адресация проверяется схемой, а не кодом (по образцу
+    `ck_target_addressing`): у `similar` обязано быть семя и не может быть
+    строки поиска, у `search` — наоборот.
+
+    «Не повторяться» (B.2) — тоже свойство схемы: два частичных уникальных
+    индекса на календарные сутки UTC. Окно — сутки, а не скользящие 24 часа,
+    потому что скользящее окно индексом невыразимо (`now()` не immutable); это
+    же окно считает дневной лимит поисков, чтобы у индекса и счётчика не
+    разъехались границы.
+    """
+    __tablename__ = "discovery_queries"
+
+    KINDS = ("similar", "search")
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    seed_channel_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("channels.id"))
+    query: Mapped[str | None] = mapped_column(String(255))
+    # id аккаунта в Engage — без FK, как у `BackfillItem.account_id`.
+    account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Прогон скана, ради которого искали (кнопка «найти похожие» заводит один).
+    run_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("runs.id"))
+
+    # Сколько каналов вернул поиск и сколько из них заведено новыми строками
+    # кандидатов. Без этих колонок итог виден только в логе прогона.
+    found_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    new_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        CheckConstraint(
+            "(kind = 'similar' AND seed_channel_id IS NOT NULL AND query IS NULL)"
+            " OR (kind = 'search' AND query IS NOT NULL AND seed_channel_id IS NULL)",
+            name="ck_discovery_query_target"),
+        CheckConstraint(
+            "kind IN ('similar', 'search')",
+            name="ck_discovery_query_kind"),
+        # Уникальность «в пределах окна»: один семен/один запрос — один поиск в
+        # сутки. Частичные: у search нет семени, у similar нет строки поиска.
+        Index("uq_discovery_query_seed", "kind", "seed_channel_id",
+              func.date_trunc("day", text("created_at AT TIME ZONE 'UTC'")),
+              unique=True, postgresql_where=text("seed_channel_id IS NOT NULL")),
+        Index("uq_discovery_query_text", "kind", "query",
+              func.date_trunc("day", text("created_at AT TIME ZONE 'UTC'")),
+              unique=True, postgresql_where=text("query IS NOT NULL")),
+    )
+
+
 class LlmTrace(Base):
     """Трейс вызова модели. Нужен и для отладки, и для счёта себестоимости лида."""
     __tablename__ = "llm_traces"

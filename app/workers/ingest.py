@@ -45,7 +45,15 @@ from fastapi import HTTPException
 from app.api.v1.ingest import process_event
 from app.core.config import get_settings
 from app.db.session import get_engine, get_session_maker
-from app.services import alerts, backfill_drain, cascade_registry, engage, engage_registry, queue
+from app.services import (
+    alerts,
+    backfill_drain,
+    cascade_registry,
+    discovery,
+    engage,
+    engage_registry,
+    queue,
+)
 
 # Уровень логов настраивается здесь, а не только в `app/main.py`: воркер поднимает
 # arq напрямую по `WorkerSettings`, `app.main` он не импортирует никогда, и потому
@@ -198,8 +206,16 @@ class WorkerSettings:
     # контейнер с проверкой вхождения, и range в `arq.cron.calculate_next`
     # валит воркер RuntimeError на первом же ударе сердца — уже после успешной
     # выкатки. Именно так 05.09 лег крон Engage.
+    #
+    # Тик проверки кандидатов бьётся тем же ритмом и рядом с очередью
+    # дочитывания, а не у воркера прогонов: у того `max_jobs = 1` и таймаут в
+    # четыре часа, и тик простоял бы весь час переклассификации. Назначение —
+    # долечивать отложенное (дневные лимиты кончаются, на следующие сутки
+    # остаток подхватится сам) и переводить `approved → connected` по факту.
     cron_jobs = [cron(backfill_drain_tick, minute=set(range(0, 60, 5)),
-                      second=0, run_at_startup=False)]
+                      second=0, run_at_startup=False),
+                 cron(discovery.discovery_check_tick,
+                      minute=set(range(0, 60, 5)), second=0, run_at_startup=False)]
     # Результат держится сутки. Он же — ключ от повторной доставки: `_job_id` считается
     # по содержимому события, и пока результат жив, тот же вебхук второй раз не
     # разбирается. Сутки — с запасом больше любого разумного окна ретраев Engage.
