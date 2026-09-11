@@ -39,7 +39,9 @@ def bound(key: str, profile: cascade.CascadeProfile) -> targeting.Bound:
     wf = Workflow(key=key, title=key, target_kind="user", action="dm",
                   visibility="private", engage_instance_id=1,
                   engage_use_case=key, cascade_profile=profile.key)
-    wf.id = abs(hash(key)) % 1000 + 1
+    # id из ключа детерминированно: hash() рандомизирован между процессами и при
+    # коллизии двух ключей словарь wf_verdicts терял один сценарий (PYTHONHASHSEED=269)
+    wf.id = int.from_bytes(key.encode("utf-8"), "big") % 100_000 + 1
     return targeting.Bound(wf, profile)
 
 
