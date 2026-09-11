@@ -1,8 +1,8 @@
 """Настройки отбора целиком, одним файлом: выгрузить, поправить снаружи, залить назад.
 
 Единица обмена здесь — весь набор: описание бизнеса, боли с якорями L1 и эталонными
-фразами L2, шум, дисквалификаторы, системные промпты L3. Не отдельная боль и не
-отдельный промпт.
+фразами L2, шум, дисквалификаторы, системные промпты L3 и пороги каскада. Не отдельная
+боль и не отдельный промпт.
 
 Почему так, а не версиями по сущностям. Прежний порядок правки был: предложить
 (`CONFIG_PROPOSE`) — включить (`CONFIG_ACTIVATE`), у каждой сущности своя лесенка
@@ -87,6 +87,26 @@ def validate(bundle) -> None:
         if not str(body or "").strip():
             raise BundleError(f"промпт «{key}»: пустой текст")
 
+    # Блок порогов необязателен: файл без него — старая выгрузка, и пороги при
+    # таком импорте просто не трогаются. А вот в присутствующем блоке чужой ключ
+    # или значение вне (0, 1) — ошибка: кривой порог обязан быть виден здесь,
+    # до первой записи, а не после того как отбор молча перестал что-то пропускать.
+    thresholds = bundle.get("thresholds")
+    if thresholds is not None:
+        if not isinstance(thresholds, dict):
+            raise BundleError("thresholds: ожидался объект «ключ → число»")
+        for key, value in thresholds.items():
+            if key not in cascade_registry.THRESHOLD_LIMIT_KEYS:
+                raise BundleError(
+                    f"порог «{key}» неизвестен; известны: "
+                    f"{', '.join(cascade_registry.THRESHOLD_LIMIT_KEYS)}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise BundleError(
+                    f"порог «{key}»: ожидалось число, получено {value!r}")
+            if not 0 < float(value) < 1:
+                raise BundleError(
+                    f"порог «{key}»: значение {value!r} вне диапазона 0 < v < 1")
+
 
 async def export_bundle(db, *, name: str | None = None) -> dict:
     """Текущие активные настройки в том же виде, в каком их принимает загрузка.
@@ -119,6 +139,12 @@ async def export_bundle(db, *, name: str | None = None) -> dict:
         if row is not None:
             prompts[key] = row.system_prompt
 
+    # Пороги кладутся всегда, оба ключа: значение — из строки `limits`, а где
+    # строки нет — действующее значение кода. Иначе экспорт с одного инстанса
+    # и импорт на другой перенёс бы боли и промпты, а порог молча оставил бы
+    # прежним: отбор поехал бы, а все видимые настройки совпадали бы.
+    thresholds = await cascade_registry.read_thresholds(db)
+
     return {
         "format": FORMAT,
         "version": VERSION,
@@ -130,6 +156,7 @@ async def export_bundle(db, *, name: str | None = None) -> dict:
         "disqualifiers": {k: list(v)
                           for k, v in (cascade.disqualifiers if cascade else {}).items()},
         "l3_prompts": prompts,
+        "thresholds": thresholds,
     }
 
 
@@ -171,14 +198,29 @@ async def import_bundle(db, bundle, *, actor: str) -> dict:
                                               actor=actor, activate=True)
         applied_prompts.append(key)
 
+    # Пороги пишутся после таксономии (та одна может отказать по внешней причине —
+    # эмбеддеру) и до перечитки: строки `limits` записываются upsert-ом по ключу,
+    # той же дорогой, что и правка порога владельцем, а стоящая ниже перечитка
+    # применяет записанное без рестарта. Файл без блока порогов строки не трогает —
+    # и это видно: в ответе ниже `thresholds` будет пустым списком, а не молчание.
+    try:
+        applied_thresholds = await cascade_registry.save_thresholds(
+            db, dict(bundle.get("thresholds") or {}), actor=actor)
+    except ValueError as e:
+        # `validate` отсеивает кривые блоки до первой записи; сюда доехать можно
+        # только при рассинхроне правил — тип приводится к общему для модуля.
+        raise BundleError(str(e)) from e
+
     await cascade_registry.reload(db)
 
     out = {"name": bundle.get("name"), "pains": len(pains), "noise": len(noise),
            "disqualifiers": len(disq), "prompts": sorted(applied_prompts),
+           "thresholds": sorted(applied_thresholds),
            "prototypes": sum(len(p) for _, p in pains.values())
            + sum(len(v) for v in noise.values())}
-    logger.info("config_bundle_imported name=%s pains=%s prompts=%s by=%s",
-                out["name"], out["pains"], ",".join(out["prompts"]), actor)
+    logger.info("config_bundle_imported name=%s pains=%s prompts=%s thresholds=%s by=%s",
+                out["name"], out["pains"], ",".join(out["prompts"]),
+                ",".join(out["thresholds"]), actor)
     return out
 
 

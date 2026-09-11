@@ -21,6 +21,13 @@
 смысл, а не подстроку. Обратный порядок (жёсткий L1 перед умным L2) означал бы, что
 L2 разбирает только то, что и так нашли словами, и ничего не добавляет.
 
+**Обход L1 — адресный, по флагу канала.** Каналу, владельцем отмеченному
+(`channels.l1_bypass_enabled`), словарь перестаёт быть воротами: отказ «ни одного
+якоря боли» при включённом L2 не убивает длинное сообщение, а отправляет его на
+решение L2 — по правилу близости, не отрыва. Всё остальное — L0, сработавший якорь,
+каналы без флага, работа при выключенном L2 — слово в слово прежние. Ядро по-прежнему
+без БД и без сети: флаг приезжает явным параметром, как профиль.
+
 **Правила параметризованы профилем** (`CascadeProfile`). Ступени одни и те же, а вот
 что считать мусором — зависит от того, что мы собираемся с сообщением делать. Для
 личных сообщений автопересылка поста канала — шум, для публичного ответа она же
@@ -46,6 +53,17 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
 MIN_TEXT_LENGTH = 15
+
+# Граница длины для пути мимо словаря L1 (`l1_bypass`): короче — обход не
+# применяется, сообщение умирает прежним приговором L1.
+#
+# Число 200 — граница знания, а не вывод. Замер 08.09 отбирал находки по клетке
+# «длина ≥ 200», поэтому ниже 200 находок НЕ ИСКАЛИ: утверждать, что их там нет,
+# нельзя. До проверки обход туда не пускаем — у коротких текстов эмбеддинг
+# неустойчив и доля высоких pos втрое выше (АУДИТ 5.4). Это константа пути
+# обхода, а не общий порог длины перед L2 для всех сообщений: тот — отдельный
+# пункт плана (10.24) и отдельное решение.
+L1_BYPASS_MIN_TEXT = 200
 
 # Отдельного порога на скор здесь нет, и это осознанно.
 #
@@ -199,6 +217,16 @@ DECISION_MAKER_MARKERS = ("у нас в компании", "наша компа�
 # придётся заплатить: на 0.05 остаётся 88 сообщений, но вместе с мусором уходят и
 # живые жалобы вроде «что то сегодня не vless не wg3 не работают».
 L2_MIN_MARGIN = 0.01
+
+# Порог близости для сообщений, прошедших мимо словаря L1 по обходу канала
+# (`l1_bypass`): на L2 для них действует не правило отрыва, а правило близости
+# верхнего «положительного» эталона. Значение — замер 7.2: при 0.57 до L3
+# доезжают 60 находок из 74 (7 % убитых словарём длинных сообщений); ниже 0.55
+# остаётся одна находка на 9201 сообщение. Читается ровно в одной точке —
+# `classify` в момент вызова; перенастройка без рестарта — переприсваиванием
+# через `apply_l1_bypass_pos_min` (строку `l1_bypass_pos_min` в `limits` для
+# неё читает `cascade_registry`).
+L1_BYPASS_POS_MIN = 0.57
 
 
 # ── профиль ───────────────────────────────────────────────────────────────────
@@ -355,6 +383,47 @@ def apply_taxonomy(*, pain_anchors: Mapping[str, tuple[str, ...]],
     DISQUALIFIERS.update(disqualifiers)
 
 
+def apply_l2_min_margin(value: float) -> None:
+    """Перенастроить порог отрыва L2 без подъёма процесса заново.
+
+    Эту функцию зовёт `cascade_registry.reload`, прочитав строку `l2_min_margin`
+    из таблицы `limits`; отсутствие строки — значение кода, кривое значение
+    обязано упасть громко (`ValueError`), а не молча отсеять всё.
+
+    Меняем поле у обоих синглтонов профилей **на месте** (`object.__setattr__` —
+    профили заморожены), а не пересоздаём их: оба объекта стоят значениями по
+    умолчанию в сигнатурах всех функций модуля (`profile: CascadeProfile = DM_V1`),
+    и новый объект оставил бы их со старым порогом. Та же доктрина мутации, что
+    у `apply_taxonomy`. Константа `L2_MIN_MARGIN` при этом не трогается: она —
+    значение кода, к которому порог возвращается, когда строка из `limits`
+    удалена.
+    """
+    value = float(value)
+    if not 0 < value < 1:
+        raise ValueError(
+            f"l2_min_margin: ожидалось значение из диапазона 0 < v < 1, "
+            f"получено {value!r}")
+    for p in (DM_V1, PUBLIC_V1):
+        object.__setattr__(p, "l2_min_margin", value)
+
+
+def apply_l1_bypass_pos_min(value: float) -> None:
+    """Перенастроить порог близости мимо-словарного пути (см. `L1_BYPASS_POS_MIN`).
+
+    Симметрично `apply_l2_min_margin`, только хранителем значения здесь служит
+    сама переменная модуля: `classify` читает её в момент вызова, так что
+    переприсваивание действует со следующего сообщения без рестарта. Валидация
+    та же: кривое значение из базы обязано упасть громко.
+    """
+    value = float(value)
+    if not 0 < value < 1:
+        raise ValueError(
+            f"l1_bypass_pos_min: ожидалось значение из диапазона 0 < v < 1, "
+            f"получено {value!r}")
+    global L1_BYPASS_POS_MIN
+    L1_BYPASS_POS_MIN = value
+
+
 # Матчится ссылка целиком, а не только её начало: вырезать один «https://» и мерить
 # остаток бессмысленно — длинный путь URL сам по себе перевалит любой порог.
 _URL = re.compile(r"(?:https?://|t\.me/|www\.)\S*")
@@ -464,17 +533,46 @@ def level1(text: str | None, *, strict: bool = True,
 # ── L2: эмбеддинги ────────────────────────────────────────────────────────────
 
 def level2(ranked: list[tuple[str, str, float]],
-           *, profile: CascadeProfile = DM_V1) -> tuple[bool, str, str | None, float]:
+           *, profile: CascadeProfile = DM_V1,
+           pos_min: float | None = None) -> tuple[bool, str, str | None, float]:
     """Решение по отранжированным эталонам `(kind, label, similarity)`.
 
     Возвращает (прошло, причина, имя боли, отрыв). Ранжирование и косинусы считает
     `services/embeddings.py` — сюда приезжают готовые числа, чтобы правило можно было
     проверить тестом без сети и без модели.
+
+    Правил два, и выбираются они параметром `pos_min`, а не профилем: это правило
+    пути «мимо словаря», а не свойство контура.
+
+    * `pos_min is None` — обычные сообщения, правило отрыва: верхний «neg» — отсев;
+      отрыв меньше `profile.l2_min_margin` — отсев; иначе проход с именем боли.
+    * `pos_min` задан — сообщение пришло обходом L1, правило близости (замер 7.2):
+      верхний эталон не «pos» — отсев; верхний «pos», но его близость ниже
+      `pos_min` — отсев; иначе проход, боль — ярлык верхнего «pos». Негативные
+      эталоны в этом правиле не участвуют вовсе: по замеру 5.3 вычитание шума
+      сегодня вредит, сама близость pos отделяет лучше отрыва. Четвёртым значением
+      в этом режиме возвращается не отрыв, а сама близость верхнего эталона.
     """
     if not ranked:
         return False, "нет ни одного эталона для сравнения", None, 0.0
 
     top_kind, top_label, top_sim = ranked[0]
+
+    if pos_min is not None:
+        if top_kind != "pos":
+            return (False,
+                    f"мимо словаря: ближе всего к шуму «{top_label}» ({top_sim:.3f})",
+                    None, top_sim)
+        if top_sim < pos_min:
+            return (False,
+                    f"мимо словаря: близость к боли «{top_label}» "
+                    f"{top_sim:.4f} < {pos_min}",
+                    None, top_sim)
+        return (True,
+                f"мимо словаря: близость к боли «{top_label}» "
+                f"{top_sim:.4f} ≥ {pos_min}",
+                top_label, top_sim)
+
     other = next(((k, name, s) for k, name, s in ranked if k != top_kind), None)
     margin = top_sim - other[2] if other else top_sim
 
@@ -622,6 +720,7 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
              author_peer_id: int | None, author_username: str | None,
              tg_date: datetime, now: datetime | None = None,
              l2_enabled: bool = False, l3_enabled: bool = False,
+             l1_bypass: bool = False,
              ranked: list[tuple[str, str, float]] | None = None,
              llm: dict | None = None,
              profile: CascadeProfile = DM_V1) -> dict:
@@ -636,6 +735,16 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
     включена, но её вход (вектор, ответ модели) пока не посчитан. Ингест пишет такие
     сообщения с `NULL`, фоновый проход их дозабирает. Записать «не прошло» вместо
     «не досчитали» значило бы навсегда потерять лид на ровном месте.
+
+    `l1_bypass` — адресный обход словаря L1, включённый владельцем на конкретном
+    канале (флаг приезжает параметром из `channels.l1_bypass_enabled`; ядро без БД).
+    Меняется ровно один случай — «ни одного якоря боли» при включённом L2: сообщение
+    короче `L1_BYPASS_MIN_TEXT` умирает отказом на месте, длинное — уходит «ожидать
+    вектора», а когда вектор досчитан и `classify` зван снова с `ranked`, решает L2
+    по правилу близости (`L1_BYPASS_POS_MIN`), не отрыва. L0 обход не затрагивает
+    никогда; при выключенном L2 флаг ничего не меняет — без следующей ступени L1
+    остаётся последним рубежом. По умолчанию `False`: код, не передающий параметр,
+    работает слово в слово как раньше.
     """
     now = now or datetime.now(timezone.utc)
     if tg_date.tzinfo is None:
@@ -653,11 +762,6 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
 
     ok1, why1, pain, anchors = level1(text, strict=not l2_enabled, profile=profile)
     detail["l1"] = why1
-    if not ok1:
-        detail["l2"] = "не запускался: отсеяно на L1"
-        detail["l3"] = "не запускался: отсеяно на L1"
-        return {"level": 1, "passed": False, "detail": detail, "pain": None,
-                "score": 0, "breakdown": [], "disqualifiers": []}
 
     def _scored(level: int, passed: bool | None, pain_name: str | None) -> dict:
         total, breakdown = score(text=text, anchors=anchors, tg_date=tg_date, now=now,
@@ -665,6 +769,36 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         return {"level": level, "passed": passed, "detail": detail, "pain": pain_name,
                 "score": total, "breakdown": breakdown,
                 "disqualifiers": disqualifiers(text, profile=profile)}
+
+    bypassed = False
+    if not ok1 and l2_enabled and l1_bypass:
+        # Адресный обход L1: единственный случай, который он меняет, — отказ
+        # «ни одного якоря боли» при включённом L2. Без L2 флаг бессмыслен —
+        # L1 остаётся последним рубежом, и приговор прежний (выше проверено:
+        # ветка не срабатывает при l2_enabled=False).
+        if len((text or "").strip()) < L1_BYPASS_MIN_TEXT:
+            # Ниже границы не искали находок — не потому, что их нет, а потому
+            # что не мерили; до проверки обход туда не пускаем.
+            detail["l1"] = (f"ни одного якоря боли — обход не применяется: "
+                            f"короче {L1_BYPASS_MIN_TEXT} символов")
+            detail["l2"] = "не запускался: отсеяно на L1"
+            detail["l3"] = "не запускался: отсеяно на L1"
+            return {"level": 1, "passed": False, "detail": detail, "pain": None,
+                    "score": 0, "breakdown": [], "disqualifiers": []}
+        # Длинное сообщение не убивается: боли словарь не нашёл, но решать обязан
+        # тот, кто понимает смысл. Якорей нет — скор считается с пустым списком
+        # (слагаемое боли даёт минимум 12), и дальше два пути: «ожидает вектора»
+        # ниже либо L2 — по правилу близости, не отрыва.
+        bypassed = True
+        pain, anchors = None, []
+        detail["l1"] = "ни одного якоря боли — канал с открытым L1, решает L2"
+        ok1 = True
+
+    if not ok1:
+        detail["l2"] = "не запускался: отсеяно на L1"
+        detail["l3"] = "не запускался: отсеяно на L1"
+        return {"level": 1, "passed": False, "detail": detail, "pain": None,
+                "score": 0, "breakdown": [], "disqualifiers": []}
 
     if not l2_enabled:
         detail["l2"] = "не запускался: эмбеддинги выключены"
@@ -676,7 +810,9 @@ def classify(*, text: str | None, is_automatic_forward: bool, author_is_bot: boo
         detail["l3"] = "ожидает: не дошло до L3"
         return _scored(1, None, pain)
 
-    ok2, why2, pain2, _margin = level2(ranked, profile=profile)
+    ok2, why2, pain2, _margin = level2(
+        ranked, profile=profile,
+        pos_min=L1_BYPASS_POS_MIN if bypassed else None)
     detail["l2"] = why2
     if not ok2:
         detail["l3"] = "не запускался: отсеяно на L2"

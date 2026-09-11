@@ -101,6 +101,14 @@ STATEMENTS: list[str] = [
     "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS min_date TIMESTAMPTZ",
     "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS read_total INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE backfill_queue ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
+
+    # 2026-09-11, адресный обход словаря L1 (контракт каскада §1.1): решение
+    # «якорей нет — сообщение идёт к L2, а не умирает» принимается на канале,
+    # а не глобально. DEFAULT FALSE обязателен: выкатка не меняет поведение ни
+    # одного канала, включение — отдельное действие владельца. Таблица channels
+    # на проде уже создана create_all, колонку в неё досоздаёт только эта строка.
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS l1_bypass_enabled BOOLEAN "
+    "NOT NULL DEFAULT FALSE",
 ]
 
 

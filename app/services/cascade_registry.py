@@ -34,7 +34,7 @@ from typing import Mapping, Sequence
 from sqlalchemy import select, update
 
 from app.core import cascade, prototypes
-from app.db.models import CascadeVersion, L2Prototype, L3Prompt, ProfileVersion
+from app.db.models import CascadeVersion, L2Prototype, L3Prompt, Limit, ProfileVersion
 from app.db.session import get_session_maker
 from app.services import embeddings, llm
 
@@ -123,6 +123,108 @@ async def active_profile_version(db) -> ProfileVersion | None:
         .order_by(ProfileVersion.id.desc()).limit(1))).scalar_one_or_none()
 
 
+# ── пороги каскада: строки `limits` поверх значений кода ────────────────────────
+#
+# Контракт каскада §3: порог отрыва L2 и порог близости мимо-словарного пути —
+# строки таблицы `limits`; отсутствие строки означает «действует значение кода»,
+# а не ошибку. Сегодня ровно два ключа, и список живёт здесь одним местом: и
+# сидирование старта, и перечитка, и набор настроек (`config_bundle`) обязаны
+# называть одни и те же ключи — второй список рядом разъехался бы с первым молча.
+
+L2_MIN_MARGIN_LIMIT_KEY = "l2_min_margin"
+L1_BYPASS_POS_MIN_LIMIT_KEY = "l1_bypass_pos_min"
+THRESHOLD_LIMIT_KEYS = (L2_MIN_MARGIN_LIMIT_KEY, L1_BYPASS_POS_MIN_LIMIT_KEY)
+
+# Значения кода снимаются один раз на процесс, до любой перечитки. Для
+# `l2_min_margin` это просто константа модуля (применение её не трогает —
+# правятся поля профилей), а вот хранитель действующего `l1_bypass_pos_min` —
+# сама переменная `cascade.L1_BYPASS_POS_MIN`, которую применение перезаписывает:
+# без снимка удаление строки из `limits` вернуло бы порог не к коду, а к последней
+# правке.
+_THRESHOLD_DEFAULTS: dict[str, float] = {
+    L2_MIN_MARGIN_LIMIT_KEY: float(cascade.L2_MIN_MARGIN),
+    L1_BYPASS_POS_MIN_LIMIT_KEY: float(cascade.L1_BYPASS_POS_MIN),
+}
+
+# Единица обеих строк — косинус: пороги сравниваются, а не показываются
+# (`models.Limit` заведён ровно под такое).
+_THRESHOLD_UNIT = "косинус"
+
+_THRESHOLD_DESCRIPTIONS = {
+    L2_MIN_MARGIN_LIMIT_KEY:
+        "минимальный отрыв верхнего положительного эталона от шума на L2",
+    L1_BYPASS_POS_MIN_LIMIT_KEY:
+        "минимальная близость к боли для сообщений, идущих мимо словаря L1",
+}
+
+
+def threshold_defaults() -> dict[str, float]:
+    """Действующие значения кода — то, что работает при пустой таблице `limits`."""
+    return dict(_THRESHOLD_DEFAULTS)
+
+
+async def read_thresholds(db) -> dict[str, float]:
+    """Действующие пороги каскада: строки `limits` поверх значений кода — строка
+    в БД побеждает, отсутствие строки — значение кода (та же семантика, что у
+    порогов discovery). Читается при каждой перечитке, а не кешируется на старте:
+    правка строки обязана действовать без выкатки и без рестарта."""
+    rows = (await db.execute(
+        select(Limit).where(Limit.key.in_(THRESHOLD_LIMIT_KEYS)))).scalars().all()
+    out = dict(_THRESHOLD_DEFAULTS)
+    for row in rows:
+        out[row.key] = float(row.value)
+    return out
+
+
+def apply_thresholds(values: Mapping[str, float]) -> None:
+    """Применить пороги к каскаду в памяти процесса.
+
+    Применители — те же, что зовёт правка порога владельцем, с их валидацией:
+    кривое значение из базы обязано упасть громко (`ValueError`), а не молча
+    отсеять всё. Значение должно быть передано для каждого известного ключа:
+    частичное применение оставило бы половину порогов от старой правки —
+    состояние, которое выглядит рабочим и не является им.
+    """
+    missing = [key for key in THRESHOLD_LIMIT_KEYS if key not in values]
+    if missing:
+        raise ValueError(f"пороги: нет значения для {', '.join(missing)}")
+    cascade.apply_l2_min_margin(values[L2_MIN_MARGIN_LIMIT_KEY])
+    cascade.apply_l1_bypass_pos_min(values[L1_BYPASS_POS_MIN_LIMIT_KEY])
+
+
+async def save_thresholds(db, values: Mapping[str, float], *,
+                          actor: str) -> list[str]:
+    """Записать строки `limits` порогов каскада (upsert по ключу): существующая
+    строка обновляется, отсутствующая заводится. Та же дорога, которой правит
+    порог владелец; отдельного применителя здесь нет — записанное значение
+    вступает в силу при ближайшей перечитке (`reload`), в конце импорта набора
+    она стоит и так. Возвращает записанные ключи в порядке передачи."""
+    unknown = [key for key in values if key not in _THRESHOLD_DEFAULTS]
+    if unknown:
+        raise ValueError(f"пороги: неизвестный ключ {', '.join(unknown)}; "
+                         f"известны: {', '.join(THRESHOLD_LIMIT_KEYS)}")
+    for key, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key}: ожидалось число, получено {value!r}")
+        if not 0 < float(value) < 1:
+            raise ValueError(
+                f"{key}: ожидалось значение из диапазона 0 < v < 1, "
+                f"получено {value!r}")
+
+    rows = (await db.execute(
+        select(Limit).where(Limit.key.in_(list(values))))).scalars().all()
+    by_key = {row.key: row for row in rows}
+    for key, value in values.items():
+        if key in by_key:
+            by_key[key].value = float(value)
+        else:
+            db.add(Limit(key=key, value=float(value), unit=_THRESHOLD_UNIT,
+                         description=_THRESHOLD_DESCRIPTIONS[key]))
+    await db.commit()
+    logger.info("thresholds_saved keys=%s by=%s", ",".join(values), actor)
+    return list(values)
+
+
 # ── старт процесса ───────────────────────────────────────────────────────────────
 
 async def ensure_bootstrap(db) -> bool:
@@ -162,6 +264,20 @@ async def ensure_bootstrap(db) -> bool:
             created = True
             logger.info("l3_prompt_bootstrapped key=%s version=%s", key, p.version)
 
+    # Пороги каскада сеются отсутствующими строками со значениями кода: установка
+    # и так работает по константам, а строка даёт владельцу место, куда вписать
+    # правку (`UPDATE limits …` действует без выкатки). Существующие строки не
+    # трогаем: там может стоять уже правленное владельцем значение, и перепосев
+    # молча отменил бы его.
+    for key in THRESHOLD_LIMIT_KEYS:
+        if await db.get(Limit, key) is None:
+            db.add(Limit(key=key, value=_THRESHOLD_DEFAULTS[key],
+                         unit=_THRESHOLD_UNIT,
+                         description=_THRESHOLD_DESCRIPTIONS[key]))
+            created = True
+            logger.info("threshold_limit_seeded key=%s value=%s",
+                        key, _THRESHOLD_DEFAULTS[key])
+
     if created:
         await db.commit()
     return created
@@ -183,8 +299,13 @@ async def reload(db) -> None:
             llm.apply_prompt(key, llm.Prompt(key=key, version=row.version,
                                              system=row.system_prompt))
 
+    # Пороги каскада применяются при каждой перечитке — поэтому и правка строки
+    # `limits`, и её удаление (возврат к значению кода) действуют во всех трёх
+    # процессах без выкатки: часы перечитки раз в 30 секунд уже стоят везде.
+    apply_thresholds(await read_thresholds(db))
+
     logger.info("cascade_registry_reloaded cascade_version=%s",
-               version.version if version else None)
+                version.version if version else None)
 
 
 async def _reload_prototypes(db, version: CascadeVersion) -> None:

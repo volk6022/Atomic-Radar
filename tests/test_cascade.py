@@ -168,3 +168,85 @@ def test_breakdown_sums_to_score():
     v = classify("у нас в компании срочно нужен вариант, платёж за рубеж не проходит")
     assert sum(b["value"] for b in v["breakdown"]) == v["score"]
     assert v["score"] <= 100
+
+
+# ── обход L1: адресность, включаемая владельцем канала (l1_bypass) ────────────
+
+# Без якорей и длиннее 200 — ровно тот класс, который обход обязан отпускать
+# дальше, а код без флага обязан убивать прежним приговором L1.
+NO_ANCHOR_LONG = ("ведомость банковского контроля не сходится с декларацией, "
+                  + "а" * 180)
+
+
+def test_default_behavior_bit_for_bit():
+    """Главный тест волны (TESTS-cascade T1): весь код, не передающий `l1_bypass`,
+    работает слово в слово как раньше — на этом держится совместимость с волной B.
+    Явный `l1_bypass=False` обязан дать словарь, равный вызову без параметра."""
+    without = classify(NO_ANCHOR_LONG, l2_enabled=True)
+    assert without["level"] == 1 and without["passed"] is False
+    assert without["detail"]["l1"] == "ни одного якоря боли"
+    assert without["detail"]["l2"] == "не запускался: отсеяно на L1"
+    assert without["pain"] is None and without["score"] == 0
+    explicit = classify(NO_ANCHOR_LONG, l2_enabled=True, l1_bypass=False)
+    assert without == explicit
+
+
+def test_default_thresholds_are_the_current_constants():
+    """Пока пороги живут в коде (TESTS-cascade T1.4): профиль заимствует константу
+    отрыва, новый порог близости — 0.57. Точка чтения порога одна, перенос в
+    `limits` делает соседняя задача thresholds через `apply_*` — поведение кода
+    от этого переноса не меняется."""
+    assert cascade.PROFILES["dm_v1"].l2_min_margin == 0.01 == cascade.L2_MIN_MARGIN
+    assert cascade.PROFILES["public_v1"].l2_min_margin == 0.01
+    assert cascade.L1_BYPASS_POS_MIN == 0.57
+    assert cascade.L1_BYPASS_MIN_TEXT == 200
+
+
+def test_anchor_hit_still_goes_to_l2_regardless_of_bypass_flag():
+    """Якорь сработал — путь обычный при любом значении флага (TESTS-cascade
+    T1.3): обход меняет только отказ «ни одного якоря боли»."""
+    for bypass in (False, True):
+        v = classify("не могу оплатить инвойс, помогите пожалуйста",
+                     l2_enabled=True, l1_bypass=bypass)
+        assert v["passed"] is None and v["level"] == 1, bypass
+        assert v["detail"]["l2"] == "ожидает: вектор ещё не посчитан", bypass
+
+
+def test_bypass_keeps_long_anchorless_message_alive():
+    """TESTS-cascade T3: якорей нет, но 250 символов и обход включён — сообщение
+    не убивается, а уходит «ожидать вектора». Скор считается по общим правилам
+    с пустым списком якорей, поэтому слагаемое боли даёт свой минимум
+    12 (`min(weights.pain, 12 + 10 * len(anchors))`)."""
+    v = classify("а" * 250, l2_enabled=True, l1_bypass=True)
+    assert v["passed"] is None and v["level"] == 1
+    assert "канал с открытым L1" in v["detail"]["l1"]
+    assert v["detail"]["l2"] == "ожидает: вектор ещё не посчитан"
+    assert v["pain"] is None
+    pain_part = next(b for b in v["breakdown"] if b["label"] == "совпадение с болью")
+    assert pain_part["value"] == 12
+
+
+def test_bypass_requires_l2_to_mean_anything():
+    """TESTS-cascade T4: при выключенном L2 обход не применяется — без следующей
+    ступени L1 остаётся последним рубежом, и приговор не отличается от дефолта."""
+    v = classify("а" * 250, l2_enabled=False, l1_bypass=True)
+    assert v["passed"] is False and v["level"] == 1
+    assert v["detail"]["l1"] == "ни одного якоря боли"
+
+
+def test_bypass_length_floor_is_200():
+    """TESTS-cascade T5: ниже 200 обход не пускает — это граница знания, а не
+    вывод (ревью п. 3: ниже 200 находок не искали); ровно 200 уже применяется,
+    граница включительная."""
+    short = classify("а" * 199, l2_enabled=True, l1_bypass=True)
+    assert short["passed"] is False and short["level"] == 1
+    assert "короче 200" in short["detail"]["l1"]
+    edge = classify("а" * 200, l2_enabled=True, l1_bypass=True)
+    assert edge["passed"] is None, "ровно 200 — обход применяется"
+
+
+def test_bypass_never_lifts_l0():
+    """TESTS-cascade T6: бот, автопересылка, короткий текст — приговор L0
+    неизменен и при открытом обходе: L0 не обходится никогда."""
+    v = classify("а" * 250, author_is_bot=True, l2_enabled=True, l1_bypass=True)
+    assert v["level"] == 0 and v["passed"] is False

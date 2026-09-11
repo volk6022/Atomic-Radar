@@ -184,6 +184,12 @@ class Channel(Base):
     leads_per_1000: Mapped[float | None] = mapped_column(Numeric(8, 3))
 
     ingest_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Адресный обход словаря L1 (10.25): «якорей нет — решает L2, а не отказ»
+    # разрешается не всем сразу, а отмеченному каналу. FALSE по умолчанию —
+    # выкатка колонки не меняет вердикт ни одного канала; включение — осознанное
+    # действие владельца, а не свойство схемы. Одно имя, синонимов не заводить:
+    # второе название того же выключателя разъедется с этим молча.
+    l1_bypass_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_junk: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     backfill_cursor: Mapped[int | None] = mapped_column(BigInteger)
 
