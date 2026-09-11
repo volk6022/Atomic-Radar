@@ -45,19 +45,28 @@ KIND_CAPABILITY = {
     # тратит другой дневной бюджет и оставляет след, который видит администратор.
     # Поэтому право владельца, то же самое, что у `POST /channels/discussions/join`.
     "group_join": Capability.CHANNEL_JOIN,
+    # Подбор каналов — то же право, что у самой ручки `POST /discovery/scan`: поиск
+    # и проверка кандидатов тратят бюджет чтений флота, как дочитывание. Общий
+    # запуск здесь только отражает решение той ручки; без строки в этой таблице
+    # вид запускался бы кем угодно, включая того, кто занимает карту.
+    "discovery_scan": Capability.RUN_BACKFILL,
+    "discovery_check": Capability.RUN_BACKFILL,
 }
 
 KIND_TITLE = {"reclassify": "Переклассификация", "backfill": "Дочитать историю",
               "channel_add": "Подключение канала", "export": "Выгрузка",
               "discussions": "Разбор групп обсуждения",
-              "group_join": "Вступление в группы обсуждения"}
+              "group_join": "Вступление в группы обсуждения",
+              "discovery_scan": "Подбор каналов: поиск",
+              "discovery_check": "Подбор каналов: проверка кандидатов"}
 
 # Где у вида задачи кнопка. Бэкфиллу и подключению канала нужен выбранный канал
 # (или его username) — оба живут в разделе Channels и оттуда же заводят строку в
 # `runs`, а не через общий `POST /runs`.
 KIND_WHERE = {"reclassify": "runs", "backfill": "channels",
              "channel_add": "channels", "export": "nowhere",
-             "discussions": "channels", "group_join": "channels"}
+             "discussions": "channels", "group_join": "channels",
+             "discovery_scan": "channels", "discovery_check": "channels"}
 
 
 def _aware(dt: datetime | None) -> datetime | None:
