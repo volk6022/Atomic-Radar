@@ -26,9 +26,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core import clock
-from app.db.models import Channel, ChannelCandidate, DiscoveryQuery, Limit, LlmTrace
+from app.db.models import Channel, ChannelCandidate, DiscoveryQuery, Limit, LlmTrace, Run
 from app.db.session import get_session_maker
-from app.services import cascade_registry, engage, llm
+from app.services import cascade_registry, deferrals, engage, llm
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +176,15 @@ async def _fetch_info(account_id: int, username: str) -> dict:
     return await engage.wait_for_task(task["task_id"])
 
 
-async def check_card(db, candidate, *, account_id: int) -> str:
-    """Шаг 1 — карточка (§4.1). Возвращает `"pass" | "reject" | "defer"`."""
+async def check_card(db, candidate, *, account_id: int,
+                     out: dict | None = None) -> str:
+    """Шаг 1 — карточка (§4.1). Возвращает `"pass" | "reject" | "defer"`.
+
+    `out` — детализация для прогона (как у `check_fit`): откладывание лимитом
+    (`interpret` → deferred) дописывает сюда `(аккаунт, действие, код)` —
+    прогон собирает такие тройки, чтобы один раз спросить окно возврата
+    бюджета и назвать его в своём результате (R4).
+    """
     if not candidate.username:
         # Без username `get_chat_info` не выполнить (нужен знакомый пир), а
         # подключить тем более: это серверная половина проверки B.7 «кандидат
@@ -187,15 +194,22 @@ async def check_card(db, candidate, *, account_id: int) -> str:
                                     "подключить нельзя")
     try:
         info = await _fetch_info(account_id, candidate.username)
-    except engage.EngageTaskDeferred as e:
+    except (engage.EngageTaskFailed, engage.EngageUnavailable) as e:
+        # `EngageTaskDeferred` — наследник `EngageTaskFailed`, так что одна строка
+        # catch ловит все три вида; различает их общая трактовка (`deferrals`).
+        interp = deferrals.interpret(e)
+        if interp.kind == "failed":
+            return await _reject(db, candidate, decided_by=CARD_ACTOR,
+                                 reason=_translate(interp.code))
+        if interp.kind == "unavailable":
+            # Сбой сети — не вина канала: поля не трогаем, кандидат остаётся pending.
+            return await _defer(f"@{candidate.username}: Engage недоступен — {e}", None)
         # Исчерпан дневной лимит чтений аккаунта — «можно, но не сегодня».
-        return await _defer(f"@{candidate.username}: карточка отложена — {e}", None)
-    except engage.EngageTaskFailed as e:
-        return await _reject(db, candidate, decided_by=CARD_ACTOR,
-                             reason=_translate(e.code))
-    except engage.EngageUnavailable as e:
-        # Сбой сети — не вина канала: поля не трогаем, кандидат остаётся pending.
-        return await _defer(f"@{candidate.username}: Engage недоступен — {e}", None)
+        if out is not None:
+            out.setdefault("budget_deferrals", []).append(
+                (account_id, "get_chat_info", interp.code))
+        return await _defer(f"@{candidate.username}: карточка отложена — {interp.note}",
+                            None)
 
     if not info.get("found", True):
         return await _reject(db, candidate, decided_by=CARD_ACTOR,
@@ -252,12 +266,14 @@ async def _history_page(account_id: int, username: str, *, min_date: str,
 
 async def check_liveness(db, candidate, *, account_id: int,
                          now: datetime | None = None,
-                         sample: list[str] | None = None, report=None) -> str:
+                         sample: list[str] | None = None, report=None,
+                         out: dict | None = None) -> str:
     """Шаг 2 — живость (§4.2). Тем же аккаунтом, что и карточка (B.5).
 
     `sample` — сборник текстов для шага модели: выборку отдаёт живость, второй
     ходки в Telegram ради неё не делаем (§5). `now` вынесен параметром для
-    проверяемости окна, как у `backfill_drain.tick`.
+    проверяемости окна, как у `backfill_drain.tick`. `out` — как у `check_card`:
+    откладывание лимитом записывает `(аккаунт, действие, код)` для окна прогона.
     """
     now = now or clock.utcnow()
     min_date = (now - LIVENESS_WINDOW).isoformat()
@@ -296,11 +312,18 @@ async def check_liveness(db, candidate, *, account_id: int,
             max_id = oldest - 1
             if len(page) < LIVENESS_PAGE:
                 break
-    except engage.EngageTaskDeferred as e:
-        return await _defer(f"@{candidate.username}: живость отложена — {e}", report)
-    except (engage.EngageUnavailable, engage.EngageTaskFailed) as e:
-        # Поля живости не трогаем: шаг не доделан, а не «мертв».
-        return await _defer(f"@{candidate.username}: живость не посчитана — {e}", report)
+    except (engage.EngageTaskFailed, engage.EngageUnavailable) as e:
+        # `EngageTaskDeferred` внутри — общий предок ловит все три вида, различает
+        # трактовка. Поля живости не трогаем: шаг не доделан, а не «мёртв».
+        interp = deferrals.interpret(e)
+        if interp.kind == "deferred":
+            if out is not None:
+                out.setdefault("budget_deferrals", []).append(
+                    (account_id, "get_chat_history", interp.code))
+            return await _defer(f"@{candidate.username}: живость отложена — {interp.note}",
+                                report)
+        return await _defer(f"@{candidate.username}: живость не посчитана — {interp.note}",
+                            report)
 
     candidate.liveness_posts_7d = post_count
     candidate.liveness_comments_7d = comments
@@ -430,7 +453,9 @@ async def check_fit(db, candidate, *, report, posts: list[str] | None = None,
 
 async def _check_one(db, candidate, *, fleet: set[int], report) -> dict:
     """Полный конвейер одного кандидата: карточка → живость → модель (B.3).
-    Возвращает ступени и заметку для лога — прогон считает по ним итог."""
+    Возвращает ступени, заметку для лога и — при откладывании лимитом — тройки
+    `(аккаунт, действие, код)` под ключом `budget_deferrals`; прогон считает по
+    ним итог и окно возврата."""
     name = (f"@{candidate.username}" if candidate.username
             else f"кандидат #{candidate.id}")
     if candidate.found_by_account_id not in fleet:
@@ -440,28 +465,43 @@ async def _check_one(db, candidate, *, fleet: set[int], report) -> dict:
                 "note": f"{name}: аккаунт {candidate.found_by_account_id} не активен "
                         f"во флоте — проверки отложены"}
 
-    card = await check_card(db, candidate, account_id=candidate.found_by_account_id)
+    # Детализация ступеней для прогона: «спросили ли модель» (check_fit) и
+    # «кого отложило лимитом» (check_card/check_liveness) — из неё run_check
+    # собирает исход прогона и окно возврата бюджета.
+    detail: dict = {}
+    card = await check_card(db, candidate, account_id=candidate.found_by_account_id,
+                            out=detail)
     if card != "pass":
         why = candidate.decision_reason if card == "reject" else "отложено"
-        return {"card": card, "liveness": None, "fit": None, "asked": False,
-                "note": f"{name}: карточка — {why}"}
+        return _outcome({"card": card, "liveness": None, "fit": None,
+                         "asked": False,
+                         "note": f"{name}: карточка — {why}"}, detail)
 
     # Выборка для модели собирается здесь же, второй ходки в Telegram нет (§5).
     sample: list[str] = []
     liveness = await check_liveness(
         db, candidate, account_id=candidate.found_by_account_id,
-        sample=sample, report=report)
+        sample=sample, report=report, out=detail)
     if liveness != "pass":
         why = candidate.decision_reason if liveness == "reject" else "отложено"
-        return {"card": card, "liveness": liveness, "fit": None, "asked": False,
-                "note": f"{name}: живость — {why}"}
+        return _outcome({"card": card, "liveness": liveness, "fit": None,
+                         "asked": False,
+                         "note": f"{name}: живость — {why}"}, detail)
 
-    detail: dict = {}
     fit = await check_fit(db, candidate, report=report, posts=sample, out=detail)
     why = ("отклонена моделью" if fit == "reject"
            else "отложена" if fit == "defer" else f"вердикт {candidate.llm_verdict}")
-    return {"card": card, "liveness": liveness, "fit": fit,
-            "asked": bool(detail.get("asked")), "note": f"{name}: модель — {why}"}
+    return _outcome({"card": card, "liveness": liveness, "fit": fit,
+                     "asked": bool(detail.get("asked")),
+                     "note": f"{name}: модель — {why}"}, detail)
+
+
+def _outcome(outcome: dict, detail: dict) -> dict:
+    """Итог одного кандидата; пары «кого отложило лимитом» прикладываются,
+    только если они есть — статистика штатного прогона остаётся прежней."""
+    if detail.get("budget_deferrals"):
+        outcome["budget_deferrals"] = detail["budget_deferrals"]
+    return outcome
 
 
 async def run_check(*, report, cancelled) -> dict:
@@ -470,10 +510,21 @@ async def run_check(*, report, cancelled) -> dict:
     Один отказ не роняет прогон (образец `discussions.scan`): приватный канал или
     флуд-контроль на списке кандидатов — обычные события, а перезапуск прогона
     перечитал бы уже проверенное.
+
+    Исход «отложено лимитом» (R4): проверки кандидатов, отложенные Engage
+    (`interpret` → deferred), собираются за прогон в тройки (аккаунт, действие,
+    код) — по ним прогон **один раз** спрашивает `engage.limits()` и кладёт в
+    свой результат маркер `deferred: True` (по нему `jobs.execute` ставит строке
+    статус `deferred`) и окно возврата `retry_after_s` (его читает тик через
+    `_waiting_budget`, чтобы не заводить новый прогон до возврата бюджета).
+    Недоступность Engage, откладывание моделью и неактивный аккаунт — не лимит:
+    маркера они не ставят, прогон остаётся «готово». Счётчик отложенных
+    кандидатов — отдельный ключ `deferred_candidates`, не маркер.
     """
     maker = get_session_maker()
     stats = {"checked": 0, "passed_card": 0, "passed_liveness": 0, "asked_llm": 0,
-             "rejected": 0, "deferred": 0, "connected": 0}
+             "rejected": 0, "deferred_candidates": 0, "connected": 0}
+    budget_deferrals: list[tuple[int, str, str | None]] = []
 
     # Флот спрашивается один раз за прогон (образец `_job_discussions`): список
     # аккаунтов за минуты прогона не меняется, а запросов к Engage и так хватает.
@@ -511,11 +562,25 @@ async def run_check(*, report, cancelled) -> dict:
         if "reject" in (outcome["card"], outcome["liveness"], outcome["fit"]):
             stats["rejected"] += 1
         elif "defer" in (outcome["card"], outcome["liveness"], outcome["fit"]):
-            stats["deferred"] += 1
+            stats["deferred_candidates"] += 1
+        budget_deferrals.extend(outcome.get("budget_deferrals") or [])
         await report(100.0 * n / total if total else 100.0,
                      f"[{n}/{total}] {outcome['note']}")
 
     stats["cancelled"] = cancelled() and stats["checked"] < total
+    if budget_deferrals and not stats["cancelled"]:
+        # Отменённый прогон остаётся «отменён» даже с отложенными проверками:
+        # статус строки — про то, чем кончился прогон, окно подождёт следующего.
+        stats["deferred"] = True
+        stats["code"] = budget_deferrals[0][2]
+        retry_after_s = await _check_retry_after_seconds(budget_deferrals)
+        if retry_after_s is not None:
+            stats["retry_after_s"] = retry_after_s
+        await report(100, "проверки отложены лимитом Engage "
+                     f"({stats['code']}) — "
+                     + (f"возврат через {retry_after_s} с"
+                        if retry_after_s is not None
+                        else "окно возврата неизвестно, прежний ритм тика"))
     return stats
 
 
@@ -560,6 +625,73 @@ async def _upsert_candidate(db, item: dict, *, kind: str,
                             seed_channel_id=seed_channel_id,
                             found_by_account_id=account_id))
     return True
+
+
+# Действие, которым заказывается каждый вид поиска: `resets_in_seconds` в E1
+# отдаётся на действие, а TTL у ключей одного окна одинаков — поэтому окно
+# ожидания читается у действия, которым заказывали, а не «у любого» (R4).
+_SEARCH_ACTION = {"similar": "get_similar_channels", "search": "search_public_chats"}
+
+
+def _resets_from_answer(lim: dict, account_id: int, action: str | None) -> int | None:
+    """`resets_in_seconds` действия у аккаунта из ответа E1: сначала per_account,
+    при отсутствии — агрегат того же действия (TTL у ключей одного окна
+    одинаков). Действия в ответе нет — None."""
+    for acc in lim.get("accounts") or []:
+        if not isinstance(acc, dict) or acc.get("account_id") != account_id:
+            continue
+        for act in acc.get("actions") or []:
+            if not isinstance(act, dict) or act.get("action") != action:
+                continue
+            for bucket in ("per_account", "aggregate"):
+                value = (act.get(bucket) or {}).get("resets_in_seconds")
+                if value is not None:
+                    return int(value)
+    return None
+
+
+async def _retry_after_seconds(kind: str, account_id: int) -> int | None:
+    """Сколько ждать до возврата бюджета поиска: `resets_in_seconds` действия,
+    которым заказывали поиск, из ответа `GET /v1/limits` (E1). Это один из двух
+    точечных опросов остатка у discovery — в момент откладывания, не на тик
+    (R2/R4): тик, спрашивай он остаток каждые пять минут, сам стал бы источником
+    нагрузки.
+
+    Не время до полуночи UTC и не `_utc_day_start`: окно бюджета Engage —
+    скользящие сутки от первого расхода, и эти величины не складываются.
+
+    Опрос не удался (Engage недоступен, старая версия без маршрута) — None:
+    тик вернётся к прежнему пятиминутному ритму. Молча ждать «до никогда» нельзя.
+    """
+    try:
+        lim = await engage.limits(account_ids=[account_id])
+    except engage.EngageUnavailable:
+        return None
+    return _resets_from_answer(lim, account_id, _SEARCH_ACTION.get(kind))
+
+
+async def _check_retry_after_seconds(
+        deferred: list[tuple[int, str, str | None]]) -> int | None:
+    """Окно возврата для отложенных проверок (R4): один опрос `engage.limits()`
+    сразу по всем аккаунтам, чьи проверки отложены, и минимальное окно среди
+    отложенных пар (аккаунт, действие) — у того действия, которым проверяли.
+
+    Минимум, а не максимум: тик обязан вернуться, как только вернётся хоть один
+    нужный бюджет. Ещё исчерпанный бюджет отложит свою проверку заново — и новый
+    прогон назовёт свежее окно; прогон на окно — не шторм. Опрос не удался —
+    None: прежний пятиминутный ритм, молча ждать «до никогда» нельзя.
+    """
+    if not deferred:
+        return None
+    account_ids = sorted({account_id for account_id, _act, _code in deferred})
+    try:
+        lim = await engage.limits(account_ids=account_ids)
+    except engage.EngageUnavailable:
+        return None
+    windows = [w for w in (_resets_from_answer(lim, account_id, action)
+                           for account_id, action, _code in deferred)
+               if w is not None]
+    return min(windows) if windows else None
 
 
 async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
@@ -618,7 +750,19 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
         if cancelled():
             return {"cancelled": True, "found_total": 0, "new_total": 0}
         await report(0, f"{what}, аккаунт {account_id}")
-        result = await order_search(action, payload)
+        try:
+            result = await order_search(action, payload)
+        except engage.EngageTaskDeferred as e:
+            # Отложено лимитом — не падение: прогон завершается штатно, а статус
+            # «deferred» строке ставит `execute` по ключу в результате. Кандидаты
+            # и строка `discovery_queries` не пишутся: поиска не было.
+            interp = deferrals.interpret(e)
+            await report(0, f"{what}: {interp.note}")
+            out: dict = {"deferred": True, "code": interp.code}
+            retry_after_s = await _retry_after_seconds(kind, account_id)
+            if retry_after_s is not None:
+                out["retry_after_s"] = retry_after_s
+            return out
         items = _found_items(result)
         await report(40, f"найдено {len(items)} каналов")
 
@@ -673,6 +817,12 @@ async def discovery_check_tick(ctx: dict) -> dict:
     """Один удар проверки кандидатов (§4.4): долечить отложенное и перевести
     `approved → connected`, а если есть `pending` и прогон не идёт — завести его.
 
+    «Прогон не идёт» — не единственное условие заводить новый (R4): если последний
+    завершённый прогон отложен лимитом и назвал окно возврата (`retry_after_s`),
+    которое ещё не истекло, новый не заводится — иначе каждый удар заново заказывал
+    бы карточку, которую Engage снова откладывает: так выглядит шторм повторов.
+    Окно не названо — прежний пятиминутный ритм.
+
     Бьётся каждые пять минут круглые сутки и падать не имеет права на том, что
     буднями считается погодой: исключение на ровном месте залило бы журнал
     воркера ложными отказами (образец — `backfill_drain_tick`).
@@ -689,14 +839,44 @@ async def discovery_check_tick(ctx: dict) -> dict:
                 select(func.count(ChannelCandidate.id))
                 .where(ChannelCandidate.decision == "pending"))).scalar_one()
             started = False
+            waiting_budget = False
             if pending and await jobs.active_run(db, "discovery_check") is None:
-                await jobs.start(db, kind="discovery_check", params={},
-                                 name="Проверка кандидатов Discovery",
-                                 user_email="auto:tick")
-                started = True
+                if await _waiting_budget(db):
+                    waiting_budget = True
+                else:
+                    await jobs.start(db, kind="discovery_check", params={},
+                                     name="Проверка кандидатов Discovery",
+                                     user_email="auto:tick")
+                    started = True
     except Exception as e:  # noqa: BLE001 — тик не вправе уронить воркера приёма
         logger.warning("discovery_check_tick_failed error=%s", e)
-        return {"connected": 0, "pending": 0, "started": False}
-    logger.info("discovery_check_tick connected=%s pending=%s started=%s",
-                connected, pending, started)
-    return {"connected": connected, "pending": pending, "started": started}
+        return {"connected": 0, "pending": 0, "started": False,
+                "waiting_budget": False}
+    logger.info("discovery_check_tick connected=%s pending=%s started=%s "
+                "waiting_budget=%s", connected, pending, started, waiting_budget)
+    return {"connected": connected, "pending": pending, "started": started,
+            "waiting_budget": waiting_budget}
+
+
+async def _waiting_budget(db) -> bool:
+    """Последний завершённый прогон проверок отложен лимитом и назвал окно
+    (`retry_after_s`), которое ещё не истекло (R4).
+
+    Читается последний завершённый run вида `discovery_check` — не «любой
+    deferred»: более поздний обычный прогон отменяет старое окно само собой.
+    Окна нет (Engage был недоступен в момент откладывания и опрос остатка не
+    удался) — False: молча ждать «до никогда» нельзя, работает прежний ритм.
+    """
+    last = (await db.execute(
+        select(Run).where(Run.kind == "discovery_check",
+                          Run.finished_at.is_not(None))
+        .order_by(Run.finished_at.desc(), Run.id.desc())
+        .limit(1))).scalar_one_or_none()
+    if last is None or last.status != "deferred":
+        return False
+    seconds = (last.result or {}).get("retry_after_s")
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return False
+    return clock.utcnow() < last.finished_at + timedelta(seconds=seconds)

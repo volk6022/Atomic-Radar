@@ -308,6 +308,43 @@ async def test_engage_unavailable_on_card_defers_and_touches_nothing(monkeypatch
     assert db.commits == 0
 
 
+# ── 7б. карточка через общую трактовку (R3 §5.5) ─────────────────────────────
+
+async def test_deferred_task_on_card_defers_and_stays_pending(monkeypatch):
+    """Карточка, отложенная лимитом, различается от отказа через общую трактовку
+    (`deferrals.interpret`): кандидат остаётся pending, причина не пишется."""
+    calls: list = []
+    _stub_engage(monkeypatch, calls, card=_card(), fail={
+        ("get_chat_info", "bank"): engage.EngageTaskDeferred(
+            "Engage отложил задачу: READ_BUDGET_EXCEEDED",
+            code="READ_BUDGET_EXCEEDED")})
+    db = _FakeDB()
+    cand = _candidate()
+
+    assert await discovery.check_card(db, cand, account_id=3) == "defer"
+    assert cand.decision == "pending"
+    assert cand.decided_by is None and cand.decision_reason is None
+    assert cand.peer_id is None and cand.members is None
+    assert db.commits == 0
+
+
+async def test_task_failed_on_card_is_rejected_with_translated_code(monkeypatch):
+    """Отказ Engage (EngageTaskFailed) — данные о решении: причина переводится
+    кодом и записывается кандидату, как и раньше (регресс ветки reject)."""
+    calls: list = []
+    _stub_engage(monkeypatch, calls, card=_card(), fail={
+        ("get_chat_info", "bank"): engage.EngageTaskFailed(
+            "задача не выполнена: channel_private", code="channel_private")})
+    db = _FakeDB()
+    cand = _candidate()
+
+    assert await discovery.check_card(db, cand, account_id=3) == "reject"
+    assert cand.decision == "rejected"
+    assert cand.decided_by == "auto:card"
+    assert "приватный" in cand.decision_reason
+    assert db.commits == 1
+
+
 # ── 8. EngageTaskDeferred на живости ──────────────────────────────────────────
 
 async def test_deferred_task_on_liveness_defers_not_rejects(monkeypatch):

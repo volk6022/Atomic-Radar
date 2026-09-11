@@ -185,10 +185,16 @@ _mask_phone = engage.mask_phone
 async def accounts(user=requires(Section.FLEET)):
     """Живой флот из Engage — единственная ручка, за которой уже стоят настоящие данные.
 
-    Поля, которых Engage не знает (часовой пояс собеседника, израсходованные за сутки
-    лимиты, аптайм вотчера), не выдумываются: экран показывает по ним прочерк. Пустая
-    клетка честнее правдоподобного числа — по такому экрану принимают решение о паузе
-    аккаунта.
+    Поля, которых Engage не знает (часовой пояс собеседника, аптайм вотчера), не
+    выдумываются: экран показывает по ним прочерк. Остатки лимитов — знает: они
+    читаются из `GET /v1/limits` того же Engage (E1) одним вызовом на запрос
+    ручки, отдельной ручки остатков не заводится — кнопка вступления берёт «на
+    аккаунт» и «агрегат» с этой же строки флота. Отказ именно опроса остатка
+    (`EngageUnavailable` от `limits()` — старая версия Engage или недоступность)
+    экран не роняет: четыре поля остатков уходят в `null` (прочерк), флот
+    остаётся жив. Прочерк, а не нуль: нуль читался бы как «лимит исчерпан», а
+    это другая новость. Сам флот при недоступности Engage по-прежнему 503 —
+    см. ниже.
     """
     try:
         raw = await engage.list_accounts()
@@ -198,12 +204,31 @@ async def accounts(user=requires(Section.FLEET)):
         # новости, и путать их на экране здоровья флота нельзя.
         raise HTTPException(503, str(e)) from e
 
+    # Остаток — второй вызов с другой судьбой: его отказ говорит о витрине, а не о
+    # флоте, и лечится прочерком в четырёх полях, а не 503. Ответ E1 не
+    # пересобирается: индекс «account_id → {action → элемент actions}», значения
+    # читаются прямо из него (формула R5 §2: `remaining` уже
+    # min(per_account, aggregate) по правилам E1, `resets_in_seconds` — TTL
+    # скользящего окна, НЕ время до полуночи).
+    try:
+        engage_limits = await engage.limits()
+    except engage.EngageUnavailable:
+        engage_limits = {}
+    actions_by_account = {acc.get("account_id"): {act.get("action"): act
+                                                  for act in acc.get("actions", [])}
+                          for acc in engage_limits.get("accounts", [])}
+
     totals = safety.get("warmup_totals", {})
     rows = []
     for a in raw:
         proxy = a.get("proxy") or {}
         phone_country = a.get("phone_country")
         proxy_country = proxy.get("country")
+        # Аккаунта нет в ответе E1 (попал в `missing`) — остатков у него нет,
+        # те же четыре прочерка, что и при недоступности: пустые dict дают null.
+        actions = actions_by_account.get(a.get("account_id"), {})
+        joins = actions.get("joins_per_day") or {}
+        messages = actions.get("messages_per_day") or {}
         rows.append({
             "id": a.get("account_id"),
             "label": f"acc-{a.get('account_id')}",
@@ -221,6 +246,16 @@ async def accounts(user=requires(Section.FLEET)):
             "warmup_tier": a.get("warmup_tier"),
             "warmup_day": a.get("warmup_day"),
             "warmup_total": totals.get(a.get("use_case")),
+            # Остатки Engage — скользящее окно 24 ч; с собственными счётчиками
+            # Radar (полночь UTC) они нигде не складываются в одно число.
+            "joins_remaining": joins.get("remaining"),
+            "joins_resets_in_seconds": (joins.get("per_account") or {}).get(
+                "resets_in_seconds"),
+            # «Сколько осталось флоту» на api_id: у joins агрегат есть всегда
+            # (действие чувствительное), но читается с оглядкой — нет так нет.
+            "joins_aggregate_remaining": (joins.get("aggregate") or {}).get(
+                "remaining"),
+            "messages_remaining": messages.get("remaining"),
         })
     return rows
 

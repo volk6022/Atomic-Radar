@@ -47,6 +47,13 @@ logger = logging.getLogger("radar.jobs")
 # чем кончилась, а не чтобы хранить всю историю: полный вывод живёт в логах контейнера.
 LOG_LIMIT = 200
 
+# Активные статусы: строка занимает исполнителя и мешает запустить вторую такого
+# же вида. Полный набор статусов `runs`: `queued`, `running`, `done`, `failed`,
+# `cancelled`, `interrupted` — и с R3 ещё два. `deferred` — терминальный:
+# «завершён, отложено лимитом» (ставит `execute` по ключу результата, тревоги
+# нет). `waiting` — НЕ терминальный и сюда не входит: так читают только внешние
+# цепочки (бэкфилл, подключение канала), ждущие лимита Engage, — в `ACTIVE`
+# его нет сознательно, второй запуск того же вида поверх ждущего разрешён.
 ACTIVE = ("queued", "running")
 
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
@@ -348,11 +355,28 @@ async def execute(run_id: int, kind: str, params: dict) -> None:
     try:
         result = await RUNNERS[kind](run_id, params)
         cancelled = bool(result.get("cancelled"))
-        await _touch(run_id, status="cancelled" if cancelled else "done",
-                     progress=100 if not cancelled else None,
-                     result=result, finished_at=clock.utcnow())
-        await _append_log(run_id, "остановлено оператором" if cancelled else "готово")
-        logger.info("job_finished run=%s kind=%s cancelled=%s", run_id, kind, cancelled)
+        # Строгое `is True`, а не `bool(...)`: у scan/join в статистике тоже
+        # живёт ключ `deferred` — но это СЧЁТЧИК отложенных каналов/групп, не
+        # маркер исхода (у check счётчик зовётся `deferred_candidates`, а ключ
+        # `deferred` — сам маркер, R4-fix). Прогон, отложивший один канал из
+        # шестидесяти и завершившийся штатно, обязан остаться «готово».
+        deferred = result.get("deferred") is True
+        if deferred:
+            # «Отложено лимитом Engage» (R3) — не падение и не отмена: работа
+            # вернётся сама по перепланировке Engage. Строка закрывается
+            # терминальным «deferred» без тревоги: тревога живёт только в ветке
+            # исключения, а откладывание — штатный исход, о нём читает строка
+            # Runs и лог прогона.
+            await _touch(run_id, status="deferred", result=result,
+                         finished_at=clock.utcnow())
+            await _append_log(run_id, "отложено лимитом Engage — задача вернётся сама")
+            logger.info("job_deferred run=%s kind=%s", run_id, kind)
+        else:
+            await _touch(run_id, status="cancelled" if cancelled else "done",
+                         progress=100 if not cancelled else None,
+                         result=result, finished_at=clock.utcnow())
+            await _append_log(run_id, "остановлено оператором" if cancelled else "готово")
+            logger.info("job_finished run=%s kind=%s cancelled=%s", run_id, kind, cancelled)
     except Exception as e:  # noqa: BLE001 — падение задачи не должно ронять сервис
         logger.exception("job_failed run=%s kind=%s", run_id, kind)
         await _touch(run_id, status="failed", error=f"{type(e).__name__}: {e}",

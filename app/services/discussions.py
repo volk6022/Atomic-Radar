@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 from app.core import clock
 from app.db.models import Channel, Message, MessageReader
 from app.db.session import get_session_maker
-from app.services import engage
+from app.services import deferrals, engage
 from app.services import ingest as ingest_service
 
 logger = logging.getLogger("radar.discussions")
@@ -315,7 +315,7 @@ async def scan(*, channel_ids: list[int], account_ids: list[int], target: int,
     total = len(queue)
     lock = asyncio.Lock()
     stats = {"total": total, "done": 0, "no_group": 0, "groups_linked": 0,
-             "messages": 0, "failed": 0, "skipped": 0}
+             "messages": 0, "failed": 0, "deferred": 0, "skipped": 0}
 
     async def worker(account_id: int) -> None:
         maker = get_session_maker()
@@ -330,9 +330,17 @@ async def scan(*, channel_ids: list[int], account_ids: list[int], target: int,
                                           target=target, cancelled=cancelled,
                                           check_only=check_only)
             except Exception as e:  # noqa: BLE001 — один канал не роняет прогон
-                logger.warning("discussion_scan_failed channel=%s account=%s error=%s",
-                               channel_id, account_id, e)
-                out = {"failed": f"{type(e).__name__}: {e}"}
+                interp = deferrals.interpret(e)
+                if interp.kind == "failed":
+                    logger.warning("discussion_scan_failed channel=%s account=%s error=%s",
+                                   channel_id, account_id, e)
+                    out = {"failed": f"{type(e).__name__}: {e}"}
+                else:
+                    # Отложено лимитом либо Engage недоступен — не вина канала:
+                    # поля не трогаются, счёт идёт в `deferred`, а не в `failed`.
+                    logger.warning("discussion_scan_deferred channel=%s account=%s why=%s",
+                                   channel_id, account_id, interp.note)
+                    out = {"deferred": interp.note}
 
             async with lock:
                 stats["done"] += 1
@@ -343,6 +351,8 @@ async def scan(*, channel_ids: list[int], account_ids: list[int], target: int,
                 stats["messages"] += out.get("read", 0)
                 if out.get("failed") or out.get("failed_group"):
                     stats["failed"] += 1
+                if out.get("deferred"):
+                    stats["deferred"] += 1
                 if out.get("skipped"):
                     stats["skipped"] += 1
                 done, note = stats["done"], _note(channel_id, out)
@@ -363,6 +373,10 @@ def _note(channel_id: int, out: dict) -> str:
     if out.get("failed_group"):
         return (f"канал {channel_id}: группа @{out.get('linked')} — "
                 f"{out['failed_group']}")
+    if out.get("deferred"):
+        # Текст даёт трактовка (`deferrals.interpret`): у откладывания он свой,
+        # не «упало» и не «пропущено».
+        return f"канал {channel_id}: {out['deferred']}"
     if out.get("no_group"):
         return f"канал {channel_id}: группы обсуждения нет"
     if out.get("own_group"):
@@ -646,14 +660,16 @@ async def join_groups(*, group_ids: list[int], account_ids: list[int],
                 async with maker() as db:
                     out = await _join_one(db, group_id, account_id,
                                           subscribed_by=subscribed_by)
-            except engage.EngageTaskDeferred as e:
-                logger.warning("group_join_deferred group=%s account=%s error=%s",
-                               group_id, account_id, e)
-                out = {"deferred": str(e)}
             except Exception as e:  # noqa: BLE001 — одна группа не роняет прогон
-                logger.warning("group_join_failed group=%s account=%s error=%s",
-                               group_id, account_id, e)
-                out = {"failed": f"{type(e).__name__}: {e}"}
+                interp = deferrals.interpret(e)
+                if interp.kind == "deferred":
+                    logger.warning("group_join_deferred group=%s account=%s why=%s",
+                                   group_id, account_id, interp.note)
+                    out = {"deferred": interp.note}
+                else:
+                    logger.warning("group_join_failed group=%s account=%s error=%s",
+                                   group_id, account_id, e)
+                    out = {"failed": f"{type(e).__name__}: {e}"}
 
             async with lock:
                 stats["done"] += 1
@@ -673,8 +689,9 @@ def _join_note(group_id: int, account_id: int, out: dict) -> str:
     if out.get("joined"):
         return f"аккаунт {account_id} вступил в @{out.get('username')}"
     if out.get("deferred"):
-        return (f"группа {group_id}: у аккаунта {account_id} кончился дневной лимит "
-                f"вступлений — {out['deferred']}")
+        # Текст даёт трактовка (`deferrals.interpret`): «кончился дневной лимит»
+        # в ней уже сказано, второй раз повторять его здесь незачем.
+        return f"группа {group_id} у аккаунта {account_id}: {out['deferred']}"
     if out.get("skipped"):
         return f"группа {group_id} пропущена: {out['skipped']}"
     return f"группа {group_id}: {out.get('failed')}"

@@ -124,6 +124,26 @@ async def test_result_of_a_good_event_is_returned_verbatim():
         assert await worker.ingest_event({}, BODY, Q) == {"accepted": 12, "created": 12}
 
 
+async def test_task_deferred_event_is_neither_retried_nor_alarmed():
+    """`task_deferred` (E4) для воркера — обычное событие, а не сбой: разбор
+    отвечает словарём «отложено», работа завершается успешно. Ни ретрая, ни
+    тревоги: лимит вернётся сам, и будить оператора про каждый deferred —
+    путь к тому, что тревоги перестанут читать."""
+    maker, _ = _session()
+    body = {"event": "task_deferred", "task_id": "t-77", "account_id": 3,
+            "error_code": "READ_BUDGET_EXCEEDED",
+            "deferred_until": "2026-09-11T13:00:00Z"}
+    with patch.object(worker, "get_session_maker", return_value=maker), \
+         patch.object(worker, "_alert", AsyncMock()) as alert, \
+         patch.object(worker, "process_event",
+                      AsyncMock(return_value={"accepted": 0,
+                                              "deferred": "READ_BUDGET_EXCEEDED"})):
+        out = await worker.ingest_event({}, body, {"kind": "history"})
+
+    assert out == {"accepted": 0, "deferred": "READ_BUDGET_EXCEEDED"}
+    alert.assert_not_awaited()
+
+
 async def test_worker_refuses_to_start_without_a_queue(monkeypatch):
     """Воркер, поднявшийся без адреса очереди, выглядит исправным и не работает.
 

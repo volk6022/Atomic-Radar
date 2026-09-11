@@ -40,7 +40,7 @@ from app.api.deps import GetDB, permits, requires
 from app.core import clock
 from app.core.access import Capability, Section
 from app.core.config import get_settings
-from app.db.models import AuditLog, Channel, Message
+from app.db.models import AuditLog, BackfillItem, Channel, Message
 from app.services import alerts, channels as channels_service
 from app.services import discussions as discussions_service
 from app.services import backfill_drain, engage
@@ -172,6 +172,41 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
                               note=f"задача Engage не выполнена: {reason}")
         return {"accepted": 0, "error": body.get("error_code")}
 
+    if event == "task_deferred":
+        # Отложено по бюджету (E4): суточный лимит аккаунта исчерпан, Engage
+        # сам вернётся к задаче по перепланировке. Это не провал шага — шаг
+        # не начинался, — поэтому и 200, и никаких ретраев: переигрывать тут
+        # нечего, а повтор того же события разбирается идемпотентно (at-least-once
+        # доставка; дедуп повтора — по (task_id, deferred_until) в самом факте
+        # обновления: статусы и таймер просто перезаписываются теми же значениями).
+        code = str(body.get("error_code") or "")
+        reason = _translate_engage_reason(code)
+        until = str(body.get("deferred_until") or "")
+        run_id = int(q.get("run_id") or 0)
+        item_id = int(q.get("item_id") or 0)
+        logger.info("engage_task_deferred task=%s error=%s kind=%s run=%s item=%s",
+                    body.get("task_id"), code, q.get("kind"), run_id, item_id)
+        if run_id:
+            # Цепочка не умерла и не упала — она ждёт лимита. Статус "waiting"
+            # не терминальный и в ACTIVE не входит (jobs.py): строка Runs читается
+            # «ждёт лимита Engage», отличаясь и от «выполняется», и от «упала».
+            # Прилёт task_complete позже вернёт цепочку в штатный ход своим
+            # progress/finish, повторный defer перезапишет то же самое.
+            await jobs._touch(run_id, status="waiting", error=None)
+            await jobs.progress(run_id, None, "ждёт лимита Engage — " + reason
+                                + (f", возврат до {until}" if until else ""))
+        if item_id:
+            # Страница истории отложена (R4): продлить элемент очереди, сбросив
+            # STALE-таймер (`started_at = now`), иначе через час тишины тик вернул
+            # бы элемент в очередь и заказал страницу ЗАНОВО — до трёх живых задач
+            # одной страницы у Engage. Состояние остаётся `running`, попытки не
+            # растут; STALE как страховка от реально пропавших вебхуков не трогается.
+            item = await db.get(BackfillItem, item_id)
+            if item is not None and item.state == "running":
+                item.started_at = clock.utcnow()
+                await db.commit()
+        return {"accepted": 0, "deferred": code or None}
+
     if event != "task_complete":
         logger.info("engage_event_ignored event=%s", event)
         return {"accepted": 0, "ignored": event}
@@ -255,6 +290,12 @@ _ENGAGE_REASON_TEXT: dict[str, str] = {
     "user_banned_in_channel": "аккаунт заблокирован в этом канале",
     "chat_admin_required": "нужны права администратора канала",
     "flood_wait": "Telegram временно ограничил действия аккаунта — попробуйте позже",
+    # Коды откладывания по бюджету (E4). Ключи в нижнем регистре: поиск здесь
+    # идёт по `reason.strip().lower()`, а приходят коды заглавными — иначе тексты
+    # не находились бы никогда. Откладывание — не отказ: задача вернётся сама.
+    "read_budget_exceeded": "суточный бюджет Engage исчерпан — задача отложена и вернётся сама",
+    "budget_per_account": "суточный бюджет Engage исчерпан — задача отложена и вернётся сама",
+    "budget_aggregate": "суточный бюджет Engage исчерпан — задача отложена и вернётся сама",
 }
 
 
