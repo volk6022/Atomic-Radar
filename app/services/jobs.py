@@ -39,8 +39,7 @@ from sqlalchemy import select, update
 from app.core import clock
 from app.db.models import Run
 from app.db.session import get_session_maker
-from app.services import (alerts, discussions, embeddings, engage, llm, queue,
-                          reclassify)
+from app.services import alerts, discovery, discussions, embeddings, engage, llm, queue, reclassify
 
 logger = logging.getLogger("radar.jobs")
 
@@ -53,7 +52,7 @@ ACTIVE = ("queued", "running")
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
 # браузера, и запускать по нему произвольную функцию нельзя.
 KINDS = ("reclassify", "backfill", "channel_add", "export", "discussions",
-         "group_join")
+         "group_join", "discovery_scan", "discovery_check")
 
 
 class JobBusy(Exception):
@@ -234,10 +233,35 @@ async def _job_group_join(run_id: int, params: dict) -> dict:
             report=report, cancelled=cancelled)
 
 
+async def _job_discovery_scan(run_id: int, params: dict) -> dict:
+    """Поиск похожих каналов (сценарий B): Engage → кандидаты → строка поиска.
+
+    Тело — в службе discovery, здесь только обвязка прогона: у обеих сторон
+    свои причины меняться, и связывать их в одном модуле значило бы тянуть
+    Engage в исполнитель задач ради одной строки.
+    """
+    async with _tracked(run_id) as (report, cancelled):
+        return await discovery.run_scan(run_id, params=params,
+                                        report=report, cancelled=cancelled)
+
+
+async def _job_discovery_check(run_id: int, params: dict) -> dict:
+    """Три проверки кандидатов по возрастанию цены: карточка → живость → модель.
+
+    Параметров у прогона нет намеренно: отбор `pending` считается на момент
+    старта, а не на момент постановки — между ними прогон может простоять
+    в очереди, и «кто ждёт проверки» за это время поменяется.
+    """
+    async with _tracked(run_id) as (report, cancelled):
+        return await discovery.run_check(report=report, cancelled=cancelled)
+
+
 RUNNERS: dict[str, Callable[[int, dict], Awaitable[dict]]] = {
     "reclassify": _job_reclassify,
     "discussions": _job_discussions,
     "group_join": _job_group_join,
+    "discovery_scan": _job_discovery_scan,
+    "discovery_check": _job_discovery_check,
 }
 
 
