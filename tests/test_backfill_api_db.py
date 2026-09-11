@@ -37,6 +37,7 @@ from app.core.security import SessionSigner  # noqa: E402
 from app.db.models import (BackfillItem, Base, Channel,  # noqa: E402
                            EngageInstance, User)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
+from app.core import clock  # noqa: E402
 from app.main import create_app  # noqa: E402
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
@@ -230,7 +231,9 @@ def test_depth_can_be_asked_for_and_is_bounded(client, seeded):
     assert ok.status_code in (200, 201, 202), ok.text
     item = _items()[0]
     assert item.target == 300
-    assert (datetime.now(timezone.utc) - item.min_date).days == 7
+    # Теми же часами, что и приложение: conftest сдвигает clock.utcnow() к часам
+    # базы, и сырые datetime.now() отстают от min_date на этот сдвиг — «6 == 7».
+    assert (clock.utcnow() - item.min_date).days == 7
 
     too_much = client.post("/api/v1/backfill/queue",
                            json={"channel_ids": [seeded["joined"]], "target": 50_000})

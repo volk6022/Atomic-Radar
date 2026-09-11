@@ -155,8 +155,12 @@ async def _seed() -> dict:
             # Без наводки, без канала, без времени отправки и без аккаунта: строка,
             # которая проваливается сразу в четырёх местах, если что-то соединено
             # внутренним джойном или окно сравнивается только по `sent_at`.
+            # `recorded_at` — явно, а не server_default: иначе его ставят часы базы в
+            # момент вставки, а верхнюю границу окна — `clock.utcnow()`, выровненный с
+            # базой одним замером в начале теста. Дрейф часов контейнера между
+            # замером и вставкой уводит запись «в будущее» — плавающее `2 == 3`.
             ManualSend(workflow_id=public.id, text="написал тому, кого Radar не нашёл",
-                       recorded_by="owner@local"),
+                       recorded_at=NOW - timedelta(minutes=5), recorded_by="owner@local"),
             # За окном недели, но внутри девяноста дней.
             ManualSend(workflow_id=public.id, target_id=t_awaiting.id,
                        message_id=m_loud.id, engage_account_id=ACCOUNT,
