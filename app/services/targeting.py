@@ -66,14 +66,21 @@ async def bind_active(db) -> list[Bound]:
 
 def verdict_for(bound: Bound, message: Message, *, l2_enabled: bool, l3_enabled: bool,
                 ranked: list[tuple[str, str, float]] | None = None,
-                llm: dict | None = None, now: datetime | None = None) -> dict:
-    """Вердикт каскада по одному сообщению в правилах одного сценария."""
+                llm: dict | None = None, now: datetime | None = None,
+                l1_bypass: bool = False) -> dict:
+    """Вердикт каскада по одному сообщению в правилах одного сценария.
+
+    `l1_bypass` — адресный обход словаря L1 канала-владельца сообщения. Второй
+    конвейер обязан знать тот же флаг, что и старые колонки: иначе `wf_verdicts`
+    молча разошёлся бы с ними, и разница была бы видна только как «цель есть,
+    а лида нет».
+    """
     return cascade.classify(
         text=message.text, is_automatic_forward=message.is_automatic_forward,
         author_is_bot=message.author_is_bot, author_peer_id=message.author_peer_id,
         author_username=message.author_username, tg_date=message.tg_date, now=now,
         l2_enabled=l2_enabled, l3_enabled=l3_enabled, ranked=ranked, llm=llm,
-        profile=bound.profile)
+        profile=bound.profile, l1_bypass=l1_bypass)
 
 
 async def save_verdict(db, *, workflow_id: int, message_id: int, verdict: dict) -> None:
@@ -152,13 +159,18 @@ async def _drop_target(db, target: WfTarget) -> bool:
 
 
 async def sync_target(db, bound: Bound, *, message: Message, channel: Channel,
-                      verdict: dict) -> str:
+                      verdict: dict, create_only: bool = False) -> str:
     """Привести цель сценария в соответствие со свежим вердиктом.
 
     Возвращает, что сделали: `created`, `updated`, `removed`, `unaddressable` или
     `kept`. Строкой, а не булевым: вызывающая сторона считает по ним сводку, и «цель
-    не завелась, потому что писать некому» — совсем не то же самое, что «цель не
-    завелась, потому что сообщение не прошло отбор».
+    не завелась, потому что писать некому» — совсем не то же самое, что «цель
+    не завелась, потому что сообщение не прошло отбор».
+
+    `create_only` — частичный прогон (задан список каналов): только создание,
+    перезапись и удаление пропускаются, исход `kept`. Решение об удалении цели
+    принимается по вердикту, который в частичном прогоне мог измениться из-за
+    новых правил у отмеченных каналов, а не из-за самой цели.
     """
     target = await _existing_target(db, workflow_id=bound.workflow.id,
                                     message_id=message.id)
@@ -171,9 +183,13 @@ async def sync_target(db, bound: Bound, *, message: Message, channel: Channel,
     if not verdict["passed"]:
         if target is None:
             return "kept"
+        if create_only:
+            return "kept"
         return "removed" if await _drop_target(db, target) else "kept"
 
     if target is not None:
+        if create_only:
+            return "kept"
         target.pain = verdict["pain"]
         target.score = verdict["score"]
         target.score_breakdown = verdict["breakdown"]
@@ -201,12 +217,20 @@ async def sync_message(db, bound_list: list[Bound], *, message: Message,
                        ranked: list[tuple[str, str, float]] | None = None,
                        llm_by_prompt: dict[str, dict] | None = None,
                        now: datetime | None = None,
+                       l1_bypass: bool = False,
+                       create_only: bool = False,
                        summary: dict | None = None) -> dict:
     """Посчитать и записать вердикт и цель по одному сообщению во всех сценариях.
 
     `llm_by_prompt` — ответы модели по этому сообщению, по ключу промпта. Каждый
     профиль берёт оттуда свой и только свой: чужой ответ здесь означал бы отбор по
     вопросу, который задавали не про этот контур.
+
+    `l1_bypass` — флаг обхода L1 канала этого сообщения, тот же, что получают старые
+    колонки: два конвейера над одним сообщением обязаны читать одни правила.
+
+    `create_only` — режим частичного прогона: цели только создаются, перезапись
+    и удаление пропускаются (исход `kept`). Подробности у `sync_target`.
 
     Сводка накапливается по ключу сценария, а не суммой: «завели 40 целей» на двух
     конвейерах не говорит ничего — 40 и 0 и 20 и 20 выглядят одинаково.
@@ -216,11 +240,12 @@ async def sync_message(db, bound_list: list[Bound], *, message: Message,
     for bound in bound_list:
         verdict = verdict_for(bound, message, l2_enabled=l2_enabled,
                               l3_enabled=l3_enabled, ranked=ranked,
-                              llm=answers.get(bound.profile.l3_prompt_key), now=now)
+                              llm=answers.get(bound.profile.l3_prompt_key), now=now,
+                              l1_bypass=l1_bypass)
         await save_verdict(db, workflow_id=bound.workflow.id, message_id=message.id,
                            verdict=verdict)
         outcome = await sync_target(db, bound, message=message, channel=channel,
-                                    verdict=verdict)
+                                    verdict=verdict, create_only=create_only)
         per_wf = summary.setdefault(bound.workflow.key, {})
         per_wf[outcome] = per_wf.get(outcome, 0) + 1
     return summary

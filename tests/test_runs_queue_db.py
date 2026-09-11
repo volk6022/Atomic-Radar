@@ -50,7 +50,8 @@ pytestmark = pytest.mark.skipif(
 
 
 async def _seed() -> dict:
-    """Владелец и инстанс Engage — минимум, при котором ручка запуска отвечает.
+    """Владелец, заказчик и инстанс Engage — минимум, при котором ручка запуска
+    отвечает и право на тяжёлый прогон можно проверить по-настоящему.
 
     Инстанс нужен не прогону, а старту приложения: без него `ensure_bootstrap`
     ругается в лог, и шум маскировал бы настоящие сообщения.
@@ -69,9 +70,12 @@ async def _seed() -> dict:
         owner = User(email="owner@local", name="owner", initials="OW", role="owner",
                      password_hash="!нельзя-войти", totp_secret="X" * 32,
                      totp_confirmed=True, is_active=True)
-        db.add(owner)
+        customer = User(email="customer@local", name="customer", initials="CU",
+                        role="customer", password_hash="!нельзя-войти",
+                        totp_secret="X" * 32, totp_confirmed=True, is_active=True)
+        db.add_all([owner, customer])
         await db.commit()
-        out = {"owner": owner.id}
+        out = {"owner": owner.id, "customer": customer.id}
 
     await engine.dispose()
     return out
@@ -152,6 +156,13 @@ def _await_status(run_id: int, status: str, limit: float = 10.0) -> str:
 def _start(client, **params):
     return client.post("/api/v1/runs",
                        json={"kind": "reclassify", "params": params or {"scope": "pending"}})
+
+
+def _login(client: TestClient, uid: int) -> None:
+    """Перелогиниться под другую роль внутри теста (по образцу соседних
+    `test_*_api_db.py`): фикс `client` ставит куку владельца по умолчанию."""
+    token = SessionSigner(get_settings().SECRET_KEY).dumps({"uid": uid, "totp_ok": True})
+    client.cookies.set(get_settings().SESSION_COOKIE, token)
 
 
 # ── очереди нет: прежнее поведение целиком ────────────────────────────────────
@@ -411,3 +422,32 @@ def test_a_swept_run_frees_the_button(client):
         return busy is None
 
     assert asyncio.run(_check()), "помеченная строка всё ещё считается идущей"
+
+
+# ── наверстание истории: channel_ids в params и в имени (T17) ─────────────────
+
+def test_runs_api_accepts_channel_ids(client, seeded, monkeypatch):
+    """Контракт каскада §5.4: API принимает `channel_ids`, хранит их в `params`
+    и дополняет имя прогона списком каналов — чтобы экран Runs отличал
+    наверстание истории от обычного пересчёта. Исполнение списка — дело
+    прогона (`jobs`/`reclassify`), ручка ничего не считает: прогон здесь
+    подменён, как и во всех проверках очереди выше.
+    """
+    async def _fake_runner(run_id: int, params: dict) -> dict:
+        return {"checked": 0}
+
+    monkeypatch.setattr(queue, "enabled", lambda: False)
+    monkeypatch.setitem(jobs.RUNNERS, "reclassify", _fake_runner)
+
+    body = {"kind": "reclassify", "params": {"scope": "all", "channel_ids": [29]}}
+    r = client.post("/api/v1/runs", json=body)
+    assert r.status_code == 200, r.text
+    row = r.json()
+    assert row["params"]["channel_ids"] == [29], row
+    assert "29" in row["name"], row
+
+    # Пересчёт занимает видеокарту — право владельца (`RUN_HEAVY`): заказчику
+    # наверстание не отдают, как и обычный пересчёт.
+    _login(client, seeded["customer"])
+    denied = client.post("/api/v1/runs", json=body)
+    assert denied.status_code == 403, denied.text

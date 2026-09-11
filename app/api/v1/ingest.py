@@ -30,18 +30,21 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 from collections.abc import Mapping
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 
 from app.api.deps import GetDB, permits, requires
 from app.core import clock
 from app.core.access import Capability, Section
+from app.core.cascade import L1_BYPASS_MIN_TEXT
 from app.core.config import get_settings
 from app.db.models import AuditLog, BackfillItem, Channel, Message
 from app.services import alerts, channels as channels_service
+from app.services import cascade_registry
 from app.services import discussions as discussions_service
 from app.services import backfill_drain, engage
 from app.services import ingest as ingest_service
@@ -708,34 +711,135 @@ async def add_channel(body: AddChannelRequest, request: Request, db: GetDB,
 
 class UpdateChannelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    ingest_enabled: bool
+    # Оба выключателя необязательны: None — «это поле не передано, не трогать».
+    # Меняется ровно то, что пришло; пустое тело отвергается ручкой (422 «нечего
+    # менять»), иначе опечатка в имени поля выглядела бы исполненным «ничего
+    # не делать».
+    ingest_enabled: bool | None = None
+    l1_bypass_enabled: bool | None = None
 
 
 @operator_router.patch("/{channel_id}")
 async def update_channel(channel_id: int, body: UpdateChannelRequest, request: Request,
                          db: GetDB, user=permits(Section.CHANNELS, Capability.CHANNEL_ARCHIVE)):
-    """Снять или вернуть отслеживание — отдельно от удаления сообщений (см. ниже).
+    """Снять или вернуть отслеживание — отдельно от удаления сообщений (см. ниже);
+    здесь же выключатель адресного обхода словаря L1 (контракт каскада §5.1).
 
-    Читает и пишет ровно то же поле, что сам себе молча ставит `get_or_create_channel`
-    при первом сообщении: включение здесь не заводит канал заново и не трогает
-    накопленное, только решает, продолжать ли класть новые сообщения.
+    Читает и пишет ровно те же поля, что сам себе молча ставит
+    `get_or_create_channel` при первом сообщении (для `ingest_enabled`):
+    включение здесь не заводит канал заново и не трогает накопленное, только
+    решает, продолжать ли класть новые сообщения.
+
+    Обход включается тем же правом, что и снятие отслеживания
+    (`CHANNEL_ARCHIVE`, только владелец): он тратит карту и меняет отбор, это
+    решение уровня владельца. Нового `Capability` под него нет — матрица прав
+    обязана дословно совпадать с оболочкой, а экраны в эту задачу не входят.
     """
+    # Проверка запроса, а не канала: пустое тело невалидно само по себе,
+    # поэтому 422 стоит раньше 404.
+    if body.ingest_enabled is None and body.l1_bypass_enabled is None:
+        raise HTTPException(422, "нечего менять")
+
     channel = (await db.execute(
         select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
     if channel is None:
         raise HTTPException(404, f"канал {channel_id} не найден")
 
-    was = channel.ingest_enabled
-    channel.ingest_enabled = body.ingest_enabled
-    db.add(AuditLog(
-        user_id=user.id, user_email=user.email, action="channel_tracking_changed",
-        detail={"channel_id": channel_id, "title": channel.title,
-               "from": was, "to": body.ingest_enabled},
-        ip=request.client.host if request.client else None))
+    if body.ingest_enabled is not None:
+        was = channel.ingest_enabled
+        channel.ingest_enabled = body.ingest_enabled
+        db.add(AuditLog(
+            user_id=user.id, user_email=user.email, action="channel_tracking_changed",
+            detail={"channel_id": channel_id, "title": channel.title,
+                   "from": was, "to": body.ingest_enabled},
+            ip=request.client.host if request.client else None))
+
+    if body.l1_bypass_enabled is not None:
+        was_bypass = channel.l1_bypass_enabled
+        channel.l1_bypass_enabled = body.l1_bypass_enabled
+        db.add(AuditLog(
+            user_id=user.id, user_email=user.email,
+            action="channel_l1_bypass_changed",
+            detail={"channel_id": channel_id, "title": channel.title,
+                    "from": was_bypass, "to": body.l1_bypass_enabled},
+            ip=request.client.host if request.client else None))
+
     await db.commit()
-    logger.info("channel_tracking_changed channel=%s from=%s to=%s by=%s",
-               channel_id, was, body.ingest_enabled, user.email)
-    return {"id": channel.id, "ingest_enabled": channel.ingest_enabled}
+    if body.ingest_enabled is not None:
+        logger.info("channel_tracking_changed channel=%s from=%s to=%s by=%s",
+                    channel_id, was, body.ingest_enabled, user.email)
+    if body.l1_bypass_enabled is not None:
+        logger.info("channel_l1_bypass_changed channel=%s from=%s to=%s by=%s",
+                    channel_id, was_bypass, body.l1_bypass_enabled, user.email)
+    return {"id": channel.id, "ingest_enabled": channel.ingest_enabled,
+            "l1_bypass_enabled": channel.l1_bypass_enabled}
+
+
+# Цена одного вердикта L3 — 1,27 секунды: замер 08.09 (АУДИТ 6.1,
+# `_reference/MEASUREMENT-08-09.txt`). Число замера не пересчитывается и в
+# настройку не выносится: это константа ОЦЕНКИ для превью, а не бюджет —
+# реальный поток к L3 режут порог близости (`l1_bypass_pos_min`) и потолок
+# вопросов прогона `l3_limit`.
+L3_VERDICT_SECONDS = 1.27
+
+
+@operator_router.get("/{channel_id}/l1-bypass-preview")
+async def l1_bypass_preview(channel_id: int, db: GetDB,
+                            user=requires(Section.CHANNELS)):
+    """Цена включения адресного обхода L1 для канала — до включения (§5.2).
+
+    Владелец решает, стоит ли тратить карту, глядя на числа: сколько сообщений
+    канала словарь уже убил, сколько из них кандидаты обхода (длиннее
+    `L1_BYPASS_MIN_TEXT`), сколько вопросов L3 и минут карты это стоит по
+    верхней границе. `pos_min` — действующий порог близости: он настраивается
+    строкой `limits`, и превью обязано показывать то, что работает сейчас, а не
+    значение кода. Право на чтение — как у списка каналов: цифры нужны всякому,
+    кто смотрит на канал, а менять они ничего не меняют.
+
+    Счётчики считаются двумя SQL-запросами, без загрузки строк сообщений в
+    Python: таблица самая большая в системе, и превью обязано стоить как
+    счётчик, а не как выборку.
+    """
+    # Первый запрос — сколько всего убито словарём; тем же левым соединением
+    # проверяется существование канала: несуществующий id даёт ноль строк после
+    # группировки, и отдельного похода за каналом не заводится.
+    row = (await db.execute(
+        select(Channel.id, func.count(Message.id))
+        .join(Message, and_(Message.channel_id == Channel.id,
+                            Message.cascade_level == 1,
+                            Message.cascade_passed.is_(False)), isouter=True)
+        .where(Channel.id == channel_id)
+        .group_by(Channel.id))).one_or_none()
+    if row is None:
+        raise HTTPException(404, f"канал {channel_id} не найден")
+    killed_by_l1 = int(row[1])
+
+    # Второй запрос — кандидаты обхода: из убитых длиннее порога, только им
+    # ветка обхода оставляет шанс дойти до L2. Длина — по тем же правилам, что
+    # у ветки обхода (`len(text.strip())`), с той оговоркой, что SQL-TRIM
+    # снимает пробелы, а не весь юникодный whitespace; для верхней границы
+    # оценки этого достаточно.
+    killed_long = int((await db.execute(
+        select(func.count(Message.id)).where(
+            Message.channel_id == channel_id,
+            Message.cascade_level == 1,
+            Message.cascade_passed.is_(False),
+            func.length(func.trim(func.coalesce(Message.text, "")))
+            >= L1_BYPASS_MIN_TEXT))).scalar_one())
+
+    pos_min = (await cascade_registry.read_thresholds(db))[
+        cascade_registry.L1_BYPASS_POS_MIN_LIMIT_KEY]
+
+    return {
+        "killed_by_l1": killed_by_l1,
+        "killed_long": killed_long,
+        # Верхняя граница: столько вопросов L3 выйдет, если порог близости
+        # пропустит всех кандидатов. По замеру проходят единицы процентов,
+        # но обещать владельцу надо худший случай.
+        "expected_l3_questions_max": killed_long,
+        "expected_minutes_max": math.ceil(killed_long * L3_VERDICT_SECONDS / 60),
+        "pos_min": pos_min,
+    }
 
 
 @operator_router.delete("/{channel_id}/messages")

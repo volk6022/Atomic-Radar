@@ -9,6 +9,7 @@
     docker exec api-radar python -m scripts.reclassify --scope pending # только недосчитанное
     docker exec api-radar python -m scripts.reclassify --no-l3
     docker exec api-radar python -m scripts.reclassify --l3-limit 100
+    docker exec api-radar python -m scripts.reclassify --channel-ids 29,31
 """
 from __future__ import annotations
 
@@ -33,11 +34,22 @@ async def main() -> None:
                          "контурах N вопросов покрывают вдвое меньше сообщений")
     ap.add_argument("--scope", choices=reclassify.SCOPES, default="all",
                     help="all — все сообщения, pending — только недосчитанные")
+    ap.add_argument("--channel-ids", default=None,
+                    help="пересчитать только перечисленные каналы — id через запятую "
+                         "(например 29,31); наверстание истории канала после включения "
+                         "ему обхода L1. Такой прогон только создаёт лиды: перезапись "
+                         "оценок и удаление у существующих пропускаются")
     args = ap.parse_args()
+
+    channel_ids = None
+    if args.channel_ids is not None:
+        channel_ids = [int(x) for x in args.channel_ids.split(",") if x.strip()]
 
     l2_enabled = embeddings.enabled() and not args.no_l2
     l3_enabled = llm.enabled() and not args.no_l3
-    log.info("охват: %s; ступени: L0/L1 всегда, L2 %s, L3 %s", args.scope,
+    log.info("охват: %s; каналы: %s; ступени: L0/L1 всегда, L2 %s, L3 %s",
+             args.scope,
+             ", ".join(map(str, channel_ids)) if channel_ids is not None else "все",
              "вкл" if l2_enabled else "выкл", "вкл" if l3_enabled else "выкл")
 
     async def report(pct, note):
@@ -46,7 +58,8 @@ async def main() -> None:
     async with get_session_maker()() as db:
         summary = await reclassify.run(
             db, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
-            l3_limit=args.l3_limit, scope=args.scope, report=report)
+            l3_limit=args.l3_limit, scope=args.scope, channel_ids=channel_ids,
+            report=report)
 
     await embeddings.close()
     await llm.close()

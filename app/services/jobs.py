@@ -163,11 +163,16 @@ async def _job_reclassify(run_id: int, params: dict) -> dict:
     l2 = embeddings.enabled() and params.get("l2", True)
     l3 = llm.enabled() and params.get("l3", True)
     limit = params.get("l3_limit")
+    # Список каналов проходит насквозь без разбора: «наверстать историю канала» —
+    # тот же прогон, суженный списком, и режим create-only включает само ядро,
+    # а не эта обвязка.
+    channel_ids = params.get("channel_ids")
 
     async with _tracked(run_id) as (report, cancelled):
         async with get_session_maker()() as db:
             return await reclassify.run(db, l2_enabled=l2, l3_enabled=l3,
                                         l3_limit=limit, scope=scope,
+                                        channel_ids=channel_ids,
                                         report=report, cancelled=cancelled)
 
 

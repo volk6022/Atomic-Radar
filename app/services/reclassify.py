@@ -62,12 +62,13 @@ def _never_cancelled() -> bool:
     return False
 
 
-def _run_l0l1(m: Message, *, l2_enabled: bool, l3_enabled: bool) -> dict:
+def _run_l0l1(m: Message, *, l2_enabled: bool, l3_enabled: bool,
+              l1_bypass: bool = False) -> dict:
     return cascade.classify(
         text=m.text, is_automatic_forward=m.is_automatic_forward,
         author_is_bot=m.author_is_bot, author_peer_id=m.author_peer_id,
         author_username=m.author_username, tg_date=m.tg_date,
-        l2_enabled=l2_enabled, l3_enabled=l3_enabled)
+        l2_enabled=l2_enabled, l3_enabled=l3_enabled, l1_bypass=l1_bypass)
 
 
 def _apply(m: Message, v: dict) -> None:
@@ -84,6 +85,7 @@ def _wf_verdicts(bound: list[targeting.Bound], messages: list[Message], *,
                  l2_enabled: bool, l3_enabled: bool,
                  ranked: dict[int, list],
                  llm_answers: dict[int, dict[str, dict]],
+                 channels: dict[int, Channel],
                  ) -> dict[tuple[int, int], dict]:
     """Вердикты всех сценариев по всем сообщениям — из того, что посчитано на сейчас.
 
@@ -94,11 +96,16 @@ def _wf_verdicts(bound: list[targeting.Bound], messages: list[Message], *,
 
     Ответ модели берётся по ключу промпта самого профиля: чужой здесь означал бы
     отбор по вопросу, заданному не про этот контур.
+
+    Флаг обхода L1 берётся у канала сообщения: второй конвейер обязан судить
+    сообщение по тем же правилам, что и старые колонки, иначе `wf_verdicts` молча
+    разошёлся бы с ними.
     """
     return {(b.workflow.id, m.id): targeting.verdict_for(
                 b, m, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
                 ranked=ranked.get(m.id),
-                llm=llm_answers.get(m.id, {}).get(b.profile.l3_prompt_key))
+                llm=llm_answers.get(m.id, {}).get(b.profile.l3_prompt_key),
+                l1_bypass=channels[m.channel_id].l1_bypass_enabled)
             for b in bound for m in messages}
 
 
@@ -152,8 +159,14 @@ def _l3_jobs(messages: list[Message], verdicts: dict, wf_verdicts: dict,
     return jobs
 
 
-async def _select_messages(db, scope: str, bound: list[targeting.Bound]) -> list[Message]:
+async def _select_messages(db, scope: str, bound: list[targeting.Bound],
+                           channel_ids: list[int] | None = None) -> list[Message]:
     stmt = select(Message)
+    if channel_ids is not None:
+        # Частичный прогон: только перечисленные каналы, для любого охвата.
+        # Наверстание истории канала — это тот же прогон, суженный списком, а не
+        # отдельный механизм (контракт §6).
+        stmt = stmt.where(Message.channel_id.in_(channel_ids))
     if scope == "pending":
         # Только то, что ещё не досчитано: новое из ингеста и застрявшее на ступени,
         # которая в прошлый раз была недоступна. На двенадцати тысячах сообщений это
@@ -177,7 +190,8 @@ async def _select_messages(db, scope: str, bound: list[targeting.Bound]) -> list
 
 
 async def _stage_l2(db, waiting, verdicts, *, l3_enabled, report, cancelled,
-                    base: float, ranked_out: dict[int, list]) -> int:
+                    base: float, ranked_out: dict[int, list],
+                    channels: dict[int, Channel]) -> int:
     """Досчитать L2 у всех, кто ждёт вектора.
 
     Список ожидающих приходит снаружи: он собран по всем сценариям сразу, потому что
@@ -201,11 +215,15 @@ async def _stage_l2(db, waiting, verdicts, *, l3_enabled, report, cancelled,
             # L1 — дописать ему вердикт L2 значило бы сдвинуть прежнее поведение.
             if not (verdicts[m.id]["passed"] is None and verdicts[m.id]["level"] == 1):
                 continue
+            # Флаг обхода обязателен и здесь: обходное сообщение ждёт вектора
+            # с вердиктом «уровень 1, в пути», и достройка без флага судила бы его
+            # словарём заново — то есть убивала бы то, что канал решил пропустить.
             v = cascade.classify(
                 text=m.text, is_automatic_forward=m.is_automatic_forward,
                 author_is_bot=m.author_is_bot, author_peer_id=m.author_peer_id,
                 author_username=m.author_username, tg_date=m.tg_date,
-                l2_enabled=True, l3_enabled=l3_enabled, ranked=ranked)
+                l2_enabled=True, l3_enabled=l3_enabled, ranked=ranked,
+                l1_bypass=channels[m.channel_id].l1_bypass_enabled)
             verdicts[m.id] = v
             _apply(m, v)
             passed += int(v["passed"] is not False)
@@ -340,7 +358,8 @@ def _apply_legacy_l3(messages: list[Message], verdicts: dict,
         _apply(m, v)
 
 
-async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
+async def _reconcile_leads(db, messages, verdicts, *, create_only: bool = False,
+                           skipped: dict[str, int] | None = None) -> tuple[int, int, int]:
     """Привести очередь лидов в соответствие со свежими вердиктами.
 
     Лид, переставший проходить каскад, из очереди убирается — держать в ней то, что
@@ -359,12 +378,22 @@ async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
 
     Поэтому: неразобранный черновик (`pending`) удаляется вместе с лидом — решения в
     нём нет, терять нечего; разобранный оставляет лид на месте.
+
+    `create_only` — частичный прогон (задан список каналов, контракт §6.1): только
+    создание. Перезапись оценок и удаление пропускаются — решение о них принимается
+    по вердикту, который в частичном прогоне мог измениться из-за новых правил
+    отмеченных каналов, а не из-за самого лида. Сколько действий пропущено, функция
+    кладёт в переданный словарь `skipped`: ключи `"updates"` и `"removals"`.
+    Лид, который и в обычном режиме остался бы на месте (человеческий статус,
+    решение по черновику, «ещё в пути»), считается `kept` — его ничего не
+    пропускает, он и так не трогался.
     """
     leads = {row.message_id: row
              for row in (await db.execute(select(Lead))).scalars().all()}
     drafts = {row.lead_id: row
               for row in (await db.execute(select(Draft))).scalars().all()}
     created = removed = kept = 0
+    skipped = {} if skipped is None else skipped
 
     for m in messages:
         v = verdicts[m.id]
@@ -380,9 +409,12 @@ async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
                 status="new"))
             created += 1
         elif v["passed"] and lead is not None:
-            lead.score, lead.score_breakdown = v["score"], v["breakdown"]
-            lead.pain, lead.disqualifiers = v["pain"], v["disqualifiers"]
-            kept += 1
+            if create_only:
+                skipped["updates"] = skipped.get("updates", 0) + 1
+            else:
+                lead.score, lead.score_breakdown = v["score"], v["breakdown"]
+                lead.pain, lead.disqualifiers = v["pain"], v["disqualifiers"]
+                kept += 1
         elif not v["passed"] and lead is not None:
             # `passed is None` — «ещё в пути», это не повод удалять лид: сообщение
             # просто не досчитали, а не признали мусором.
@@ -395,10 +427,16 @@ async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
             else:
                 draft = drafts.get(lead.id)
                 if draft is not None and draft.state != "pending":
-                    log.warning("лид %s больше не проходит каскад, но по нему уже есть "
-                                "решение по черновику («%s») — оставлен как есть",
-                                lead.id, draft.state)
+                    if not create_only:
+                        log.warning("лид %s больше не проходит каскад, но по нему уже "
+                                    "есть решение по черновику («%s») — оставлен как есть",
+                                    lead.id, draft.state)
                     kept += 1
+                elif create_only:
+                    # Частичный прогон удаляет только «на бумаге»: сюда доходят ровно
+                    # те, кого обычный прогон удалил бы (статус `new`, черновика нет
+                    # или он неразобранный).
+                    skipped["removals"] = skipped.get("removals", 0) + 1
                 else:
                     # Порядок важен: сначала черновик, потом лид. Обратный порядок —
                     # это то самое нарушение внешнего ключа, ради которого всё писалось.
@@ -412,19 +450,26 @@ async def _reconcile_leads(db, messages, verdicts) -> tuple[int, int, int]:
 
 async def _reconcile_targets(db, bound, messages, *, l2_enabled: bool, l3_enabled: bool,
                              ranked: dict[int, list],
-                             llm_answers: dict[int, dict]) -> dict:
+                             llm_answers: dict[int, dict],
+                             channels: dict[int, Channel],
+                             create_only: bool = False) -> dict:
     """Записать вердикты сценариев и привести их цели в соответствие.
 
     Отдельным проходом после `_reconcile_leads`, а не внутри него: очередь лидов и
     цели сценариев — две независимые витрины над одними и теми же вердиктами, и
     смешивать их правила в одном цикле значило бы получить место, где починка одной
     молча меняет другую.
+
+    Словарь каналов приходит выбранным в `run` до цикла L0/L1 — тот же запрос,
+    что даёт флаг обхода L1; второй выбор всех каналов за прогон был бы вторым
+    местом той же правды.
+
+    `create_only` — частичный прогон: цели только создаются, перезапись и удаление
+    пропускаются (`kept`), по той же причине, что и у очереди лидов.
     """
     if not bound:
         return {}
 
-    channels = {c.id: c for c in
-                (await db.execute(select(Channel))).scalars().all()}
     wf_summary: dict = {}
     for m in messages:
         channel = channels.get(m.channel_id)
@@ -437,13 +482,24 @@ async def _reconcile_targets(db, bound, messages, *, l2_enabled: bool, l3_enable
         await targeting.sync_message(
             db, bound, message=m, channel=channel, l2_enabled=l2_enabled,
             l3_enabled=l3_enabled, ranked=ranked.get(m.id),
-            llm_by_prompt=llm_answers.get(m.id), summary=wf_summary)
+            llm_by_prompt=llm_answers.get(m.id),
+            l1_bypass=channel.l1_bypass_enabled, create_only=create_only,
+            summary=wf_summary)
     return wf_summary
 
 
 async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = None,
-              scope: str = "all", report=None, cancelled=None) -> dict:
+              scope: str = "all", channel_ids: list[int] | None = None,
+              report=None, cancelled=None) -> dict:
     """Прогнать каскад и вернуть сводку.
+
+    `channel_ids` сужает прогон перечисленными каналами (для любого охвата) —
+    так наверстывается история одного канала после включения ему обхода L1.
+    Задан список — прогон идёт в режиме «только создавать»: существующие лиды
+    и цели не перезаписываются и не удаляются, пропущенные действия считаются
+    в `skipped_updates`/`skipped_removals` (контракт §6.1: частичный охват не
+    даёт права выносить приговор тому, что прогон не пересчитывал). Связка
+    «список задан ⇒ create-only» жёсткая, отдельным параметром не разносится.
 
     Коммит делается один раз в конце — включая случай отмены: то, что успели
     посчитать, терять незачем, а частично разобранный поток ничем не хуже
@@ -453,20 +509,27 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         raise ValueError(f"неизвестный охват «{scope}», ожидается один из {SCOPES}")
     report = report or _noop_report
     cancelled = cancelled or _never_cancelled
+    create_only = channel_ids is not None
 
     # Профили ищутся до первой записи и до выборки: чужой ключ профиля в реестре
     # должен уронить прогон на старте, а не на середине, оставив половину сообщений
     # пересчитанной. Выборке же реестр нужен, чтобы понимать, кто ещё не досчитан.
     bound = await targeting.bind_active(db)
 
-    messages = await _select_messages(db, scope, bound)
+    messages = await _select_messages(db, scope, bound, channel_ids=channel_ids)
     summary = {"scope": scope, "messages": len(messages), "l2": l2_enabled,
                "l3": l3_enabled, "cancelled": False,
                "created": 0, "removed": 0, "kept": 0,
+               "skipped_updates": 0, "skipped_removals": 0,
                "l3_questions": 0, "workflows": {}}
     if not messages:
         await report(100, "нечего пересчитывать")
         return summary
+
+    # Каналы — одним запросом до цикла L0/L1: отсюда берётся флаг обхода L1 для
+    # обеих ступеней и обоих конвейеров, а заодно и канал для целей сценариев.
+    channels = {c.id: c for c in
+                (await db.execute(select(Channel))).scalars().all()}
 
     was_cancelled = False
     verdicts: dict[int, dict] = {}
@@ -477,7 +540,8 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
     try:
         await report(0, f"сообщений в работе: {len(messages)}")
         for m in messages:
-            v = _run_l0l1(m, l2_enabled=l2_enabled, l3_enabled=l3_enabled)
+            v = _run_l0l1(m, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
+                          l1_bypass=channels[m.channel_id].l1_bypass_enabled)
             verdicts[m.id] = v
             _apply(m, v)
         alive = sum(1 for v in verdicts.values() if v["passed"] is not False)
@@ -487,15 +551,16 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         if l2_enabled:
             wf_now = _wf_verdicts(bound, messages, l2_enabled=l2_enabled,
                                   l3_enabled=l3_enabled, ranked=ranked,
-                                  llm_answers=llm_answers)
+                                  llm_answers=llm_answers, channels=channels)
             await _stage_l2(db, _waiting_at(1, messages, verdicts, wf_now, bound),
                             verdicts, l3_enabled=l3_enabled, report=report,
-                            cancelled=cancelled, base=base, ranked_out=ranked)
+                            cancelled=cancelled, base=base, ranked_out=ranked,
+                            channels=channels)
         base += WEIGHTS["l2"]
         if l3_enabled:
             wf_now = _wf_verdicts(bound, messages, l2_enabled=l2_enabled,
                                   l3_enabled=l3_enabled, ranked=ranked,
-                                  llm_answers=llm_answers)
+                                  llm_answers=llm_answers, channels=channels)
             asked = await _stage_l3(
                 db, _l3_jobs(messages, verdicts, wf_now, bound), limit=l3_limit,
                 report=report, cancelled=cancelled, base=base,
@@ -507,11 +572,17 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         summary["cancelled"] = True
         await report(None, "остановлено; посчитанное сохранено")
 
-    created, removed, kept = await _reconcile_leads(db, messages, verdicts)
+    skipped: dict[str, int] = {}
+    created, removed, kept = await _reconcile_leads(db, messages, verdicts,
+                                                    create_only=create_only,
+                                                    skipped=skipped)
     summary.update(created=created, removed=removed, kept=kept)
+    summary["skipped_updates"] = skipped.get("updates", 0)
+    summary["skipped_removals"] = skipped.get("removals", 0)
     summary["workflows"] = await _reconcile_targets(
         db, bound, messages, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
-        ranked=ranked, llm_answers=llm_answers)
+        ranked=ranked, llm_answers=llm_answers, channels=channels,
+        create_only=create_only)
 
     # Счётчик лидов в канале — производная величина. При частичном охвате пересчитать
     # её по одним лишь тронутым сообщениям нельзя: получится «в канале два лида»
@@ -520,7 +591,7 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         select(Message.channel_id, func.count(Message.id))
         .where(Message.cascade_passed.is_(True))
         .group_by(Message.channel_id))).all())
-    for channel in (await db.execute(select(Channel))).scalars().all():
+    for channel in channels.values():
         channel.leads_total = counts.get(channel.id, 0)
 
     await db.commit()

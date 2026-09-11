@@ -9,6 +9,10 @@
 поэтому `reclassify --scope all` падал нарушением ключа на первом же таком лиде и
 откатывал весь прогон целиком.
 
+Здесь же — частичный прогон по списку каналов (T12, T13 из `_TESTS-cascade.md`):
+задан список — прогон только создаёт лиды, перезапись оценок и удаление
+пропускаются, и пропущенное видно в сводке.
+
 База берётся из `RADAR_TEST_DATABASE_URL`; без переменной тесты пропускаются.
 """
 from __future__ import annotations
@@ -21,7 +25,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.models import Base, Channel, Draft, Lead, Message
-from app.services import reclassify
+from app.services import embeddings, llm, reclassify
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
 
@@ -44,13 +48,21 @@ async def db():
     await engine.dispose()
 
 
-async def seed(db, *, lead_status="new", draft_state=None):
-    """Сообщение, лид по нему и, если попросили, черновик в заданном состоянии."""
-    channel = Channel(peer_id=-1001, username="ch", title="Канал")
+async def seed(db, *, lead_status="new", draft_state=None, bypass=False,
+               age: timedelta | None = None, breakdown=None):
+    """Сообщение, лид по нему и, если попросили, черновик в заданном состоянии.
+
+    `bypass` — канал с включённым обходом L1 (для частичных прогонов по списку
+    каналов); `age` — возраст сообщения (свежесть оценки считается от `tg_date`);
+    `breakdown` — разбор оценки, посаженный в лид напрямую.
+    """
+    channel = Channel(peer_id=-1001, username="ch", title="Канал",
+                      l1_bypass_enabled=bypass)
     db.add(channel)
     await db.flush()
 
-    message = Message(channel_id=channel.id, tg_message_id=1000, tg_date=NOW,
+    message = Message(channel_id=channel.id, tg_message_id=1000,
+                      tg_date=(NOW - age) if age else NOW,
                       author_peer_id=500, author_username="user", author_name="Имя",
                       author_is_bot=False, is_automatic_forward=False,
                       text="не могу оплатить инвойс, помогите разобраться",
@@ -60,7 +72,8 @@ async def seed(db, *, lead_status="new", draft_state=None):
 
     lead = Lead(message_id=message.id, channel_id=channel.id, author_peer_id=500,
                 author_username="user", author_name="Имя", pain="не может оплатить за рубеж",
-                quote="цитата", score=50, status=lead_status)
+                quote="цитата", score=50, score_breakdown=breakdown,
+                status=lead_status)
     db.add(lead)
     await db.flush()
 
@@ -194,3 +207,86 @@ async def test_a_whole_run_no_longer_dies_on_the_first_such_lead(db):
     assert leads_left == 1 and drafts_left == 1
     survivor = (await db.execute(select(Lead))).scalar_one()
     assert survivor.id == keep_me.id
+
+
+# ── частичный прогон по списку каналов: только создавать ──────────────────────
+
+# Заглушки ступеней — те же, что в `tests/test_l1_bypass_db.py`: эмбеддер всегда
+# отдаёт одну картину близости, модель всегда соглашается.
+RANKED_POS = [("pos", "банк не пропускает платёж", 0.60), ("neg", "офтоп", 0.40)]
+RANKED_NOISE = [("neg", "болтовня по теме, проблемы нет", 0.81),
+                ("pos", "не может оплатить за рубеж", 0.60)]
+LLM_YES = {"real_problem": True, "is_seller": False,
+           "answering_someone_else": False, "why": "…"}
+
+
+def stub_stages(monkeypatch, ranked=RANKED_POS):
+    async def fake_prototype_vectors():
+        return []
+
+    async def fake_embed(texts):
+        return [[0.0] for _ in texts]
+
+    async def fake_verdict(*, text, context, prompt_key):
+        return dict(LLM_YES), None
+
+    monkeypatch.setattr(embeddings, "enabled", lambda: True)
+    monkeypatch.setattr(embeddings, "prototype_vectors", fake_prototype_vectors)
+    monkeypatch.setattr(embeddings, "embed", fake_embed)
+    monkeypatch.setattr(embeddings, "rank", lambda vector, protos: list(ranked))
+    monkeypatch.setattr(llm, "verdict", fake_verdict)
+
+
+async def test_channel_scoped_run_creates_but_never_updates_leads(db, monkeypatch):
+    """T12: прогон по списку каналов заводит новые лиды, но не дышит на существующие.
+
+    Без create-only свежесть пересчиталась бы в 0 (сообщению 8 суток) и оценка
+    стала бы 40 — ровно этот сдвиг оценок у заведённых лидов и запрещён.
+    """
+    stub_stages(monkeypatch)
+    m1, lead = await seed(db, bypass=True, age=timedelta(days=8),
+                          breakdown=[{"label": "свежесть", "value": 10}])
+    channel_id, lead_id = m1.channel_id, lead.id
+    m2 = Message(channel_id=channel_id, tg_message_id=1001, tg_date=NOW,
+                 author_peer_id=501, author_username="user2", author_name="Имя 2",
+                 author_is_bot=False, is_automatic_forward=False,
+                 text="а" * 250, cascade_level=1, cascade_passed=False,
+                 processed_at=NOW)
+    db.add(m2)
+    await db.commit()
+    m2_id = m2.id
+
+    summary = await reclassify.run(db, l2_enabled=True, l3_enabled=True,
+                                   scope="all", channel_ids=[channel_id])
+
+    assert summary["created"] == 1, "создан ровно один новый лид — по m2"
+    assert summary["skipped_updates"] == 1, "перезапись лида m1 пропущена"
+    still = (await db.execute(
+        select(Lead).where(Lead.id == lead_id))).scalar_one()
+    assert still.score == 50, "оценка существующего лида не сдвинулась"
+    assert still.score_breakdown == [{"label": "свежесть", "value": 10}]
+    assert still.status == "new"
+    m2_after = (await db.execute(
+        select(Message).where(Message.id == m2_id))).scalar_one()
+    assert m2_after.cascade_level == 3 and m2_after.cascade_passed is True, \
+        "мёртвое словарём сообщение ожило через обход и дошло до L3"
+    fresh = (await db.execute(
+        select(Lead).where(Lead.message_id == m2_id))).scalars().all()
+    assert len(fresh) == 1 and fresh[0].status == "new"
+
+
+async def test_channel_scoped_run_never_removes_leads(db, monkeypatch):
+    """T13: решение об удалении в частичном прогоне не выносится вовсе — вердикт
+    мог измениться из-за новых правил отмеченного канала, а не из-за сообщения."""
+    stub_stages(monkeypatch, ranked=RANKED_NOISE)
+    m3, lead = await seed(db, bypass=True)
+    m3.cascade_level = 3
+    await db.commit()
+    lead_id, channel_id = lead.id, m3.channel_id
+
+    summary = await reclassify.run(db, l2_enabled=True, l3_enabled=True,
+                                   scope="all", channel_ids=[channel_id])
+
+    leads = (await db.execute(select(Lead))).scalars().all()
+    assert len(leads) == 1 and leads[0].id == lead_id, "лид обязан остаться"
+    assert summary["skipped_removals"] == 1, "отказ от удаления виден в сводке"

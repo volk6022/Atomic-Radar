@@ -182,6 +182,13 @@ async def start_run(body: StartRequest, request: Request, db: GetDB,
     if body.kind == "reclassify":
         scope = body.params.get("scope") or "pending"
         name += " · " + ("всё" if scope == "all" else "недосчитанное")
+        # Наверстание истории (контракт каскада §5.4): прогон с `channel_ids` —
+        # не обычный пересчёт, и экран Runs обязан их различать. Список едет и
+        # в `params` — здесь он дублируется в имени для человека; исполняет его
+        # прогон, ручка ничего не считает.
+        ids = body.params.get("channel_ids")
+        if isinstance(ids, list) and ids:
+            name += " · каналы " + ", ".join(str(i) for i in ids)
 
     try:
         run = await jobs.start(db, kind=body.kind, params=body.params, name=name,

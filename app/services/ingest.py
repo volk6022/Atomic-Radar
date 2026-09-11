@@ -95,6 +95,9 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
         author_peer_id=author_peer_id, author_username=author_username,
         tg_date=tg_date, now=now,
         l2_enabled=embeddings.enabled(), l3_enabled=llm.enabled(),
+        # Адресный обход L1 — свойство канала (§1.2): ядро каскада остаётся без БД
+        # и получает признак явным параметром, как профиль.
+        l1_bypass=channel.l1_bypass_enabled,
     )
 
     values = {
@@ -139,7 +142,7 @@ async def upsert_message(db, *, channel: Channel, tg_message_id: int,
         await targeting.sync_message(
             db, bound, message=message, channel=channel,
             l2_enabled=embeddings.enabled(), l3_enabled=llm.enabled(),
-            now=now, summary=summary)
+            now=now, l1_bypass=channel.l1_bypass_enabled, summary=summary)
 
     return message, created
 
