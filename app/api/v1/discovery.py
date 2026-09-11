@@ -2,8 +2,8 @@
 
 HTTP-поверхность над службой (`app/services/discovery.py`), а не вторая её копия:
 три проверки кандидатов ведёт тик и прогоны, экрану же нужны четыре вещи —
-смотреть список, запустить поиск, вынести решение, увидеть остаток дневного
-лимита. Всё, что не это, живёт в службе.
+смотреть список, запустить поиск, вынести решение, увидеть объём прогона.
+Всё, что не это, живёт в службе.
 
 Ручки `connect` здесь НЕТ (§3.4): подключение зовёт существующий
 `POST /api/v1/channels`, а статус `connected` кандидату проставляет тик —
@@ -91,22 +91,6 @@ def _query_row(q: DiscoveryQuery) -> dict:
             "created_at": _iso(q.created_at)}
 
 
-async def _searches_today(db) -> tuple[int, int]:
-    """Сколько поисков потрачено сегодня и каков потолок. Окно — те же UTC-сутки,
-    что у уникальности `discovery_queries` (§1.2): у индекса и счётчика обязана
-    быть одна граница, иначе «не повторяется» и «не больше пяти» считали бы
-    разные дни. Границу берём у службы (`_utc_day_start`), а не дублируем
-    арифметику: разъехаться им нельзя, а приватное имя здесь — цена за то,
-    чтобы окно жило в одном месте."""
-    day_start = discovery_service._utc_day_start()
-    used = (await db.execute(
-        select(func.count(DiscoveryQuery.id)).where(
-            DiscoveryQuery.created_at >= day_start))).scalar_one()
-    limit = int((await discovery_service.thresholds(db))
-                ["discovery_searches_per_day"])
-    return used, limit
-
-
 # ── §3.1 — список кандидатов ──────────────────────────────────────────────────
 
 @router.get("/candidates")
@@ -190,18 +174,13 @@ async def scan(body: ScanRequest, request: Request, db: GetDB,
     вошедший.
 
     Ответ 202 означает «прогон заведён», а не «найдено»: сам поиск ведёт прогон
-    `discovery_scan`, проверки найденного — тик (§4.4). Дневной лимит проверяется
-    здесь и ДО постановки: поиск — разовое действие человека, и «кнопка нажалась,
-    а прогон молча умер в очереди» — худший из исходов (образец отказа — `JobBusy`).
+    `discovery_scan`, проверки найденного — тик (§4.4). Суточного лимита поисков
+    нет (Решение 1: «пять поисков» — объём одного прогона, и потолок этот живёт
+    в службе, куда общей ручке прогонов хода нет): сверху стоят один прогон за
+    раз (`JobBusy`), уникальность цели в UTC-сутки ниже и read-бюджеты самого
+    Engage.
     """
     _check(body.kind, DiscoveryQuery.KINDS, "вид поиска")
-
-    used, per_day = await _searches_today(db)
-    if used >= per_day:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"дневной лимит поисков исчерпан ({used} из {per_day}), "
-            f"продолжайте завтра")
 
     seed_channel_id: int | None = None
     query_text: str | None = None
@@ -383,23 +362,26 @@ async def decide(candidate_id: int, body: DecideRequest, request: Request,
 async def list_queries(db: GetDB, user=requires(Section.CHANNELS),
                        limit: int = Query(50, ge=1, le=500),
                        offset: int = Query(0, ge=0)):
-    """История поисков с остатком дневного лимита.
+    """История поисков и объём одного прогона.
 
     Без сортировки и фильтров намеренно: история одна, и порядок у неё жёсткий —
     свежие поиски сверху (`created_at DESC, id DESC`, образец «без сортировки» —
     очередь дочитывания). Параметров сортировки у ручки нет вовсе, чтобы экран
     не мог попросить порядок, которым история не читается.
 
-    `today` нужен экрану ДО нажатия кнопки: показывать кнопку, которая заведомо
-    упрётся в лимит, — способ собрать раздражённое «почему не работает». Счётчик
-    и лимит — те же, что проверяет `scan`: одно окно, одно число (§3.5).
+    `per_run` — объём одного прогона (`discovery_queries_per_scan`): сколько
+    поисковых заказов Engage сделает один запуск поиска. Это собственный лимит
+    Radar, НЕ остаток Engage. Суточного счётчика поисков больше не существует
+    (Решение 1), и остатка «на сегодня» ручка не показывает — остаток поисков
+    как понятие удалено.
     """
     total = (await db.execute(select(func.count(DiscoveryQuery.id)))).scalar_one()
     rows = (await db.execute(
         select(DiscoveryQuery)
         .order_by(DiscoveryQuery.created_at.desc(), DiscoveryQuery.id.desc())
         .limit(limit).offset(offset))).scalars().all()
-    used, per_day = await _searches_today(db)
+    per_run = int((await discovery_service.thresholds(db))
+                  ["discovery_queries_per_scan"])
     return {"total": total, "limit": limit, "offset": offset,
             "rows": [_query_row(q) for q in rows],
-            "today": {"used": used, "limit": per_day}}
+            "per_run": {"queries": per_run}}

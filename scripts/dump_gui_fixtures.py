@@ -122,8 +122,8 @@ async def extras(db) -> None:
 
     account = Account(engage_account_id=12, engage_instance=instance.key,
                       label="acc-12", status="active", phone_country="RU",
-                      proxy_country="DE", tz_offset=3, limit_day=20,
-                      limit_hour=4, last_action_at=NOW - timedelta(hours=2),
+                      proxy_country="DE", tz_offset=3,
+                      last_action_at=NOW - timedelta(hours=2),
                       watcher_uptime=99.4)
     db.add(account)
     await db.flush()
@@ -226,7 +226,7 @@ async def _attribution_and_comment(db, first_account: Account) -> None:
     """
     db.add(Account(engage_account_id=13, engage_instance=first_account.engage_instance,
                    label="acc-13", status="warmup", phone_country="RU",
-                   proxy_country="RU", tz_offset=3, limit_day=20, limit_hour=4))
+                   proxy_country="RU", tz_offset=3))
 
     targets = (await db.execute(select(WfTarget))).scalars().all()
     messages = {m.id: m for m in (await db.execute(

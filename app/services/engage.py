@@ -158,6 +158,25 @@ async def fleet_health(*, instance: str | None = None) -> dict:
     return await _get("/v1/fleet/health", instance=instance)
 
 
+async def limits(*, account_ids: list[int] | None = None,
+                 instance: str | None = None) -> dict:
+    """Остатки лимитов флота: `GET /v1/limits` (E1). Ответ Engage — как есть.
+
+    Клиент не пересобирает и не выбрасывает поля: потребители читают из ответа
+    разные величины (план вступлений — остатки `joins_per_day`, экран флота —
+    ещё и `messages_per_day`), и общая для всех форма — форма самого Engage.
+
+    Маршрут появился не сразу, поэтому старая версия Engage отвечает 404, а
+    недоступный Engage рвёт соединение: оба случая `_get` превращает в
+    `EngageUnavailable`, и клиент сознательно их НЕ различает — реакция
+    потребителя одна (деградация на его стороне).
+    """
+    path = "/v1/limits"
+    if account_ids:
+        path += "?account_ids=" + ",".join(str(a) for a in account_ids)
+    return await _get(path, instance=instance)
+
+
 async def action(*, account_id: int, action: str, payload: dict, webhook_url: str,
                  priority: int = 5, instance: str | None = None) -> dict:
     """Поставить задачу в Engage. Отсюда доступны ТОЛЬКО read-действия.

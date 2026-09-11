@@ -223,10 +223,13 @@ async def _job_group_join(run_id: int, params: dict) -> dict:
         if not accounts:
             raise RuntimeError("во флоте Engage нет активных аккаунтов")
 
-        per_account = int(params.get("per_account")
-                          or discussions.JOINS_PER_ACCOUNT_PER_DAY)
+        # Без дефолта-константы: настоящий потолок — остаток Engage, его прогон
+        # спрашивает сам при планировании; None — «сколько позволит Engage».
+        per_account = params.get("per_account")
+        ceiling = (f"потолок {per_account} на аккаунт" if per_account is not None
+                   else "потолок — остаток Engage")
         await report(0, f"групп без вступления {len(group_ids)}, "
-                        f"аккаунтов {len(accounts)}, потолок {per_account} на аккаунт")
+                        f"аккаунтов {len(accounts)}, {ceiling}")
         return await discussions.join_groups(
             group_ids=group_ids, account_ids=accounts, per_account=per_account,
             subscribed_by=params.get("subscribed_by") or "",

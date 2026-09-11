@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -32,6 +33,7 @@ from app.db.models import (AuditLog, Base, Channel, ChannelCandidate,  # noqa: E
                            DiscoveryQuery, EngageInstance, Run, User)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.services import engage  # noqa: E402
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
 
@@ -303,38 +305,110 @@ def test_decide_writes_the_decision_and_the_audit_row(client, seeded):
 
 # ── §3.2 — запуск поиска ──────────────────────────────────────────────────────
 
-def _spend_daily_limit(n: int = 5) -> None:
-    """n поисков «сегодня»: строки discovery_queries с разными запросами —
-    уникальность окна между собой они не нарушают."""
+def _seed_searched(*, query: str) -> None:
+    """Строка «эту цель уже искали сегодня»: дедуп цели ручка проверяет по
+    строкам `discovery_queries`, и в seeded-данных их нет."""
     async def go():
         engine = create_async_engine(DB_URL, poolclass=None)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         async with maker() as db:
-            for i in range(n):
-                db.add(DiscoveryQuery(kind="search", query=f"запрос номер {i}",
-                                      account_id=3, found_total=0, new_total=0))
+            db.add(DiscoveryQuery(kind="search", query=query,
+                                  account_id=3, found_total=0, new_total=0))
             await db.commit()
         await engine.dispose()
 
     asyncio.run(go())
 
 
-def test_scan_is_refused_when_daily_limit_is_exhausted(client, seeded):
-    """Лимит проверяется ДО постановки прогона: при исчерпании — 409 с остатком
-    в тексте, и прогона в `runs` не появляется. Отказ, а не тихая очередь:
-    поиск — разовое действие человека."""
-    _spend_daily_limit(5)
+def _stub_engage_for_scan(monkeypatch) -> list:
+    """Engage из двух шагов для фоновых прогонов scan. Очереди в тестах нет,
+    прогон живёт корутиной в процессе API, и без заглушки ходил бы в
+    http://engage.invalid. Отвечает парой каналов — прогон доживает до
+    кандидатов и своей строки `discovery_queries` (шаг §3.2 целиком)."""
+    calls: list = []
+
+    async def action(*, account_id, action, payload, webhook_url, **kw):
+        calls.append((account_id, action, payload))
+        return {"task_id": f"t{len(calls)}"}
+
+    async def wait_for_task(task_id, **kw):
+        return {"channels": [{"title": "Банк один", "username": "bankone",
+                              "members_count": 5000},
+                             {"title": "Банк два", "username": "banktwo",
+                              "members_count": 9000}]}
+
+    monkeypatch.setattr(engage, "action", action)
+    monkeypatch.setattr(engage, "wait_for_task", wait_for_task)
+    return calls
+
+
+def _run_statuses() -> list[str]:
+    async def go():
+        engine = create_async_engine(DB_URL, poolclass=None)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as db:
+            rows = list((await db.execute(
+                select(Run.status).where(Run.kind == "discovery_scan")
+                .order_by(Run.id))).all())
+        await engine.dispose()
+        return [s for (s,) in rows]
+
+    return asyncio.run(go())
+
+
+def _await_scan_settled(timeout: float = 10.0) -> None:
+    """Дождаться, пока фоновые прогоны scan дойдут до терминального статуса.
+    Без очереди прогон исполняется корутиной в процессе API; не дождавшись,
+    следующий POST /scan упёрся бы в `JobBusy` — это была бы гонка теста,
+    а не свойство ручки."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not {"queued", "running"} & set(_run_statuses()):
+            return
+        time.sleep(0.05)
+    pytest.fail("фоновые прогоны discovery_scan не завершились вовремя")
+
+
+def test_six_distinct_searches_a_day_all_start_runs(client, seeded, monkeypatch):
+    """Суточного лимита поисков больше нет (Решение 1): шесть разных поисков
+    за одни UTC-сутки — шесть прогонов, и 409 «продолжайте завтра» не существует.
+    Число «5» теперь про объём одного прогона и живёт в службе, а не в ручке."""
+    _stub_engage_for_scan(monkeypatch)
+    _login(client, seeded["uids"]["owner"])
+    for i in range(6):
+        r = client.post("/api/v1/discovery/scan",
+                        json={"kind": "search", "query": f"поиск номер {i}",
+                              "account_id": 3})
+        assert r.status_code == 202, r.text
+        assert r.json()["started"] is True
+        _await_scan_settled()
+    statuses = _run_statuses()
+    assert len(statuses) == 6 and all(s == "done" for s in statuses), statuses
+    # 202 = «прогон заведён», и каждый прогон отработал до конца: свои строки
+    # `discovery_queries` на месте
+    assert _count(DiscoveryQuery) == 6
+
+
+def test_duplicate_target_still_conflicts(client, seeded):
+    """Регресс: уникальность цели за UTC-сутки — дедуп, а не счётчик, Решение 1
+    её не отменял. Повторный поиск по той же строке — 409, и прогона нет."""
+    _seed_searched(query="бухгалтерия")
     _login(client, seeded["uids"]["owner"])
     r = client.post("/api/v1/discovery/scan",
-                    json={"kind": "search", "query": "что-то новое"})
+                    json={"kind": "search", "query": "бухгалтерия",
+                          "account_id": 3})
     assert r.status_code == 409, r.text
-    assert "5 из 5" in r.text, r.text
-    assert _count(Run) == 0, "прогон при исчерпанном лимите не должен заводиться"
-    assert _count(DiscoveryQuery) == 5
+    assert "уже искали" in r.text, r.text
+    assert _count(Run) == 0
 
-    # Остаток экран видит до нажатия кнопки — тем же числом, что проверяет scan.
-    today = client.get("/api/v1/discovery/queries").json()["today"]
-    assert today == {"used": 5, "limit": 5}
+
+def test_queries_reports_per_run_not_today(client, seeded):
+    """Вместо суточного остатка — объём прогона (Решение 1): `per_run.queries`
+    из порогов службы; поля `today` не существует."""
+    _login(client, seeded["uids"]["owner"])
+    body = client.get("/api/v1/discovery/queries").json()
+    assert body["per_run"] == {"queries": 5}
+    assert "today" not in body
 
 
 def test_scan_similar_with_search_query_is_refused(client, seeded):

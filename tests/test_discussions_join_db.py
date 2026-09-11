@@ -11,14 +11,15 @@
   группа, куда пришлось бы проситься заявкой. Такие не трогаем вовсе.
 * **только вступаем, историю не читаем.** Единственное действие прогона —
   `join_group`. Любой `get_chat_history` здесь ошибка, а не оптимизация.
-* **лимиты Engage.** У `public_reply` `joins_per_day: 3`; прогон режет пачку по этому
-  потолку сам, а не полагается на отказ Engage — Engage сверх лимита не отказывает,
-  а откладывает.
+* **потолок пачки — остаток Engage, не константа.** Прогон спрашивает
+  `GET /v1/limits` ровно ОДИН раз на прогон и режет пачку по остатку на аккаунт
+  и по агрегату api-группы; аккаунта нет в ответе — ноль и строка в отчёте;
+  недоступный Engage не роняет прогон — план по границе запроса и строка в отчёте.
 * **кто вступил — записано.** Дальше именно этим аккаунтом пойдёт бэкфилл и с него же
   будет виден живой поток.
 
-Engage подменяется на уровне `engage.action` / `engage.wait_for_task` — та же
-двухшаговая форма, что и в `test_discussions_scan_db.py`.
+Engage подменяется на уровне `engage.action` / `engage.wait_for_task` /
+`engage.limits` — та же двухшаговая форма, что и в `test_discussions_scan_db.py`.
 
 ⚠️ Один `asyncio.run` на тест. Движок и пул кешируются между вызовами
 (`get_engine.cache_clear()` зовётся только в фикстуре), и второй `asyncio.run` в том
@@ -41,7 +42,7 @@ os.environ.setdefault("RADAR_INGEST_TOKEN", "test-ingest-token")
 
 from app.core.config import get_settings  # noqa: E402
 from app.db.models import (Base, Channel, EngageInstance, Message,  # noqa: E402
-                           MessageReader, Workflow)
+                           MessageReader, Workflow)  # noqa: E402
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.services import discussions, engage  # noqa: E402
 
@@ -127,9 +128,28 @@ def db_ready():
     yield
 
 
-def _stub_engage(monkeypatch, calls: list, *, fail: dict | None = None):
-    """Engage, который умеет ровно одно действие. Любое другое — падение теста, а не
-    молчаливый пропуск: «вступили и заодно дочитали» здесь запрещено."""
+def _limits_account(aid: int, *, per: int, agg: int | None = None,
+                    api_id: int = 1, use_case: str = "public_reply") -> dict:
+    """Элемент `accounts` ответа `GET /v1/limits` (E1) в той форме, в которой его
+    читает план: действие `joins_per_day` с остатками на аккаунт и агрегатом."""
+    act: dict = {"action": "joins_per_day", "per_account": {"remaining": per}}
+    if agg is not None:
+        act["aggregate"] = {"remaining": agg, "api_credential_id": api_id,
+                            "use_case": use_case}
+    return {"account_id": aid, "api_credential_id": api_id, "use_case": use_case,
+            "actions": [act]}
+
+
+def _stub_engage(monkeypatch, calls: list, *, fail: dict | None = None,
+                 limits: dict | Exception | None = None,
+                 limits_calls: list | None = None):
+    """Engage, который умеет ровно одно действие и один вопрос об остатках.
+
+    Любое другое действие — падение теста, а не молчаливый пропуск: «вступили и
+    заодно дочитали» здесь запрещено. `limits` — тело ответа `GET /v1/limits`
+    или исключение; по умолчанию у каждого спрошенного щедрые остатки, план не
+    связывающие — его проверяют отдельные тесты.
+    """
     fail = fail or {}
     tasks: dict[str, str] = {}
 
@@ -147,8 +167,20 @@ def _stub_engage(monkeypatch, calls: list, *, fail: dict | None = None):
             raise fail[target]
         return {"found": True, "chat_id": None, "target": target}
 
+    async def limits_stub(*, account_ids=None, instance=None):
+        if limits_calls is not None:
+            limits_calls.append(list(account_ids or []))
+        if isinstance(limits, Exception):
+            raise limits
+        if limits is not None:
+            return limits
+        return {"accounts": [_limits_account(a, per=99, agg=999)
+                             for a in (account_ids or [])],
+                "missing": []}
+
     monkeypatch.setattr(engage, "action", action)
     monkeypatch.setattr(engage, "wait_for_task", wait_for_task)
+    monkeypatch.setattr(engage, "limits", limits_stub)
 
 
 async def _report(pct, note):
@@ -161,11 +193,16 @@ async def _selected() -> list[int]:
                                                        channel_ids=None)
 
 
-async def _run(*, account_ids: list[int], per_account: int = 3) -> dict:
+async def _run(*, account_ids: list[int], per_account: int | None = None,
+               notes: list | None = None) -> dict:
+    async def report(pct, note):
+        if notes is not None and note:
+            notes.append(note)
+
     group_ids = await _selected()
     return await discussions.join_groups(
         group_ids=group_ids, account_ids=account_ids, per_account=per_account,
-        subscribed_by="ivan@test", report=_report, cancelled=lambda: False)
+        subscribed_by="ivan@test", report=report, cancelled=lambda: False)
 
 
 async def _groups() -> dict[str, Channel]:
@@ -197,7 +234,7 @@ def test_join_marks_the_group_row_so_the_screen_says_live(db_ready, monkeypatch)
     _stub_engage(monkeypatch, calls)
 
     async def go():
-        stats = await _run(account_ids=[1, 2], per_account=3)
+        stats = await _run(account_ids=[1, 2])
         return stats, await _groups()
 
     stats, groups = asyncio.run(go())
@@ -219,28 +256,131 @@ def test_nothing_but_join_is_ordered(db_ready, monkeypatch):
     заказанных вступлений ровно столько же, сколько групп."""
     calls: list = []
     _stub_engage(monkeypatch, calls)
-    asyncio.run(_run(account_ids=[1, 2], per_account=3))
+    asyncio.run(_run(account_ids=[1, 2]))
     assert sorted(target for _, target in calls) == sorted(GROUP_NAMES)
 
 
-def test_daily_cap_bounds_the_batch(db_ready, monkeypatch):
-    """Один аккаунт при `joins_per_day: 3` берёт три группы, а не пять. Остальные
-    остаются в очереди на завтра — так пачка и растягивается на дни."""
+def test_plan_is_cut_by_the_aggregate_of_the_api_group(db_ready, monkeypatch):
+    """Два аккаунта одного api_id: остатки на аккаунт 3 и 3, агрегат 4.
+
+    Агрегат — общий бакет api-группы; делить его нельзя, можно только не превысить:
+    суммарный план обязан уложиться в 4, у каждого — не больше его остатка на
+    аккаунт. Урезание идёт по единице у аккаунта с наибольшим текущим значением,
+    поэтому при равных остатках план ложится [2, 2], а не весь на одного.
+    """
     calls: list = []
-    _stub_engage(monkeypatch, calls)
+    _stub_engage(monkeypatch, calls, limits={
+        "accounts": [_limits_account(1, per=3, agg=4),
+                     _limits_account(2, per=3, agg=4)],
+        "missing": []})
 
     async def go():
-        stats = await _run(account_ids=[7], per_account=3)
-        return stats, await _selected()
+        stats = await _run(account_ids=[1, 2])
+        return stats, await _groups()
 
-    stats, left = asyncio.run(go())
-    assert stats["joined"] == 3, stats
-    assert stats["left"] == 2, stats
-    assert len(calls) == 3
-    assert {account for account, _ in calls} == {7}
-    assert len(left) == 2, (
-        "вступившие группы обязаны уйти из очереди, иначе завтрашний прогон потратит "
-        "лимит на них ещё раз")
+    stats, groups = asyncio.run(go())
+    by_account: dict[int, int] = {}
+    for account, _target in calls:
+        by_account[account] = by_account.get(account, 0) + 1
+    assert stats["planned"] == 4, stats
+    assert stats["left"] == 1, stats
+    assert sum(by_account.values()) == 4, by_account
+    assert all(n <= 3 for n in by_account.values()), by_account
+    assert by_account == {1: 2, 2: 2}, (
+        "урезание по агрегату идёт у самого «толстого», а не у фиксированного "
+        f"аккаунта: by_account={by_account}")
+
+
+def test_request_bound_per_account_holds_even_with_remainder(db_ready, monkeypatch):
+    """`per_account` — только верхняя граница запроса: каждому не больше одного
+    вступления, даже когда остаток Engage позволяет три."""
+    calls: list = []
+    _stub_engage(monkeypatch, calls, limits={
+        "accounts": [_limits_account(1, per=3, agg=99),
+                     _limits_account(2, per=3, agg=99)],
+        "missing": []})
+
+    stats = asyncio.run(_run(account_ids=[1, 2], per_account=1))
+    by_account: dict[int, int] = {}
+    for account, _target in calls:
+        by_account[account] = by_account.get(account, 0) + 1
+    assert stats["planned"] == 2, stats
+    assert by_account == {1: 1, 2: 1}, by_account
+
+
+def test_missing_account_gets_zero_and_a_report_line(db_ready, monkeypatch):
+    """Аккаунта нет в ответе (он в `missing`) — ноль вступлений и строка в отчёте:
+    заказывать тому, чей остаток неизвестен, нельзя."""
+    calls: list = []
+    notes: list = []
+    _stub_engage(monkeypatch, calls, limits={
+        "accounts": [_limits_account(1, per=3, agg=99)], "missing": [2]})
+
+    stats = asyncio.run(_run(account_ids=[1, 2], notes=notes))
+    assert {account for account, _ in calls} == {1}, calls
+    assert stats["planned"] == 3, stats
+    assert any("2" in n and "не запланировано" in n for n in notes), notes
+
+
+def test_unavailable_engage_degrades_to_request_ceiling(db_ready, monkeypatch):
+    """Engage недоступен: план по верхней границе запроса, прогон не падает и не
+    лочится, в отчёте — строка про неизвестный остаток. Нулём остаток подменять
+    нельзя: любой чих сети останавливал бы вступления молча."""
+    calls: list = []
+    notes: list = []
+    _stub_engage(monkeypatch, calls,
+                 limits=engage.EngageUnavailable("Engage недоступен: ConnectError"))
+
+    stats = asyncio.run(_run(account_ids=[1, 2], per_account=2, notes=notes))
+    assert stats["planned"] == 4, stats
+    assert stats["joined"] == 4, stats
+    assert any("остаток Engage неизвестен" in n and "потолку запроса" in n
+               for n in notes), notes
+
+
+def test_unavailable_engage_without_bound_plans_everything(db_ready, monkeypatch):
+    """Границы запроса нет (`per_account=None`) и остатка нет: план без потолка —
+    «сколько позволит Engage»; прогон жив, отчёт честный."""
+    calls: list = []
+    notes: list = []
+    _stub_engage(monkeypatch, calls,
+                 limits=engage.EngageUnavailable("Engage недоступен: ConnectError"))
+
+    stats = asyncio.run(_run(account_ids=[1], notes=notes))
+    assert stats["planned"] == 5, stats
+    assert any("остаток Engage неизвестен" in n for n in notes), notes
+
+
+def test_limits_is_asked_exactly_once_per_run(db_ready, monkeypatch):
+    """Остаток спрашивается один раз на прогон: 5 аккаунтов, 40 групп — ровно один
+    вызов `engage.limits`, с полным списком аккаунтов. Глобального кеша остатков
+    нет: между прогонами числа меняются, повторный вопрос — только новый прогон.
+    """
+    calls: list = []
+    limits_calls: list = []
+    _stub_engage(monkeypatch, calls, limits_calls=limits_calls)
+
+    async def go():
+        fixture_ids = await _selected()  # 5 групп уже в фикстуре
+        async with get_session_maker()() as db:
+            group_ids = []
+            for i in range(35):
+                group = Channel(peer_id=-300_000 - i, username=f"bulk_chat_{i}",
+                                title=f"Балк {i}", chat_type="supergroup",
+                                ingest_enabled=True)
+                db.add(group)
+                await db.flush()
+                group_ids.append(group.id)
+            await db.commit()
+        return await discussions.join_groups(
+            group_ids=fixture_ids + group_ids,
+            account_ids=[1, 2, 3, 4, 5], per_account=None,
+            subscribed_by="ivan@test", report=_report, cancelled=lambda: False)
+
+    stats = asyncio.run(go())
+    assert len(limits_calls) == 1, limits_calls
+    assert limits_calls[0] == [1, 2, 3, 4, 5], limits_calls
+    assert stats["planned"] == 40, stats
 
 
 def test_one_refusal_does_not_stop_the_rest(db_ready, monkeypatch):
@@ -251,7 +391,7 @@ def test_one_refusal_does_not_stop_the_rest(db_ready, monkeypatch):
         "buhpravo_chat": engage.EngageTaskFailed("нельзя", code="channels_too_much")})
 
     async def go():
-        stats = await _run(account_ids=[1, 2, 3], per_account=3)
+        stats = await _run(account_ids=[1, 2, 3])
         return stats, await _groups()
 
     stats, groups = asyncio.run(go())
@@ -270,12 +410,12 @@ def test_deferred_task_is_not_counted_as_joined(db_ready, monkeypatch):
         "zloytam_chat": engage.EngageTaskDeferred("отложена", code="BUDGET_ACCOUNT")})
 
     async def go():
-        stats = await _run(account_ids=[1], per_account=3)
+        stats = await _run(account_ids=[1])
         return stats, await _groups()
 
     stats, groups = asyncio.run(go())
     assert stats["deferred"] == 1, stats
-    assert stats["joined"] == 2, stats
+    assert stats["joined"] == 4, stats
     assert groups["zloytam_chat"].linked_joined_at is None
 
 
@@ -300,7 +440,7 @@ def test_the_account_that_read_the_group_joins_it(db_ready, monkeypatch):
                     Message.channel_id == groups[group_name].id))).scalar_one()
                 db.add(MessageReader(message_id=message.id, account_id=account_id))
             await db.commit()
-        await _run(account_ids=[1, 2, 3, 4, 5], per_account=3)
+        await _run(account_ids=[1, 2, 3, 4, 5])
 
     asyncio.run(go())
     by_target = {target: account for account, target in calls}

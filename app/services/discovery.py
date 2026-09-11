@@ -48,11 +48,12 @@ LIVENESS_ACTOR = "auto:liveness"
 FIT_ACTOR = "auto:channel_fit_v1"
 
 # §6 — пороги и лимиты сценария B. Числа из постановки (§5) менять нельзя;
-# два последних — умолчания контракта: 100 покрывает «полсотни кандидатов в
-# день» (5 поисков × ~10 рекомендаций), 3 — не выше потолка вступлений аккаунта,
-# чтобы автовключения не съели дневной бюджет флота.
+# два последних — умолчания контракта: 100 покрывает кандидатов нескольких
+# поисков (~10 рекомендаций на заказ; «пять поисков» — объём одного прогона,
+# Решение 1), 3 — не выше потолка вступлений аккаунта, чтобы автовключения
+# не съели дневной бюджет флота.
 DEFAULTS = {
-    "discovery_searches_per_day": 5,     # §5.4 — условие задачи
+    "discovery_queries_per_scan": 5,     # Решение 1 — объём прогона, не суточный лимит
     "discovery_min_members": 500,        # §5.1 — условие задачи
     "discovery_min_posts_7d": 2,         # §5.1 — условие задачи
     "discovery_min_comments_7d": 50,     # §5.1 — условие задачи
@@ -64,24 +65,56 @@ DEFAULTS = {
 
 # ── пороги (§6) ───────────────────────────────────────────────────────────────
 
+# Старое имя ключа потолка поисков (Решение 1: «пять поисков» — объём прогона,
+# а не суточный лимит). Строка с таким ключом в `limits` на проде возможна —
+# пороги правятся без выкатки, — и терять выставленное число молча нельзя:
+# отсюда fallback в `thresholds`. Сама старая строка не удаляется автоматически:
+# её уважает fallback, пока владелец не уберёт руками.
+_OLD_SEARCHES_KEY = "discovery_searches_per_day"
+
+# Флаг подавления: переименование пишется в журнал один раз на процесс, иначе
+# каждый прогон (а `thresholds` зовётся на каждом) спамил бы одной и той же
+# строкой.
+_KEY_RENAME_LOGGED = False
+
+
 async def thresholds(db) -> dict:
     """Пороги discovery: строки `limits` поверх умолчаний, строка в БД побеждает.
 
     Таблица читается на каждом прогоне, а не кешируется на старте: правка порога
     обязана действовать без выкатки (§5.1 постановки — «правка конфига дешевле
-    выкатки»). Пустая таблица — рабочее состояние,Absent ключи берутся из кода.
+    выкатки»). Пустая таблица — рабочее состояние, отсутствующие ключи берутся
+    из кода.
+
+    Fallback-миграция переименования `discovery_searches_per_day` →
+    `discovery_queries_per_scan`: пока строки с новым именем нет, а со старым
+    есть, значение старой становится значением нового ключа, и переименование
+    один раз пишется в журнал. Перенести настройку в БД под новым именем —
+    дело владельца, автоматического удаления старой строки нет.
     """
     rows = (await db.execute(
-        select(Limit.key, Limit.value).where(Limit.key.in_(DEFAULTS)))).all()
+        select(Limit.key, Limit.value)
+        .where(Limit.key.in_([*DEFAULTS, _OLD_SEARCHES_KEY])))).all()
     out = dict(DEFAULTS)
+    seen: dict = {}
     for key, value in rows:
-        out[key] = value
+        seen[key] = value
+        if key in out:  # старое имя в `out` не попадает — его место в fallback ниже
+            out[key] = value
+    global _KEY_RENAME_LOGGED
+    if _OLD_SEARCHES_KEY in seen and "discovery_queries_per_scan" not in seen:
+        out["discovery_queries_per_scan"] = seen[_OLD_SEARCHES_KEY]
+        if not _KEY_RENAME_LOGGED:
+            _KEY_RENAME_LOGGED = True
+            logger.warning("limits_key_renamed old=%s new=%s",
+                           _OLD_SEARCHES_KEY, "discovery_queries_per_scan")
     return out
 
 
 def _utc_day_start(now: datetime | None = None) -> datetime:
     """Начало текущих UTC-суток. То же окно, что у уникальности `discovery_queries`
-    (§1.2) и дневного лимита поисков (§5.4) — один день, одно число везде."""
+    (§1.2), дневного счётчика проверок моделью и автовключений — один день, одно
+    число везде."""
     return (now or clock.utcnow()).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -533,7 +566,15 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
     """Прогон `discovery_scan`: шаги §3.2 — Engage → кандидаты → строка
     `discovery_queries` с `run_id`. Проверки кандидатов прогон не стартует:
     их ведёт тик, единственная точка запуска избавляет от гонки «скан против
-    тика» (§4.4)."""
+    тика» (§4.4).
+
+    Поисковых заказов у Engage — не больше `discovery_queries_per_scan`
+    (Решение 1: «пять поисков» — объём прогона, не суточный лимит). Потолок
+    живёт здесь, в службе, а не в ручке поиска: общая `POST /runs` заводит этот
+    же прогон с произвольными params и мимо ручки потолок бы обошла. Сегодня
+    поиск делает ровно один заказ; счётчик с жёсткой границей — рамка для
+    будущих мульти-целевых прогонов.
+    """
     kind = params.get("kind")
     if kind not in DiscoveryQuery.KINDS:
         raise RuntimeError(f"неизвестный вид поиска {kind!r}")
@@ -541,6 +582,22 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
     maker = get_session_maker()
 
     async with maker() as db:
+        per_scan = int((await thresholds(db))["discovery_queries_per_scan"])
+        orders = 0
+
+        async def order_search(action: str, payload: dict) -> dict:
+            """Один поисковый заказ под жёсткой границей потолка прогона."""
+            nonlocal orders
+            if orders >= per_scan:
+                raise RuntimeError(
+                    f"прогон исчерпал потолок поисковых заказов ({per_scan})")
+            orders += 1
+            task = await engage.action(
+                account_id=account_id, action=action, payload=payload,
+                webhook_url=engage.webhook_url(kind="polled"))
+            return await engage.wait_for_task(task["task_id"],
+                                              timeout=SCAN_WAIT_SECONDS)
+
         seed_channel_id: int | None = None
         query_text: str | None = None
         if kind == "similar":
@@ -561,11 +618,7 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
         if cancelled():
             return {"cancelled": True, "found_total": 0, "new_total": 0}
         await report(0, f"{what}, аккаунт {account_id}")
-        task = await engage.action(
-            account_id=account_id, action=action, payload=payload,
-            webhook_url=engage.webhook_url(kind="polled"))
-        result = await engage.wait_for_task(task["task_id"],
-                                            timeout=SCAN_WAIT_SECONDS)
+        result = await order_search(action, payload)
         items = _found_items(result)
         await report(40, f"найдено {len(items)} каналов")
 

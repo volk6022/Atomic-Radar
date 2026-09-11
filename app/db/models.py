@@ -135,8 +135,6 @@ class Account(Base):
     phone_country: Mapped[str | None] = mapped_column(String(2))
     proxy_country: Mapped[str | None] = mapped_column(String(2))
     tz_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    limit_day: Mapped[int | None] = mapped_column(Integer)
-    limit_hour: Mapped[int | None] = mapped_column(Integer)
     last_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     watcher_uptime: Mapped[float | None] = mapped_column(Numeric(6, 2))
     synced_at: Mapped[datetime] = _updated()

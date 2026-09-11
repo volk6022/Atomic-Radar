@@ -378,15 +378,6 @@ def _note(channel_id: int, out: dict) -> str:
 
 # ── вступление в группы (план 1.6, шаг 7) ─────────────────────────────────────
 
-# Сколько вступлений в сутки разрешено одному аккаунту. Значение из
-# `fleet_manager/config/safety.yaml`, профиль `public_reply`: `joins_per_day: 3`.
-# Продублировано здесь осознанно и как потолок, а не запрошено у Engage: Engage при
-# исчерпанном бюджете задачу не отвергает, а ОТКЛАДЫВАЕТ на час и переносит, пока не
-# сменятся сутки. Пачка из сорока вступлений, заказанная разом, безопаснее от этого
-# не станет — она превратится в сорок задач, которые сутками стучатся в планировщик.
-# Резать пачку здесь дешевле, и остаток виден в отчёте прогона.
-JOINS_PER_ACCOUNT_PER_DAY = 3
-
 # Сколько ждать результата вступления. Пауза хьюманайзера у `join_group` — 60–300 с
 # (у чтений её нет вовсе), и перед ней задача ещё стоит в поаккаунтной очереди Engage
 # за предыдущей. Штатных 300 с `wait_for_task` на это не хватает.
@@ -448,26 +439,128 @@ async def _readers_of(db, group_ids: list[int]) -> dict[int, int]:
     return best
 
 
-def plan_joins(group_ids: list[int], account_ids: list[int], *, per_account: int,
-               preferred: dict[int, int]) -> dict[int, list[int]]:
-    """Разложить группы по аккаунтам, не превышая суточный потолок ни у кого.
+def _missing_ids(lim: dict) -> set[int]:
+    """Аккаунты, которые Engage перечислил в `missing` ответа E1.
 
-    Сначала группе предлагается тот аккаунт, который её читал; если у него на сегодня
-    места нет, группа уходит к самому свободному. Что не поместилось — не уходит
-    никуда: остаток честно виден в отчёте как «осталось на следующий раз».
+    Форма элемента заранее не фиксируется — id или объект с `account_id`, —
+    читается и так, и так; неразбираемые элементы молча пропускаются: это
+    аннотация к ответу, а не его суть.
     """
-    cap = max(0, min(per_account, JOINS_PER_ACCOUNT_PER_DAY))
+    out: set[int] = set()
+    for m in lim.get("missing") or []:
+        if isinstance(m, dict):
+            m = m.get("account_id")
+        try:
+            out.add(int(m))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _caps_from_limits(lim: dict, account_ids: list[int],
+                      per_account: int | None) -> tuple[dict[int, int], list[str]]:
+    """Персональные потолки аккаунтов из ответа `GET /v1/limits` (E1) + строки
+    для отчёта прогона.
+
+    Ответ читается как есть (клиент его не пересобирает): аккаунт — элемент
+    `accounts` с `account_id`, в нём действие `joins_per_day` с остатками
+    `per_account.remaining` и `aggregate.remaining`. Две величины нужны
+    раздельно: `act.remaining` — уже их минимум, но общий агрегат между
+    аккаунтами одной (api_credential_id, use_case)-группы можно только
+    распределить, а для этого надо знать его отдельно.
+
+    Порядок: сначала каждому — минимум верхней границы запроса и его остатка
+    на аккаунт; затем каждая api-группа ужимается до своего агрегата. Агрегат
+    делить нельзя, его можно только не превысить, поэтому лишнее снимается по
+    единице у аккаунтов с наибольшим текущим значением. Аккаунта нет в ответе
+    (попал в `missing`) — ноль и строка в отчёт: заказывать вступления тому,
+    чей остаток неизвестен, нельзя.
+    """
+    notes: list[str] = []
+    by_id: dict[int, dict] = {}
+    for acc in lim.get("accounts") or []:
+        if isinstance(acc, dict) and acc.get("account_id") is not None:
+            by_id[int(acc["account_id"])] = acc
+    missing = _missing_ids(lim)
+
+    caps: dict[int, int] = {}
+    group_of: dict[int, tuple] = {}
+    agg_left: dict[tuple, int] = {}
+    for a in account_ids:
+        acc = by_id.get(a)
+        if acc is None:
+            caps[a] = 0
+            why = ("Engage вернул его в missing" if a in missing
+                   else "его нет в остатках Engage")
+            notes.append(f"аккаунт {a}: {why} — вступлений ему не запланировано")
+            continue
+        act = next((x for x in acc.get("actions") or []
+                    if isinstance(x, dict) and x.get("action") == "joins_per_day"),
+                   None)
+        if act is None:
+            caps[a] = 0
+            notes.append(f"аккаунт {a}: в остатках нет joins_per_day — "
+                         f"вступлений ему не запланировано")
+            continue
+        per = act.get("per_account") or {}
+        rem_p = int(per.get("remaining") or 0)
+        caps[a] = max(0, rem_p if per_account is None else min(per_account, rem_p))
+
+        agg = act.get("aggregate") or {}
+        if agg.get("remaining") is not None:
+            key = (acc.get("api_credential_id", agg.get("api_credential_id")),
+                   acc.get("use_case", agg.get("use_case")))
+            if key[0] is not None and key[1] is not None:
+                group_of[a] = key
+                # Один агрегат на группу; члены читают его в разные мгновения и
+                # могут увидеть разные числа — берём меньшее: превысить общий
+                # бакет нельзя никому, а больший остаток устареет первым.
+                left = int(agg["remaining"])
+                prev = agg_left.get(key)
+                agg_left[key] = left if prev is None else min(prev, left)
+
+    # group_of — {аккаунт: ключ его api-группы}; для урезания группируем наоборот.
+    members_of: dict[tuple, list[int]] = {}
+    for a, key in group_of.items():
+        members_of.setdefault(key, []).append(a)
+
+    for key, members in members_of.items():
+        left = agg_left[key]
+        total = sum(caps[a] for a in members)
+        while total > left:
+            # Урезание по единице у самого «толстого»; при равенстве — у меньшего
+            # id, чтобы результат не зависел от порядка в словаре.
+            a = min(members, key=lambda x: (-caps[x], x))
+            if caps[a] <= 0:
+                break
+            caps[a] -= 1
+            total -= 1
+    return caps, notes
+
+
+def plan_joins(group_ids: list[int], account_ids: list[int], *,
+               caps: dict[int, int], preferred: dict[int, int]) -> dict[int, list[int]]:
+    """Разложить группы по аккаунтам по персональным потолкам `caps`.
+
+    `caps[a]` — сколько вступлений можно запланировать аккаунту `a` в этом
+    прогоне (минимум границы запроса и остатка Engage, после урезания по
+    агрегату api-группы — `_caps_from_limits`). Сначала группе предлагается тот
+    аккаунт, который её читал; если у него места нет, группа уходит к самому
+    свободному из имеющих место. Что не поместилось — не уходит никуда: остаток
+    честно виден в отчёте как «осталось на следующий раз».
+    """
     plan: dict[int, list[int]] = {a: [] for a in account_ids}
-    if not account_ids or cap == 0:
+    if not account_ids:
         return plan
     for group_id in group_ids:
         want = preferred.get(group_id)
-        if want in plan and len(plan[want]) < cap:
+        if want in plan and len(plan[want]) < caps.get(want, 0):
             plan[want].append(group_id)
             continue
-        free = min(plan, key=lambda a: (len(plan[a]), a))
-        if len(plan[free]) >= cap:
+        room = [a for a in plan if len(plan[a]) < caps.get(a, 0)]
+        if not room:
             break
+        free = min(room, key=lambda a: (len(plan[a]), a))
         plan[free].append(group_id)
     return plan
 
@@ -503,7 +596,8 @@ async def _join_one(db, group_id: int, account_id: int, *, subscribed_by: str) -
 
 
 async def join_groups(*, group_ids: list[int], account_ids: list[int],
-                      per_account: int, subscribed_by: str, report, cancelled) -> dict:
+                      per_account: int | None, subscribed_by: str, report,
+                      cancelled) -> dict:
     """Вступить списком, по потоку на аккаунт.
 
     Параллелизм ровно по числу аккаунтов: очередь у Engage поаккаунтная, и два
@@ -511,11 +605,32 @@ async def join_groups(*, group_ids: list[int], account_ids: list[int],
 
     Отказ на одной группе не отменяет остальные — приватность, флуд-контроль и
     «слишком много каналов» на списке из сорока штук встречаются каждый раз.
+
+    Потолок пачки — не константа, а остаток Engage: `GET /v1/limits` спрашивается
+    ровно ОДИН раз на прогон, здесь, где строится план, и раскладывается по
+    аккаунтам через `_caps_from_limits`. Кеша остатков нет: между прогонами числа
+    меняются, и протухший кеш стал бы вторым зеркалом лимитов.
+
+    Недоступный Engage прогон не роняет и остаток нулём не подменяет — и то и
+    другое лочило бы вступления при любом чихе сети. План строится по верхней
+    границе запроса `per_account` (`None` — без границы), а в отчёт идёт строка
+    о неизвестном остатке.
     """
+    if per_account is not None:
+        per_account = int(per_account)
     async with get_session_maker()() as db:
         preferred = await _readers_of(db, group_ids)
-    plan = plan_joins(group_ids, account_ids, per_account=per_account,
-                      preferred=preferred)
+    try:
+        lim = await engage.limits(account_ids=account_ids)
+    except engage.EngageUnavailable as e:
+        caps = {a: (per_account if per_account is not None else len(group_ids))
+                for a in account_ids}
+        notes = [f"остаток Engage неизвестен — план по потолку запроса ({e})"]
+    else:
+        caps, notes = _caps_from_limits(lim, account_ids, per_account)
+    for note in notes:
+        await report(None, note)
+    plan = plan_joins(group_ids, account_ids, caps=caps, preferred=preferred)
     planned = sum(len(v) for v in plan.values())
     stats = {"total": len(group_ids), "planned": planned,
              "left": len(group_ids) - planned, "done": 0, "joined": 0,
