@@ -278,6 +278,24 @@ async def ensure_bootstrap(db) -> bool:
             logger.info("threshold_limit_seeded key=%s value=%s",
                         key, _THRESHOLD_DEFAULTS[key])
 
+    # Настройки автоматики (план 13.5) сеются тем же приёмом, что и пороги выше:
+    # строка даёт владельцу место, куда вписать включение или правку, отсутствие
+    # строки — умолчание кода, существующая строка не трогается (там может стоять
+    # уже правленное владельцем значение). Описание ключа — одно место
+    # (`autoflow.LIMIT_SPECS`), его же читают валидация и набор настроек.
+    # Импорт локальный, а не наверху: autoflow тянет discovery, тот — этот
+    # модуль, и верхнеуровневый импорт закольцевал бы загрузку (образец с той же
+    # причиной — discovery_check_tick).
+    from app.services import autoflow  # локальный: против цикла импорта
+    for key in autoflow.AUTOMATION_LIMIT_KEYS:
+        if await db.get(Limit, key) is None:
+            spec = autoflow.LIMIT_SPECS[key]
+            db.add(Limit(key=key, value=float(spec["default"]),
+                         unit=spec["unit"], description=spec["description"]))
+            created = True
+            logger.info("autoflow_limit_seeded key=%s value=%s",
+                        key, spec["default"])
+
     if created:
         await db.commit()
     return created

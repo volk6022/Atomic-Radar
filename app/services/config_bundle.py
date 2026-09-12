@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from app.db.models import ConfigFile, L2Prototype, L3Prompt
-from app.services import cascade_registry, llm
+from app.services import autoflow, cascade_registry, llm
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,20 @@ def validate(bundle) -> None:
                 raise BundleError(
                     f"порог «{key}»: значение {value!r} вне диапазона 0 < v < 1")
 
+    # Блок автоматики необязателен по той же причине: файл без него — старая
+    # выгрузка, и выключатели сценариев при импорте не трогаются. Присутствующий
+    # блок проверяется целиком правилами автоматики (чужой ключ, не-число,
+    # границы §1.1) — тоже здесь, до первой записи: файл применяется целиком
+    # или никак.
+    automation = bundle.get("automation")
+    if automation is not None:
+        if not isinstance(automation, dict):
+            raise BundleError("automation: ожидался объект «ключ → число»")
+        try:
+            autoflow.validate_settings(automation)
+        except ValueError as e:
+            raise BundleError(str(e)) from e
+
 
 async def export_bundle(db, *, name: str | None = None) -> dict:
     """Текущие активные настройки в том же виде, в каком их принимает загрузка.
@@ -145,6 +159,12 @@ async def export_bundle(db, *, name: str | None = None) -> dict:
     # прежним: отбор поехал бы, а все видимые настройки совпадали бы.
     thresholds = await cascade_registry.read_thresholds(db)
 
+    # Автоматика кладётся всегда, все девять ключей — та же доктрина круга, что
+    # у порогов выше: экспорт с одного инстанса и импорт на другой обязан
+    # переносить и выключатели сценариев, иначе включённая автоматика на новом
+    # инстансе молча осталась бы выключенной.
+    automation = await autoflow.thresholds(db)
+
     return {
         "format": FORMAT,
         "version": VERSION,
@@ -157,6 +177,7 @@ async def export_bundle(db, *, name: str | None = None) -> dict:
                           for k, v in (cascade.disqualifiers if cascade else {}).items()},
         "l3_prompts": prompts,
         "thresholds": thresholds,
+        "automation": automation,
     }
 
 
@@ -211,16 +232,30 @@ async def import_bundle(db, bundle, *, actor: str) -> dict:
         # только при рассинхроне правил — тип приводится к общему для модуля.
         raise BundleError(str(e)) from e
 
+    # Выключатели и потолки автоматики едут той же дорогой, что и пороги:
+    # upsert той же службой, которой пишет ручка настроек (волна Е). Файл без
+    # блока строки не трогает — и это видно: в ответе ниже `automation` будет
+    # пустым списком, а не молчание.
+    try:
+        applied_automation = await autoflow.save_settings(
+            db, dict(bundle.get("automation") or {}), actor=actor)
+    except ValueError as e:
+        raise BundleError(str(e)) from e
+
     await cascade_registry.reload(db)
 
     out = {"name": bundle.get("name"), "pains": len(pains), "noise": len(noise),
            "disqualifiers": len(disq), "prompts": sorted(applied_prompts),
            "thresholds": sorted(applied_thresholds),
+           "automation": sorted(applied_automation),
            "prototypes": sum(len(p) for _, p in pains.values())
            + sum(len(v) for v in noise.values())}
-    logger.info("config_bundle_imported name=%s pains=%s prompts=%s thresholds=%s by=%s",
+    # `automation` — в конце строки: ниже по файлу есть проверки журнала на
+    # подстроку «thresholds= by=», и вставка между ними сломала бы их молча.
+    logger.info("config_bundle_imported name=%s pains=%s prompts=%s thresholds=%s "
+                "by=%s automation=%s",
                 out["name"], out["pains"], ",".join(out["prompts"]),
-                ",".join(out["thresholds"]), actor)
+                ",".join(out["thresholds"]), actor, ",".join(out["automation"]))
     return out
 
 
@@ -237,6 +272,7 @@ def summarize(bundle) -> dict:
         "noise": len(noise),
         "disqualifiers": len(bundle.get("disqualifiers") or {}),
         "prompts": sorted((bundle.get("l3_prompts") or {}).keys()),
+        "automation": len(bundle.get("automation") or {}),
     }
 
 
