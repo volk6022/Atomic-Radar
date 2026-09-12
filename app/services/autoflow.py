@@ -17,10 +17,10 @@
 старта, и набор настроек; второй список тех же ключей рядом разъехался бы с
 первым молча.
 
-Формы швов сценариев (`after_join`, `reclassify_tick`, `scan_tick`,
-`approve_tick`) здесь сознательно нет — их дописывают волны Б, В, Г и Д. Ни тел,
-ни заглушек: функция-заполнитель выглядела бы «сценарием, который ничего не
-делает», и от ещё не написанного её было бы не отличить.
+Швы сценариев дописывают свои волны, по одному: `after_join` — волна Б (ниже),
+`reclassify_tick`, `scan_tick`, `approve_tick` — волны В, Г и Д. Заглушек и тел
+«на вырост» нет: функция-заполнитель выглядела бы «сценарием, который ничего
+не делает», и от ещё не написанного её было бы не отличить.
 """
 from __future__ import annotations
 
@@ -29,13 +29,15 @@ from datetime import datetime, timedelta
 from typing import Mapping
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 # Форма строки прогона — дословно `runs._row` (решение ревью): одна форма прогона
 # на все экраны, а не вторая, которая разъедется с первой. Цикла импорта нет:
 # `runs` тянет службы (jobs, discovery), но ни одна из них не тянет `autoflow`.
 from app.api.v1.runs import _row
 from app.core import clock
-from app.db.models import BackfillItem, ChannelCandidate, Limit, Message, Run
+from app.db.models import (AuditLog, BackfillItem, Channel, ChannelCandidate,
+                           Limit, Message, Run)
 from app.services import backfill_queue, discovery
 
 logger = logging.getLogger(__name__)
@@ -177,6 +179,92 @@ async def save_settings(db, values: Mapping[str, int | float], *,
     await db.commit()
     logger.info("autoflow_settings_saved keys=%s by=%s", ",".join(values), actor)
     return list(values)
+
+
+# ── сценарий 1: вступил → дочитал ─────────────────────────────────────────────
+
+async def after_join(db, *, channel_id: int, source: str) -> dict:
+    """Поставить канал и его группу обсуждения в очередь дочитывания.
+
+    Зовут два шва — финал вступления в группу (`discussions._join_one`, автор
+    `auto:join`) и финал подключения канала вместе с группой (стадия `linked`
+    в `ingest._handle_chat_info_join`, автор `auto:channel_add`). Прогонов
+    сценарий не заводит — он растит очередь дочитывания (план 13.1). Выключенный
+    выключатель — пустой итог и ни одного запроса дальше чтения настроек: событие
+    случается на каждом подключении канала, и в горячем пути приёма лишних
+    вопросов базе задавать незачем.
+
+    Партнёр ищется по `linked_chat_username`, а поле двунаправленное: у канала
+    оно ведёт к группе, у группы — к каналу. Поэтому одна функция обслуживает
+    оба шва: кто бы ни приехал в `channel_id`, канал или группа, — в очередь
+    встают оба. Группу очередь читает только вступившим аккаунтом, и чужая
+    постановка получила бы `NotJoined`, поэтому не вступившая группа фильтруется
+    превентивно (по образцу ручки `backfill.py`) и попадает в `skipped`, а не
+    роняет шов. Уже стоящий канал очередь пропускает молча сама; гонку
+    одновременной постановки ловит частичный уникальный индекс
+    `uq_backfill_active_channel` — пойманный IntegrityError значит «кто-то успел
+    раньше», это откат и warning, а не ошибка наверх.
+    """
+    lim = await thresholds(db)
+    if int(lim["autoflow_join_backfill_enabled"]) != 1:
+        return {"enabled": False, "queued": [], "skipped": []}
+
+    row = await db.get(Channel, channel_id)
+    if row is None:
+        logger.warning("autoflow_after_join_unknown_channel channel=%s source=%s",
+                       channel_id, source)
+        return {"enabled": True, "queued": [], "skipped": []}
+
+    # Список постановки: сам канал и партнёр по имени обсуждения (не сам row —
+    # поле может случайно указывать на собственную строку).
+    wanted: list[Channel] = [row]
+    username = (row.linked_chat_username or "").strip().lower()
+    if username:
+        partner = (await db.execute(
+            select(Channel).where(Channel.id != row.id,
+                                  func.lower(Channel.username) == username)
+            .limit(1))).scalars().first()
+        if partner is not None:
+            wanted.append(partner)
+
+    # Группа ставится только вступившим: превентивная проверка тех же двух полей,
+    # которые проверяет `enqueue`, иначе постановка упала бы NotJoined посреди
+    # шва. Каналу проверять нечего — его историю Telegram отдаёт любому.
+    items: list[dict] = []
+    skipped: list[int] = []
+    for ch in wanted:
+        if (ch.chat_type in backfill_queue.GROUP_CHAT_TYPES
+                and (ch.linked_joined_at is None
+                     or ch.subscribed_account_id is None)):
+            skipped.append(ch.id)
+            continue
+        items.append({"channel_id": ch.id})
+
+    made: list[BackfillItem] = []
+    try:
+        made = await backfill_queue.enqueue(
+            db, items=items, requested_by=source,
+            target=int(lim["autoflow_backfill_target"]),
+            min_date=clock.utcnow()
+            - timedelta(days=int(lim["autoflow_backfill_depth_days"])))
+    except IntegrityError as e:
+        # Параллельная постановка того же канала: наш «уже стоит» прочитал базу
+        # до чужого коммита, и дубль поймал уникальный индекс. Откат: сделка в
+        # этот момент недостоверна, а «поставлено раньше» — не происшествие.
+        await db.rollback()
+        logger.warning("autoflow_after_join_race channel=%s source=%s error=%s",
+                       channel_id, source, e)
+
+    queued = [m.channel_id for m in made]
+    if queued:
+        db.add(AuditLog(
+            user_id=None, user_email=source, action="backfill_enqueue",
+            detail={"queued": queued,
+                    "target": int(lim["autoflow_backfill_target"]),
+                    "depth_days": int(lim["autoflow_backfill_depth_days"])},
+            ip=None))
+        await db.commit()
+    return {"enabled": True, "queued": queued, "skipped": skipped}
 
 
 # ── сводка для экрана ─────────────────────────────────────────────────────────

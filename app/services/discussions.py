@@ -606,6 +606,12 @@ async def _join_one(db, group_id: int, account_id: int, *, subscribed_by: str) -
     await db.commit()
     logger.info("group_joined group=%s username=%s account=%s by=%s",
                 group.id, group.username, account_id, subscribed_by)
+    # шов автоматики (сценарий 1): вступили → очередь дочитывания
+    try:
+        from app.services import autoflow  # локально: autoflow → jobs → discussions
+        await autoflow.after_join(db, channel_id=group.id, source="auto:join")
+    except Exception as e:  # noqa: BLE001 — шов не вправе уронить вступление
+        logger.warning("autoflow_after_join_failed group=%s error=%s", group_id, e)
     return {"joined": True, "username": group.username, "account_id": account_id}
 
 

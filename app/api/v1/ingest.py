@@ -44,6 +44,7 @@ from app.core.cascade import L1_BYPASS_MIN_TEXT
 from app.core.config import get_settings
 from app.db.models import AuditLog, BackfillItem, Channel, Message
 from app.services import alerts, channels as channels_service
+from app.services import autoflow
 from app.services import cascade_registry
 from app.services import discussions as discussions_service
 from app.services import backfill_drain, engage
@@ -494,6 +495,15 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
                        "linked_group_joined": True},
                 note=f"канал подключён вместе с группой обсуждения @{username} — "
                     f"комментарии теперь видны вотчеру в реальном времени")
+        # шов автоматики (сценарий 1): канал подключён вместе с группой →
+        # очередь дочитывания. Стадия "channel" (одиночный канал без группы)
+        # шов не зовёт: читать там нечего (§9.4 контракта — «нет»).
+        try:
+            await autoflow.after_join(db, channel_id=channel_id,
+                                      source="auto:channel_add")
+        except Exception as e:  # noqa: BLE001 — финал подключения не падает из-за очереди
+            logger.warning("autoflow_after_join_failed channel=%s error=%s",
+                           channel_id, e)
         logger.info("channel_linked_group_joined channel=%s linked_peer=%s account=%s",
                    channel_id, peer_id, account_id)
         return {"accepted": 1, "channel_id": channel_id, "linked_chat_peer_id": peer_id}
