@@ -265,6 +265,11 @@ async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
     «модель не ответила» ведут к разным вердиктам, и свалив их в один словарь, мы
     получили бы отказ там, где была недоступность своей же машины.
 
+    Отмена не рвёт начатое: вопросы, уже ушедшие к модели, дожидаются ответа, и всё,
+    что успел ответить моделям до остановки, попадает в `llm_out`/`llm_errors` и в
+    трейсы — после чего стадия поднимает `Cancelled`. Ответов, заданных после отмены,
+    не бывает.
+
     Возвращает число заданных вопросов.
     """
     if limit is not None and len(jobs) > limit:
@@ -287,9 +292,16 @@ async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
     total = len(jobs)
 
     async def one(m: Message, prompt_key: str):
-        if cancelled():
-            raise Cancelled()
         async with sem:
+            # Проверка — здесь, под семафором, а не до него. `gather` создаёт все
+            # корутины разом: проверка до семафора проходится всеми в первую же
+            # секунду, до своей очереди, и дальше корутина отмены не видит никогда —
+            # на трёх тысячах вопросов стадия становится неотменяемой до конца.
+            # Под семафором проверку проходит тот, кто реально получил слот: уже
+            # ушедший к модели вопрос дожидается ответа (рвать соединение незачем),
+            # а новые вопросы после отмены не задаются.
+            if cancelled():
+                raise Cancelled()
             try:
                 parsed, trace = await llm.verdict(text=(m.text or "")[:2000],
                                                   context=contexts[m.id],
@@ -302,15 +314,38 @@ async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
                          f"L3: задано вопросов {done['n']} из {total}")
         return m, prompt_key, parsed, trace
 
-    results = await asyncio.gather(*(one(m, key) for m, key in jobs))
+    # `return_exceptions=True` обязателен: с ним gather дожидается всех корутин, и
+    # первая `Cancelled` не обрывает сбор ответов. Иначе исключение вылетело бы
+    # сразу, а соседние задачи — и уже готовые ответы, и трейсы сделанных вызовов —
+    # остались бы несобранными: до 85 минут карты в никуда. Отменённые корутины
+    # (те, что встали у семафора после отмены) возвращаются как `Cancelled` и
+    # просто пропускаются — вопрос им уже никто не задавал.
+    results = await asyncio.gather(*(one(m, key) for m, key in jobs),
+                                   return_exceptions=True)
 
-    for m, prompt_key, parsed, trace in results:
-        if parsed.get("error"):
-            llm_errors.setdefault(m.id, {})[prompt_key] = parsed["error"]
+    stop: Cancelled | None = None
+    crash: BaseException | None = None
+    for r in results:
+        if isinstance(r, Cancelled):
+            stop = stop or r
+        elif isinstance(r, BaseException):
+            crash = crash or r
         else:
-            llm_out.setdefault(m.id, {})[prompt_key] = parsed
-        if trace is not None:
-            db.add(LlmTrace(**trace))
+            m, prompt_key, parsed, trace = r
+            if parsed.get("error"):
+                llm_errors.setdefault(m.id, {})[prompt_key] = parsed["error"]
+            else:
+                llm_out.setdefault(m.id, {})[prompt_key] = parsed
+            if trace is not None:
+                db.add(LlmTrace(**trace))
+
+    # Чужая ошибка важнее отмены: она означает поломку, которую нельзя маскировать
+    # штатной остановкой. Ответы, собранные до неё, записаны выше — но коммита не
+    # будет, прогон падает целиком, как и раньше.
+    if crash is not None:
+        raise crash
+    if stop is not None:
+        raise Cancelled()
 
     return total
 
@@ -570,6 +605,12 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
     except Cancelled:
         was_cancelled = True
         summary["cancelled"] = True
+        # Ответы, успевшие прийти до отмены, обязаны стать вердиктами здесь же.
+        # `_stage_l3` прерван и сам `_apply_legacy_l3` не вызывает: без этого
+        # прохода отвеченные сообщения остались бы «в пути», и следующий прогон
+        # переспросил бы модель то, за что уже заплачено. Для отмены до L3 функция
+        # ничего не меняет: без ответов в `llm_answers` она никуда не пишет.
+        _apply_legacy_l3(messages, verdicts, llm_answers, llm_errors)
         await report(None, "остановлено; посчитанное сохранено")
 
     skipped: dict[str, int] = {}
@@ -597,5 +638,5 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
     await db.commit()
     if not was_cancelled:
         await report(100, f"готово: лидов создано {created}, удалено {removed}, "
-                          f"обновлено {kept}")
+                          f"оставлено {kept}")
     return summary
