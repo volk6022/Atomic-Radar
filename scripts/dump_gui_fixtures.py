@@ -299,6 +299,8 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/drafts/next", "/drafts/next"),
         ("/drafts/list", "/drafts/list?limit=5"),
         ("/drafts/reasons", "/drafts/reasons"),
+        # Лента отзывов о черновиках, общая для обоих контуров.
+        ("/drafts/comments", "/drafts/comments?limit=5"),
         ("/drafts/{id}", f"/drafts/{d}"),
         ("/conversations", "/conversations"),
         ("/conversations/{id}", f"/conversations/{cv}"),

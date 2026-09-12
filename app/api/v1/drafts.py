@@ -30,8 +30,9 @@ from app.api.v1.system import current_mode
 from app.core import clock
 from app.core.access import Capability, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (AuditLog, Channel, Draft, Lead, OutboundAttempt)
-from app.services import drafting
+from app.db.models import (AuditLog, Channel, Draft, DraftComment, Lead,
+                           OutboundAttempt, WfDraft, WfTarget, Workflow)
+from app.services import draft_comments, drafting
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/drafts", tags=["drafts"])
@@ -81,6 +82,7 @@ async def _payload(db, draft: Draft) -> dict:
     lead = (await db.execute(select(Lead).where(Lead.id == draft.lead_id))).scalar_one()
     channel = (await db.execute(
         select(Channel).where(Channel.id == lead.channel_id))).scalar_one()
+    comments = await draft_comments.list_for(db, "lead", draft.id)
     return {
         "id": draft.id, "lead_id": lead.id,
         "author_name": lead.author_name or "—",
@@ -99,6 +101,11 @@ async def _payload(db, draft: Draft) -> dict:
         "decided_by": draft.decided_by,
         "decided_at": draft.decided_at.isoformat() if draft.decided_at else None,
         "reject_reason": draft.reject_reason,
+        # Отзывы о черновике: решение «одобрить/отклонить» они не заменяют, но
+        # при повторном открытии карточки человек должен видеть, что уже было
+        # сказано, — иначе оставит второй отзыв о том же самом.
+        "comments": comments,
+        "comments_count": len(comments),
     }
 
 
@@ -156,12 +163,19 @@ async def next_draft(db: GetDB, after: int | None = None, state: str = "pending"
 async def list_drafts(db: GetDB, user=requires(Section.DRAFTS),
                       state: str | None = None, channel: str | None = None,
                       q: str | None = None, min_score: int = 0,
+                      has_comments: bool | None = None,
                       limit: int = 100, offset: int = 0):
     """Полный список черновиков — то, чего очереди принципиально не хватает.
 
     Очередь показывает по одному и только неразобранные: так и задумано, иначе
     ревью превращается в блуждание. Но после решения черновик из неё исчезает, и
     без этого списка одобренный текст нельзя ни перечитать, ни показать заказчику.
+
+    `has_comments` отвечает на вопрос «что уже обсуждаемо»: черновики с отзывами —
+    это то, про что люди высказались, и разбирать их стоит первыми; без отзывов —
+    остальное. Трихотомия осознанная: `None` значит «без фильтра», и отдавать при
+    пустом параметре только «без комментариев» значило бы молча спрятать половину
+    очереди.
     """
     await _ensure_queue(db)
 
@@ -189,10 +203,20 @@ async def list_drafts(db: GetDB, user=requires(Section.DRAFTS),
                      func.lower(Lead.author_username).like(like),
                      func.lower(Lead.quote).like(like))
         stmt, count_stmt = stmt.where(search), count_stmt.where(search)
+    if has_comments is not None:
+        # Подзапрос сужен контуром "lead" сознательно: у таблицы отзывов ссылки
+        # полиморфные, и без условия в фильтр попали бы id черновиков другого
+        # контура, а с ними и чужие счётчики.
+        commented = select(DraftComment.draft_id).where(
+            DraftComment.contour == "lead")
+        marked = Draft.id.in_(commented) if has_comments else ~Draft.id.in_(commented)
+        stmt, count_stmt = stmt.where(marked), count_stmt.where(marked)
 
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(
         stmt.order_by(Draft.id.desc()).limit(limit).offset(offset))).all()
+
+    counts = await draft_comments.counts_for(db, "lead", [d.id for d, _, _ in rows])
 
     out = []
     for draft, lead, channel_row in rows:
@@ -210,6 +234,7 @@ async def list_drafts(db: GetDB, user=requires(Section.DRAFTS),
             "reject_reason": draft.reject_reason,
             "decided_by": draft.decided_by,
             "decided_at": draft.decided_at.isoformat() if draft.decided_at else None,
+            "comments_count": counts.get(draft.id, 0),
         })
 
     return {"total": total, "limit": limit, "offset": offset, "rows": out,
@@ -223,6 +248,151 @@ async def reject_reasons(user=requires(Section.DRAFTS)):
     """Справочник причин отклонения. Список закрытый: причина уходит в eval-датасет,
     на котором меряется качество генерации, и свободный текст его размывает."""
     return REASONS
+
+
+# ── комментарии к черновикам ──────────────────────────────────────────────────
+#
+# Лента объявлена ВЫШЕ `/{draft_id}` намеренно — см. предупреждение перед ним.
+# Ручки под `/{draft_id}/comments` перехвачены быть не могут (путь другой), но
+# живут здесь же, чтобы все отзывы были в одном месте.
+
+# Лента — обозримый хвост, как у ручных отправок: «что люди говорят о черновиках»
+# не должно требовать пролистывания тысяч строк.
+COMMENT_FEED_LIMIT = 200
+
+# Сколько текста черновика показывать в строке ленты. Это аннотация «о чём отзыв»,
+# а не сам черновик: карточка по прямой ссылке покажет целиком.
+COMMENT_TEXT_CHARS = 160
+
+
+def _comment_draft_text(draft, variant_index: int | None) -> str:
+    """О чём отзыв: первые символы черновика — правка, затем вариант из отзыва,
+    затем первый. Порядок тот же, по которому человек читал черновик на экране:
+    сохранённая правка замещает вариант, «вариант не указан» выглядит как
+    показанный первым."""
+    if draft is None:
+        return ""
+    if draft.final_text:
+        text = draft.final_text
+    else:
+        variants = draft.variants or []
+        index = (variant_index
+                 if variant_index is not None and 0 <= variant_index < len(variants)
+                 else 0)
+        text = variants[index].get("text") if variants else ""
+    return (text or "")[:COMMENT_TEXT_CHARS]
+
+
+@router.get("/comments")
+async def comments_feed(db: GetDB, user=requires(Section.DRAFTS),
+                        limit: int = 50, offset: int = 0,
+                        contour: str | None = None):
+    """Лента отзывов о черновиках обоих контуров — для того, кто правит промпты.
+
+    Одна ручка, а не по ленте на контур: генерация правится по обоим сразу, и
+    читать отзывы в двух местах значило бы половину из них не увидеть. Отзывы
+    сами по себе контекста не несут — «второе предложение звучит как реклама»
+    о каком предложении? — поэтому каждая строка тянет за собой черновик:
+    состояние, канал, сценарий и текст, к которому отзыв оставлен.
+
+    Данные черновиков добираются двумя запросами (по одному на контур), а не
+    по одному на строку: страница ленты в пятьдесят строк иначе превращается
+    в сотню обращений к базе. Пропавший черновик строку не выбрасывает — отзыв
+    переживает черновик, и молча потерять его значит потерять сказанное.
+    """
+    limit = max(1, min(limit, COMMENT_FEED_LIMIT))
+    offset = max(0, offset)
+
+    stmt = select(DraftComment)
+    count_stmt = select(func.count(DraftComment.id))
+    if contour:
+        stmt = stmt.where(DraftComment.contour == contour)
+        count_stmt = count_stmt.where(DraftComment.contour == contour)
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(
+        stmt.order_by(DraftComment.created_at.desc(), DraftComment.id.desc())
+        .limit(limit).offset(offset))).scalars().all()
+
+    # Свежие — выше: читают ленту как журнал, а не как архив.
+    lead_ids = [r.draft_id for r in rows if r.contour == "lead"]
+    wf_ids = [r.draft_id for r in rows if r.contour == "wf"]
+
+    leads: dict[int, tuple[Draft, str]] = {}
+    if lead_ids:
+        for d, channel_row in (await db.execute(
+                select(Draft, Channel)
+                .join(Lead, Draft.lead_id == Lead.id)
+                .join(Channel, Lead.channel_id == Channel.id)
+                .where(Draft.id.in_(lead_ids)))).all():
+            leads[d.id] = (d, channel_row.title)
+
+    wfs: dict[int, tuple[WfDraft, str, str]] = {}
+    if wf_ids:
+        for d, wf_row, channel_row in (await db.execute(
+                select(WfDraft, Workflow, Channel)
+                .join(Workflow, WfDraft.workflow_id == Workflow.id)
+                .join(WfTarget, WfDraft.target_id == WfTarget.id)
+                .join(Channel, WfTarget.channel_id == Channel.id)
+                .where(WfDraft.id.in_(wf_ids)))).all():
+            wfs[d.id] = (d, wf_row.key, channel_row.title)
+
+    out = []
+    for c in rows:
+        row = draft_comments.as_dict(c)
+        if c.contour == "lead":
+            d, title = leads.get(c.draft_id, (None, None))
+            row.update({"draft_state": d.state if d else None, "channel": title,
+                        "workflow": None,
+                        "draft_text": _comment_draft_text(d, c.variant_index)})
+        else:
+            d, key, title = wfs.get(c.draft_id, (None, None, None))
+            row.update({"draft_state": d.state if d else None, "channel": title,
+                        "workflow": key,
+                        "draft_text": _comment_draft_text(d, c.variant_index)})
+        out.append(row)
+    return {"total": total, "limit": limit, "offset": offset, "rows": out}
+
+
+class CommentRequest(BaseModel):
+    """Тело отзыва. Живёт здесь и импортируется контуром `wf` — как справочник
+    причин: две схемы значили бы два мнения о допустимой длине отзыва."""
+    text: str = Field(min_length=1, max_length=4000)
+    variant_index: int | None = None
+
+
+@router.post("/{draft_id}/comments", status_code=status.HTTP_201_CREATED)
+async def add_comment(draft_id: int, body: CommentRequest, db: GetDB,
+                      user=requires(Section.DRAFTS)):
+    """Оставить отзыв о черновике — свободным текстом, сколько угодно раз.
+
+    Право — по разделу, без отдельного разрешения: комментирование ничего не
+    меняет в черновике и наружу от него не уходит, а запретить записывать мнение
+    значит остаться без данных (та же логика, что у записи ручных отправок).
+    """
+    draft = (await db.execute(
+        select(Draft).where(Draft.id == draft_id))).scalar_one_or_none()
+    if draft is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"черновик {draft_id} не найден")
+    comment = await draft_comments.add(
+        db, contour="lead", draft_id=draft.id, variants=draft.variants or [],
+        draft_prompt_version=draft.prompt_version, user=user, text=body.text,
+        variant_index=body.variant_index)
+    await db.commit()
+    logger.info("draft_commented draft=%s by=%s", draft_id, user.email)
+    return draft_comments.as_dict(comment)
+
+
+@router.delete("/{draft_id}/comments/{comment_id}")
+async def delete_comment(draft_id: int, comment_id: int, db: GetDB,
+                         user=requires(Section.DRAFTS)):
+    """Удалить отзыв: свой — сразу, чужой — только владельцу (проверка в сервисе)."""
+    await draft_comments.delete(db, contour="lead", draft_id=draft_id,
+                                comment_id=comment_id, user=user)
+    await db.commit()
+    logger.info("draft_comment_deleted draft=%s comment=%s by=%s",
+                draft_id, comment_id, user.email)
+    return {"deleted": comment_id}
 
 
 # ВНИМАНИЕ: всё, что объявлено ниже `/{draft_id}`, будет им перехвачено —

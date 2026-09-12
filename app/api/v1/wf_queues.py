@@ -41,17 +41,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Date, cast, func, literal_column, select
 
 from app.api.deps import CurrentUser, GetDB, permits, requires
-from app.api.v1.drafts import REASON_BY_N
+from app.api.v1.drafts import CommentRequest, REASON_BY_N
 from app.api.v1.leads import BULK_ACTIONS, BulkRequest
 from app.api.v1.listing import ListParams, apply_search, apply_sort, list_params
 from app.api.v1.system import current_mode
 from app.core import cascade, clock
 from app.core.access import BULK_LIMIT_REVIEWER, Capability, Role, Section
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (Account, AuditLog, Channel, EngageInstance, ManualSend,
-                           Message, MessageReader, WfDraft, WfOutbound, WfTarget,
-                           WfVerdict, Workflow)
-from app.services import (drafting, engage, manual_sends as manual_sends_service,
+from app.db.models import (Account, AuditLog, Channel, DraftComment, EngageInstance,
+                           ManualSend, Message, MessageReader, WfDraft, WfOutbound,
+                           WfTarget, WfVerdict, Workflow)
+from app.services import (draft_comments, drafting,
+                          engage, manual_sends as manual_sends_service,
                           wf_drafting, workflows as workflow_service)
 
 logger = logging.getLogger("radar")
@@ -540,7 +541,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
                  p: ListParams = Depends(list_params),
                  state: str | None = None,
-                 account_id: int | None = None):
+                 account_id: int | None = None,
+                 has_comments: bool | None = None):
     """Очередь заготовок сценария.
 
     **Ручка не только читает** — она достраивает очередь: целям без черновика заводит
@@ -560,6 +562,12 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     одинаково к строкам, `total` и сводке `states`. Сводка «вообще», а выборка
     «в срезе» — дефект, уже пойманный на `/channels`: чипс говорил 1, фильтр
     отдавал 2.
+
+    Фильтр `has_comments` — тот же, что у старого списка (`/api/v1/drafts/list`):
+    отзыв о черновике значит «обсуждается», и такие строки ищут первыми. Он режет
+    строки и `total`; сводка состояний, как и у старого списка, остаётся общей
+    по сценарию — чипсы отвечают на «сколько всего в каждом статусе», а не «сколько
+    в срезе».
     """
     _check(state, DRAFT_STATES, "статус")
     instance_key = await _instance_key(db, wf)
@@ -588,6 +596,13 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         q = q.where(seen)
         count_q = count_q.where(seen)
         states_q = states_q.where(seen)
+    if has_comments is not None:
+        # Контур "wf" в подзапросе обязателен: ссылки на черновики полиморфные,
+        # и id из старого контура попали бы в фильтр этого.
+        commented = select(DraftComment.draft_id).where(DraftComment.contour == "wf")
+        marked = WfDraft.id.in_(commented) if has_comments else ~WfDraft.id.in_(commented)
+        q = q.where(marked)
+        count_q = count_q.where(marked)
 
     total = (await db.execute(count_q)).scalar_one()
     q = apply_sort(q, p, DRAFT_SORTS, default="created", tiebreak=WfDraft.id)
@@ -595,6 +610,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
     by_state = dict((await db.execute(
         states_q.group_by(WfDraft.state))).all())
+
+    counts = await draft_comments.counts_for(db, "wf", [d.id for d, _, _ in rows])
 
     readers = await _readers_by_message(
         db, instance_key, [t.message_id for _, t, _ in rows])
@@ -611,6 +628,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         "quote": t.quote,
         "readers": readers.get(t.message_id, []),
         "source": source.get(t.message_id),
+        "comments_count": counts.get(d.id, 0),
         "variants": d.variants or [],
         "chosen_variant": d.chosen_variant, "final_text": d.final_text,
         "reject_reason": d.reject_reason,
@@ -625,7 +643,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
 
 def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
-         readers: list[dict], source: dict | None = None) -> dict:
+         readers: list[dict], source: dict | None = None,
+         comments: list[dict] | None = None) -> dict:
     """Черновик целиком — для карточки, а не для строки таблицы.
 
     Одна форма на курсорную выдачу и на прямую ссылку: экран у них общий, и разойдись
@@ -635,6 +654,10 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
     Атрибуция приёма (`readers`) и ссылка на адресата (`tg_link`) — те же поля, что
     у строки списка, по той же причине: карточка и строка это один экран, и аккаунт
     должен быть виден в обоих местах, а не только в одном из них.
+
+    Отзывы (`comments`) функция сама не достаёт — она синхронная и без сессии базы;
+    их приносит вызывающая ручка (`draft_comments.list_for`), чтобы курсор и
+    прямая ссылка не могли показать карточку с разным числом отзывов.
     """
     return {
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -653,6 +676,8 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
         # Карточку рисует один и тот же экран, и расхождение в одном ключе означало
         # бы, что ветку вокруг цели он показывает только в одном из двух контуров.
         "thread": d.thread_context or [],
+        "comments": comments or [],
+        "comments_count": len(comments or []),
         "chosen_variant": d.chosen_variant, "final_text": d.final_text,
         "reject_reason": d.reject_reason, "decided_by": d.decided_by,
         "decided_at": d.decided_at.isoformat() if d.decided_at else None,
@@ -728,8 +753,9 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
     if row is not None:
         readers = await _readers_by_message(db, instance_key, [row[1].message_id])
         source = await _source_by_message(db, {row[2].id: row[2]}, [row[1]])
+        comments = await draft_comments.list_for(db, "wf", row[0].id)
         one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []),
-                   source.get(row[1].message_id))
+                   source.get(row[1].message_id), comments)
 
     # `readers` и `tg_link` продублированы на верхний уровень конверта — как у
     # прямой ссылки на карточку: конверты у ручек обязаны совпадать, экран их не
@@ -795,11 +821,68 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
     readers = (await _readers_by_message(
         db, await _instance_key(db, wf), [t.message_id])).get(t.message_id, [])
     source = await _source_by_message(db, {row[2].id: row[2]}, [t])
-    one = _one(wf, d, t, row[2], readers, source.get(t.message_id))
+    comments = await draft_comments.list_for(db, "wf", d.id)
+    one = _one(wf, d, t, row[2], readers, source.get(t.message_id), comments)
     return {"remaining": await _pending(db, wf), "state": d.state,
             "workflow": wf.key,
             "readers": one["readers"], "tg_link": one["tg_link"],
             "draft": one}
+
+
+# ── комментарии к черновикам сценария ─────────────────────────────────────────
+
+async def _wf_draft_or_404(db, wf: Workflow, draft_id: int) -> WfDraft:
+    """Черновик этого сценария — или 404. Одна проверка на чтение и удаление
+    отзывов: без неё черновик соседнего конвейера правился бы по прямой ссылке
+    под чужим ключом сценария (см. `draft()` о той же проверке в запросе)."""
+    d = (await db.execute(
+        select(WfDraft).where(WfDraft.id == draft_id,
+                              WfDraft.workflow_id == wf.id))).scalar_one_or_none()
+    if d is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            f"черновик {draft_id} в сценарии {wf.key!r} не найден")
+    return d
+
+
+@router.post("/drafts/{draft_id}/comments", status_code=status.HTTP_201_CREATED)
+async def add_draft_comment(draft_id: int, body: CommentRequest, db: GetDB,
+                            wf: Workflow = GetWorkflow,
+                            user=requires(Section.DRAFTS)):
+    """Оставить отзыв о черновике — та же форма, что у старого контура.
+
+    Тело и ответ общие с `/api/v1/drafts` сознательно: экран отзыва один на оба
+    контура, и разойдись формы, одна и та же кнопка в одном блоке отвечала бы 201,
+    а в другом — 422. Отличается только значение `contour`, по нему лента отличает
+    отзыв о заготовке сценария от отзыва о старом черновике.
+    """
+    d = await _wf_draft_or_404(db, wf, draft_id)
+    comment = await draft_comments.add(
+        db, contour="wf", draft_id=d.id, variants=d.variants or [],
+        draft_prompt_version=d.prompt_version, user=user, text=body.text,
+        variant_index=body.variant_index)
+    await db.commit()
+    logger.info("draft_commented workflow=%s draft=%s by=%s",
+                wf.key, draft_id, user.email)
+    return draft_comments.as_dict(comment)
+
+
+@router.delete("/drafts/{draft_id}/comments/{comment_id}")
+async def delete_draft_comment(draft_id: int, comment_id: int, db: GetDB,
+                               wf: Workflow = GetWorkflow,
+                               user=requires(Section.DRAFTS)):
+    """Удалить отзыв: свой — сразу, чужой — только владельцу (проверка в сервисе).
+
+    Принадлежность черновика сценарию проверяется наравне с созданием: удалять
+    отзывы черновика соседнего конвейера через чужой ключ значило бы иметь два
+    разных ответа на один и тот же вопрос «чей это отзыв».
+    """
+    d = await _wf_draft_or_404(db, wf, draft_id)
+    await draft_comments.delete(db, contour="wf", draft_id=d.id,
+                                comment_id=comment_id, user=user)
+    await db.commit()
+    logger.info("draft_comment_deleted workflow=%s draft=%s comment=%s by=%s",
+                wf.key, draft_id, comment_id, user.email)
+    return {"deleted": comment_id}
 
 
 # ── решения по целям ──────────────────────────────────────────────────────────

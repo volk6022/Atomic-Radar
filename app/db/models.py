@@ -1188,3 +1188,45 @@ class ManualSend(Base):
         Index("ix_manual_wf_sent", "workflow_id", "sent_at"),
         Index("ix_manual_target", "target_id"),
     )
+
+
+class DraftComment(Base):
+    """Свободный отзыв человека о черновике — рядом с вердиктом «одобрить/отклонить».
+
+    Причина отклонения — код из закрытого справочника, правка — «как надо было
+    написать»; ни то, ни другое не передаёт развёрнутого мнения: что в тексте
+    понравилось, где попали в боль, а где нет, что поправить в промпте генерации.
+    Для этого мнения и заведена таблица: записей на черновик сколько угодно, текст
+    свободный. Их читает тот, кто правит промпты, — по ленте всех отзывов сразу.
+
+    Внешнего ключа нет и не может быть: черновики живут в двух контурах (`drafts`
+    и `wf_drafts`), и ссылка «(contour, draft_id)» полиморфная — целостность держит
+    ручка. Вторая таблица, по одной на контур, значила бы и вторую ленту, а лента
+    отзывов одна: правка промптов ведётся по обоим контурам сразу, и развивать её
+    в двух местах означало бы, что отзывы одного контура перестают быть видны тому,
+    кто правит другой.
+
+    `prompt_version` — снимок на момент отзыва: `variants[variant_index].prompt_version`,
+    если отзыв про конкретный вариант, иначе `draft.prompt_version`. Отзыв нужен
+    ради правки промпта, а промпты меняются; без снимка через месяц было бы неясно,
+    к какой версии генерации относилось «второе предложение звучит как реклама».
+    """
+    __tablename__ = "draft_comments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # "lead" — таблица drafts (старый контур), "wf" — wf_drafts.
+    contour: Mapped[str] = mapped_column(String(8), nullable=False)
+    # id черновика в таблице СВОЕГО контура; проверка принадлежности — в ручке.
+    draft_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL — отзыв к черновику целиком, число — к конкретному варианту.
+    variant_index: Mapped[int | None] = mapped_column(Integer)
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+    author_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created()
+
+    __table_args__ = (
+        # Лента отзывов одного черновика и счётчики строк списков — оба запроса
+        # идут «по этому черновику, свежие раньше».
+        Index("ix_draft_comment_draft", "contour", "draft_id", "created_at"),
+    )

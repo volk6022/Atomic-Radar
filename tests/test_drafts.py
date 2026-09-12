@@ -67,6 +67,47 @@ def test_reject_validates_reason_before_touching_anything(client):
                        json={"reason_n": 99}).status_code in (401, 422)
 
 
+# ── комментарии ───────────────────────────────────────────────────────────────
+
+def test_comment_endpoints_require_auth(client):
+    """Отзывы о черновиках — те же данные черновиков, гостю их читать и писать
+    нельзя. Проверяются все три: лента, запись и удаление."""
+    assert client.get("/api/v1/drafts/comments").status_code == 401
+    assert client.post("/api/v1/drafts/1/comments",
+                       json={"text": "отзыв"}).status_code == 401
+    assert client.delete("/api/v1/drafts/1/comments/1").status_code == 401
+
+
+def test_comments_feed_is_not_shadowed_by_draft_id(client):
+    """`GET /comments` обязан быть объявлен ВЫШЕ `/{draft_id}`: маршруты разбираются
+    по порядку, и литеральный путь, оказавшийся ниже, перехватывается параметризо-
+    ванным — так уже уезжал `/reasons`. Анонимный запрос обязан доходить до проверки
+    сессии и получать 401, а не 422 «draft_id не число» от чужой ручки."""
+    assert client.get("/api/v1/drafts/comments").status_code == 401
+
+
+def test_empty_comment_text_is_refused_before_the_database(client):
+    """Пустой текст отсекается схемой тела — до базы дело не доходит.
+
+    Без живой базы «доходит ли до базы» проверяется буквально: любой поход ручки
+    в базу упал бы с 500, а не 422. Сессия подменяется целиком — здесь проверяется
+    не вход, а порядок «схема тела раньше базы».
+    """
+    from app.api import deps
+
+    class _FakeUser:
+        id = 1
+        email = "owner@local"
+        role = "owner"
+
+    client.app.dependency_overrides[deps.current_user] = lambda: _FakeUser()
+    try:
+        r = client.post("/api/v1/drafts/1/comments", json={"text": ""})
+        assert r.status_code == 422
+    finally:
+        client.app.dependency_overrides.pop(deps.current_user)
+
+
 # ── сборка вариантов ──────────────────────────────────────────────────────────
 
 def test_variants_exist_for_every_pain_the_cascade_can_emit():

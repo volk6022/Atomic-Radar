@@ -109,6 +109,19 @@ STATEMENTS: list[str] = [
     # на проде уже создана create_all, колонку в неё досоздаёт только эта строка.
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS l1_bypass_enabled BOOLEAN "
     "NOT NULL DEFAULT FALSE",
+
+    # 2026-09-12, комментарии к черновикам (просьба заказчика). Таблица новая,
+    # но создаётся отсюда, а не только create_all: прод читает DDL исключительно
+    # из этого списка, и типы обязаны совпадать с моделью колонка в колонку.
+    # Внешнего ключа на черновики нет намеренно — ссылка полиморфная, см.
+    # докстринг DraftComment.
+    "CREATE TABLE IF NOT EXISTS draft_comments ("
+    "id BIGSERIAL PRIMARY KEY, contour VARCHAR(8) NOT NULL, "
+    "draft_id BIGINT NOT NULL, variant_index INTEGER, prompt_version VARCHAR(32), "
+    "author_email VARCHAR(255) NOT NULL, text TEXT NOT NULL, "
+    "created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS ix_draft_comment_draft "
+    "ON draft_comments (contour, draft_id, created_at)",
 ]
 
 
