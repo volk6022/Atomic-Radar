@@ -17,8 +17,8 @@
 старта, и набор настроек; второй список тех же ключей рядом разъехался бы с
 первым молча.
 
-Швы сценариев дописывают свои волны, по одному: `after_join` — волна Б (ниже),
-`reclassify_tick`, `scan_tick`, `approve_tick` — волны В, Г и Д. Заглушек и тел
+Швы сценариев дописывают свои волны, по одному: `after_join` и `reclassify_tick`
+— волны Б и В (ниже), `scan_tick`, `approve_tick` — волны Г и Д. Заглушек и тел
 «на вырост» нет: функция-заполнитель выглядела бы «сценарием, который ничего
 не делает», и от ещё не написанного её было бы не отличить.
 """
@@ -28,17 +28,20 @@ import logging
 from datetime import datetime, timedelta
 from typing import Mapping
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal_column, select
 from sqlalchemy.exc import IntegrityError
 
 # Форма строки прогона — дословно `runs._row` (решение ревью): одна форма прогона
 # на все экраны, а не вторая, которая разъедется с первой. Цикла импорта нет:
-# `runs` тянет службы (jobs, discovery), но ни одна из них не тянет `autoflow`.
+# `runs` тянет службы (jobs, discovery), но ни одна из них не тянет `autoflow`;
+# `jobs` тоже чист — его собственные импорты (`discussions`, `discovery`,
+# `reclassify`…) автотех не знают.
 from app.api.v1.runs import _row
 from app.core import clock
 from app.db.models import (AuditLog, BackfillItem, Channel, ChannelCandidate,
                            Limit, Message, Run)
-from app.services import backfill_queue, discovery
+from app.db.session import get_session_maker
+from app.services import backfill_queue, discovery, jobs
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +270,79 @@ async def after_join(db, *, channel_id: int, source: str) -> dict:
     return {"enabled": True, "queued": queued, "skipped": skipped}
 
 
+# ── сценарий 2: дочитал/принял → доклассифицировал ────────────────────────────
+
+async def reclassify_tick(ctx: dict) -> dict:
+    """Один удар сценария 2 (§3.2): поставить автопрогон доклассификации ждущих L2.
+
+    Бьётся каждые пять минут, а интервал может быть длиннее: тик сам сверяет окно
+    с последним завершённым прогоном вида — любого автора (ручной прогон разобрал
+    тех же ждущих и карту бережёт так же, как авто). Холостой удар стоит один
+    SELECT — нулевая работа против второй дороги-расписания.
+
+    Порция — топ каналов по числу ждущих (`_waiting_channels`): потолок вопросов
+    L3 конечен. Прогон с `channel_ids` жёстко create-only: автопрогон никогда не
+    перезаписывает и не удаляет чужое, недосчитанное дожмёт следующий удар.
+
+    Падать не имеет права (образец — `discovery_check_tick`): исключение на ровном
+    месте залило бы журнал воркера приёма ложными отказами. `JobBusy` — не ошибка
+    и не `last_error`, а штатное «занято»: тихий пропуск, лог уровня info.
+    """
+    try:
+        maker = get_session_maker()
+        async with maker() as db:
+            lim = await thresholds(db)
+            # Ждущие считаются всегда, даже при выключенном сценарии: возврат тика
+            # — единственное место, где arq-задача отчитывается, чем дышит очередь.
+            waiting_channels, waiting_messages = await _waiting_stats(db)
+            started = busy = interval_wait = False
+            if int(lim["autoflow_reclassify_enabled"]) == 1 and waiting_channels:
+                try:
+                    if await jobs.active_run(db, "reclassify") is not None:
+                        busy = True
+                    else:
+                        last = await _last_finished_at(db, kind="reclassify")
+                        interval = timedelta(
+                            minutes=int(lim["autoflow_reclassify_interval_min"]))
+                        if last is not None and clock.utcnow() < last + interval:
+                            interval_wait = True
+                        else:
+                            ids = await _waiting_channels(
+                                db, int(lim["autoflow_reclassify_batch_channels"]))
+                            params = {"scope": "pending", "channel_ids": ids,
+                                      "l3_limit":
+                                          int(lim["autoflow_reclassify_l3_limit"])}
+                            run = await jobs.start(
+                                db, kind="reclassify", params=params,
+                                name=f"Переклассификация · недосчитанное · каналы "
+                                     f"{', '.join(str(i) for i in ids)}",
+                                user_email="auto:reclassify")
+                            # Тот же аудит, что у ручки запуска (`runs.py`), но от
+                            # авто: автор строки — единственная метка источника.
+                            db.add(AuditLog(
+                                user_id=None, user_email="auto:reclassify",
+                                action="run_start",
+                                detail={"run_id": run.id, "kind": "reclassify",
+                                        "params": params}, ip=None))
+                            await db.commit()
+                            started = True
+                except jobs.JobBusy as e:
+                    # Гонка с чужим запуском: «занято» проходит само, наружу —
+                    # не ошибка (§0.4), состояние и так видно по строке runs.
+                    logger.info("autoflow_reclassify_tick_busy error=%s", e)
+                    busy = True
+    except Exception as e:  # noqa: BLE001 — тик не вправе уронить воркера приёма
+        logger.warning("autoflow_reclassify_tick_failed error=%s", e)
+        return {"started": False, "busy": False, "interval_wait": False,
+                "waiting_channels": 0, "waiting_messages": 0}
+    logger.info("autoflow_reclassify_tick started=%s busy=%s interval_wait=%s "
+                "waiting=%s/%s", started, busy, interval_wait, waiting_channels,
+                waiting_messages)
+    return {"started": started, "busy": busy, "interval_wait": interval_wait,
+            "waiting_channels": waiting_channels,
+            "waiting_messages": waiting_messages}
+
+
 # ── сводка для экрана ─────────────────────────────────────────────────────────
 
 # Сценарии, у которых бывают прогоны: вид задачи и автор строки (§0.2). Сценарий 1
@@ -281,6 +357,44 @@ _RUN_SCENARIOS = {
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
+
+
+async def _waiting_stats(db) -> tuple[int, int]:
+    """`(каналы, сообщения)` ждущих доклассификации: `cascade_level = 2` без
+    вердикта каскада. Единая выборка для экрана и тика сценария 2: число на
+    «Автоматике» и порция автопрогона не должны уметь расходиться."""
+    waiting = (Message.cascade_level == 2, Message.cascade_passed.is_(None))
+    channels = (await db.execute(
+        select(func.count(func.distinct(Message.channel_id))).where(*waiting))
+        ).scalar_one()
+    messages = (await db.execute(
+        select(func.count(Message.id)).where(*waiting))).scalar_one()
+    return channels, messages
+
+
+async def _waiting_channels(db, batch: int) -> list[int]:
+    """Порция каналов под автопрогон: топ по числу ждущих убыванием, при равенстве
+    — меньший id первым (SQL из §3.2 контракта дословно по смыслу), не больше
+    `batch`. Прогону не хватает `l3_limit` вопросов на всех: польза максимальна
+    там, где ждущих больше, а давность всё равно догонит следующий удар — интервал
+    не длиннее часа."""
+    rows = (await db.execute(
+        select(Message.channel_id, func.count(Message.id).label("waiting"))
+        .where(Message.cascade_level == 2, Message.cascade_passed.is_(None))
+        .group_by(Message.channel_id)
+        .order_by(literal_column("waiting").desc(), Message.channel_id.asc())
+        .limit(batch))).all()
+    return [row.channel_id for row in rows]
+
+
+async def _last_finished_at(db, *, kind: str) -> datetime | None:
+    """Момент последнего завершённого прогона вида — любого автора (`discovery.
+    _waiting_budget`). Ручной прогон и авто читают одну и ту же выборку, и окно
+    от последнего из них бережёт карту одинаково."""
+    return (await db.execute(
+        select(Run.finished_at).where(Run.kind == kind,
+                                      Run.finished_at.is_not(None))
+        .order_by(Run.finished_at.desc(), Run.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def _last_run(db, *, kind: str, author: str) -> Run | None:
@@ -338,20 +452,12 @@ async def status(db) -> dict:
 
     # Сценарий 2 — ждущие L2: та же выборка, что у тика (§3.2 контракта), чтобы
     # число на экране и порция тика не могли разойтись.
-    waiting = (Message.cascade_level == 2, Message.cascade_passed.is_(None))
-    waiting_channels = (await db.execute(
-        select(func.count(func.distinct(Message.channel_id))).where(*waiting))
-        ).scalar_one()
-    waiting_messages = (await db.execute(
-        select(func.count(Message.id)).where(*waiting))).scalar_one()
+    waiting_channels, waiting_messages = await _waiting_stats(db)
 
     # Окно сценария 2 отсчитывается от последнего завершённого прогона вида
     # ЛЮБОГО автора: ручной прогон только что разобрал тех же ждущих, и бережёт
     # карту он так же, как авто.
-    last_finished = (await db.execute(
-        select(Run.finished_at).where(Run.kind == "reclassify",
-                                      Run.finished_at.is_not(None))
-        .order_by(Run.finished_at.desc(), Run.id.desc()).limit(1))).scalar_one_or_none()
+    last_finished = await _last_finished_at(db, kind="reclassify")
     reclassify_next_at = None
     if last_finished is not None:
         reclassify_next_at = _iso(last_finished + timedelta(
