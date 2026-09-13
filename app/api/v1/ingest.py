@@ -39,13 +39,14 @@ from sqlalchemy import and_, func, select
 
 from app.api.deps import GetDB, permits, requires
 from app.core import clock
-from app.core.access import Capability, Section
+from app.core.access import Capability, Section, allows
 from app.core.cascade import L1_BYPASS_MIN_TEXT
 from app.core.config import get_settings
 from app.db.models import AuditLog, BackfillItem, Channel, Message
 from app.services import alerts, channels as channels_service
 from app.services import autoflow
 from app.services import cascade_registry
+from app.services import channel_add
 from app.services import discussions as discussions_service
 from app.services import backfill_drain, engage
 from app.services import ingest as ingest_service
@@ -374,27 +375,12 @@ async def _handle_chat_info(db, result: dict, q) -> dict:
             "linked_chat_username": linked, "next": next_step}
 
 
-async def _start_join_chain(*, account_id: int, username: str, run_id: int,
-                            subscribed_by: str, stage: str,
-                            channel_id: int | None = None) -> None:
-    """Заказать `join_group` и подписать вебхук возврата так, чтобы `_handle_join`
-    знал, куда вести цепочку дальше.
-
-    `stage` различает два прохода одной и той же пары шагов (`join` →
-    `chat_info_join`): `"channel"` — подписка на сам канал, `"linked"` — на его
-    группу обсуждения, запрошенная вторым проходом уже известным `channel_id`.
-    Без общего имени пришлось бы заводить две пары функций ради разницы в
-    несколько строк на финализации.
-    """
-    # `target`, а не `username`: воркер Engage читает из payload `invite_link` или
-    # `target` (`app/workers/join_group.py`) и про `username` не знает — с ним
-    # вступление уходило в `join_chat(None)`. Проверено 31.08 по коду воркера на
-    # проде; на стенде это не всплывало, потому что живого Engage там нет.
-    await engage.action(
-        account_id=account_id, action="join_group", payload={"target": username},
-        webhook_url=engage.webhook_url(kind="join", account_id=account_id, username=username,
-                                 run_id=run_id, subscribed_by=subscribed_by, stage=stage,
-                                 channel_id=channel_id or 0))
+# Прежнее имя цепочки — тонкий алиас на службу: тело переехало дословно в
+# `channel_add.start_join_chain` (одна дорога подключения), второй копии нет.
+# Старое имя оставлено для тех, кто звал его через этот модуль:
+# `tests/test_join_payload.py` держит контракт payload'а `target` именно через
+# `ingest._start_join_chain`, а чужие тесты не правятся.
+_start_join_chain = channel_add.start_join_chain
 
 
 async def _handle_join(db, result: dict, q) -> dict:
@@ -444,7 +430,8 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
     """Финал одного прохода подключения канала: карточка получена.
 
     Стадия `"channel"` заводит строку `channels`, включает отслеживание и, если у
-    канала есть группа обсуждения, запускает второй проход `_start_join_chain` тем
+    канала есть группа обсуждения, запускает второй проход
+    `channel_add.start_join_chain` тем
     же аккаунтом на неё — без вступления в группу вотчер видит только посты
     канала, а лиды живут в комментариях. Стадия `"linked"` дописывает
     `linked_chat_peer_id` уже существующему каналу и закрывает задачу.
@@ -525,9 +512,10 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
 
     if linked and account_id:
         try:
-            await _start_join_chain(account_id=account_id, username=linked, run_id=run_id,
-                                    subscribed_by=subscribed_by or "", stage="linked",
-                                    channel_id=channel.id)
+            await channel_add.start_join_chain(
+                account_id=account_id, username=linked, run_id=run_id,
+                subscribed_by=subscribed_by or "", stage="linked",
+                channel_id=channel.id)
         except engage.EngageUnavailable as e:
             if run_id:
                 await jobs.finish(
@@ -673,82 +661,81 @@ async def add_channel(body: AddChannelRequest, request: Request, db: GetDB,
     и означает «подписка запрошена», а не «канал подключён»: `join_group` у
     Engage идёт через хьюманайзер с паузой 60–300 секунд — итог придёт вебхуком,
     ход виден в разделе Runs.
+
+    Тело ручки — только перевод исключений службы в коды HTTP: дорога
+    подключения одна (`channel_add.start`), её же зовёт автоподключение
+    одобренных кандидатов, иначе две копии цепочки разъехались бы молча.
     """
     username = body.username.lstrip("@").strip()
     if not username:
         raise HTTPException(422, "пустой username")
 
-    existing = (await db.execute(
-        select(Channel).where(Channel.username == username))).scalar_one_or_none()
-    if existing is not None and existing.ingest_enabled:
-        raise HTTPException(409, f"канал @{username} уже отслеживается (id {existing.id})")
-    if existing is not None and not existing.ingest_enabled:
-        raise HTTPException(
-            409, f"канал @{username} уже был подключён и отслеживание снято — "
-                f"включите его снова (PATCH /channels/{existing.id}), а не "
-                f"подключайте заново: аккаунт уже подписан")
-
     try:
-        run = await jobs.create_external(
-            db, kind="channel_add",
-            params={"username": username, "engage_account_id": body.engage_account_id},
-            name=f"Подключение канала · @{username}", user_email=user.email)
+        run = await channel_add.start(
+            db, username=username, account_id=body.engage_account_id,
+            actor=user.email, ip=request.client.host if request.client else None)
+    except channel_add.ChannelExists as e:
+        raise HTTPException(409, str(e)) from e
+    except channel_add.ChannelDisabled as e:
+        raise HTTPException(409, str(e)) from e
     except jobs.JobBusy as e:
         raise HTTPException(409, str(e)) from e
-
-    try:
-        await _start_join_chain(account_id=body.engage_account_id, username=username,
-                                run_id=run.id, subscribed_by=user.email, stage="channel")
     except engage.EngageUnavailable as e:
-        await jobs.finish(run.id, status="failed", error=str(e),
-                          note=f"Engage недоступен: {e}")
         raise HTTPException(503, str(e)) from e
     except ValueError as e:  # закрытый список действий у engage.action
-        await jobs.finish(run.id, status="failed", error=str(e), note=str(e))
         raise HTTPException(400, str(e)) from e
 
-    db.add(AuditLog(
-        user_id=user.id, user_email=user.email, action="channel_add_started",
-        detail={"username": username, "engage_account_id": body.engage_account_id,
-               "run_id": run.id}, ip=request.client.host if request.client else None))
-    await db.commit()
-    logger.info("channel_add_started username=%s account=%s run=%s by=%s",
-               username, body.engage_account_id, run.id, user.email)
     return {"started": True, "username": username, "run_id": run.id,
-           "note": "аккаунт подписывается на канал (и на его группу обсуждения, "
-                   "если она есть); результат придёт вебхуком, ход виден в разделе Runs"}
+            "note": "аккаунт подписывается на канал (и на его группу обсуждения, "
+                    "если она есть); результат придёт вебхуком, ход виден в разделе Runs"}
 
 
 class UpdateChannelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    # Оба выключателя необязательны: None — «это поле не передано, не трогать».
+    # Все три выключателя необязательны: None — «это поле не передано, не трогать».
     # Меняется ровно то, что пришло; пустое тело отвергается ручкой (422 «нечего
     # менять»), иначе опечатка в имени поля выглядела бы исполненным «ничего
     # не делать».
     ingest_enabled: bool | None = None
     l1_bypass_enabled: bool | None = None
+    discovery_seed: bool | None = None
 
 
 @operator_router.patch("/{channel_id}")
 async def update_channel(channel_id: int, body: UpdateChannelRequest, request: Request,
-                         db: GetDB, user=permits(Section.CHANNELS, Capability.CHANNEL_ARCHIVE)):
+                         db: GetDB, user=requires(Section.CHANNELS)):
     """Снять или вернуть отслеживание — отдельно от удаления сообщений (см. ниже);
-    здесь же выключатель адресного обхода словаря L1 (контракт каскада §5.1).
+    здесь же выключатель адресного обхода словаря L1 (контракт каскада §5.1) и
+    флаг донора автоскана (контракт автоматики §4.4).
 
     Читает и пишет ровно те же поля, что сам себе молча ставит
     `get_or_create_channel` при первом сообщении (для `ingest_enabled`):
     включение здесь не заводит канал заново и не трогает накопленное, только
     решает, продолжать ли класть новые сообщения.
 
-    Обход включается тем же правом, что и снятие отслеживания
-    (`CHANNEL_ARCHIVE`, только владелец): он тратит карту и меняет отбор, это
-    решение уровня владельца. Нового `Capability` под него нет — матрица прав
-    обязана дословно совпадать с оболочкой, а экраны в эту задачу не входят.
+    Права полевые, а не на всю ручку: отслеживание и обход L1 — решение уровня
+    владельца (`CHANNEL_ARCHIVE`, он тратит карту и меняет отбор), флаг донора —
+    действия попроще (`CHANNEL_EDIT`, владелец и заказчик: донор лишь называет,
+    у кого спрашивать «похожие», без него автоскан не найдёт семян). Раздел
+    проверяет зависимость `requires`, поля — сама ручка: нарушение — 403 тем же
+    кодом, каким его давал прежний `permits` на всю ручку.
     """
     # Проверка запроса, а не канала: пустое тело невалидно само по себе,
     # поэтому 422 стоит раньше 404.
-    if body.ingest_enabled is None and body.l1_bypass_enabled is None:
+    if (body.ingest_enabled is None and body.l1_bypass_enabled is None
+            and body.discovery_seed is None):
         raise HTTPException(422, "нечего менять")
+
+    # Проверка прав — тоже раньше 404: прежний `permits` отказывал в
+    # зависимостях, до тела ручки дело не доходило.
+    if ((body.ingest_enabled is not None or body.l1_bypass_enabled is not None)
+            and not allows(user.role, Capability.CHANNEL_ARCHIVE)):
+        raise HTTPException(403, f"роль '{user.role}' не может менять "
+                                 f"'{Capability.CHANNEL_ARCHIVE.value}'")
+    if (body.discovery_seed is not None
+            and not allows(user.role, Capability.CHANNEL_EDIT)):
+        raise HTTPException(403, f"роль '{user.role}' не может менять "
+                                 f"'{Capability.CHANNEL_EDIT.value}'")
 
     channel = (await db.execute(
         select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
@@ -774,6 +761,16 @@ async def update_channel(channel_id: int, body: UpdateChannelRequest, request: R
                     "from": was_bypass, "to": body.l1_bypass_enabled},
             ip=request.client.host if request.client else None))
 
+    if body.discovery_seed is not None:
+        was_seed = channel.discovery_seed
+        channel.discovery_seed = body.discovery_seed
+        db.add(AuditLog(
+            user_id=user.id, user_email=user.email,
+            action="channel_discovery_seed_changed",
+            detail={"channel_id": channel_id, "title": channel.title,
+                    "from": was_seed, "to": body.discovery_seed},
+            ip=request.client.host if request.client else None))
+
     await db.commit()
     if body.ingest_enabled is not None:
         logger.info("channel_tracking_changed channel=%s from=%s to=%s by=%s",
@@ -781,8 +778,12 @@ async def update_channel(channel_id: int, body: UpdateChannelRequest, request: R
     if body.l1_bypass_enabled is not None:
         logger.info("channel_l1_bypass_changed channel=%s from=%s to=%s by=%s",
                     channel_id, was_bypass, body.l1_bypass_enabled, user.email)
+    if body.discovery_seed is not None:
+        logger.info("channel_discovery_seed_changed channel=%s from=%s to=%s by=%s",
+                    channel_id, was_seed, body.discovery_seed, user.email)
     return {"id": channel.id, "ingest_enabled": channel.ingest_enabled,
-            "l1_bypass_enabled": channel.l1_bypass_enabled}
+            "l1_bypass_enabled": channel.l1_bypass_enabled,
+            "discovery_seed": channel.discovery_seed}
 
 
 # Цена одного вердикта L3 — 1,27 секунды: замер 08.09 (АУДИТ 6.1,

@@ -927,6 +927,15 @@ async def discovery_check_tick(ctx: dict) -> dict:
         maker = get_session_maker()
         async with maker() as db:
             connected = await _connect_approved(db)
+            # шов автоматики (сценарий 4): остались одобренные с именем —
+            # подключить их в остатке суток. Импорт локальный, внутри try:
+            # наверху `autoflow` тянет этот модуль, и верхнеуровневый импорт
+            # замкнул бы круг (discovery → autoflow → discovery).
+            try:
+                from app.services import autoflow
+                approved = await autoflow.approve_tick(db)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("autoflow_approve_tick_failed error=%s", e)
             pending = (await db.execute(
                 select(func.count(ChannelCandidate.id))
                 .where(ChannelCandidate.decision == "pending"))).scalar_one()

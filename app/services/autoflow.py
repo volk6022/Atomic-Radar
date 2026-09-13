@@ -41,7 +41,7 @@ from app.core import clock
 from app.db.models import (AuditLog, BackfillItem, Channel, ChannelCandidate,
                            DiscoveryQuery, Limit, Message, Run)
 from app.db.session import get_session_maker
-from app.services import backfill_queue, discovery, engage, jobs
+from app.services import backfill_queue, channel_add, discovery, engage, jobs
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +475,79 @@ async def scan_tick(ctx: dict) -> dict:
                 donors)
     return {"started": started, "busy": busy, "window_wait": window_wait,
             "seeds": len(seeds), "donors": donors}
+
+
+# ── сценарий 4: одобрен → вступил ─────────────────────────────────────────────
+
+async def approve_tick(db) -> dict:
+    """Подключить одобренных кандидатов в остатке суток (§3.4).
+
+    Зовётся из `discovery_check_tick` сразу после `_connect_approved` (шов там
+    же, под его try/except — тик проверки не вправе уронить воркер), поэтому
+    своей обёртки «тик не падает» здесь нет. `approved_waiting` считается
+    всегда — возврат тика единственный отчёт, чем дышит очередь кандидатов,
+    и при выключенном сценарии он обязан называть число ждущих.
+
+    Кандидаты — ВСЕ approved с username, любого `decided_by` (решение ревью по
+    §9.3: одобрение человеком — то же «одобрен → вступил», расход вписывается в
+    общий остаток). Подключение идёт единственной дорогой — `channel_add.start`,
+    той же, что и ручка. Кандидат постановкой НЕ переводится в `connected`:
+    его закроет штатный `_connect_approved` по факту появления отслеживаемого
+    канала с тем же username.
+
+    `JobBusy` (уже идёт подключение) — стоп перебора, не ошибка (§0.4);
+    `ChannelExists`/`ChannelDisabled` на кандидате — пропустить его: канал уже
+    есть, и `_connect_approved` закроет кандидата сам.
+    """
+    lim = await discovery.thresholds(db)
+    approved_waiting = (await db.execute(
+        select(func.count(ChannelCandidate.id)).where(
+            ChannelCandidate.decision == "approved",
+            ChannelCandidate.username.isnot(None)))).scalar_one()
+    if int(lim["discovery_autoconnect_enabled"]) != 1:
+        return {"started": 0, "approved_waiting": approved_waiting, "room": 0}
+
+    # Тот же счётчик, которым `check_fit` режет автоодобрения: второе место
+    # правды не заводим (решение каскада §2).
+    room = max(0, int(lim["discovery_auto_joins_per_day"])
+               - await discovery._auto_joins_today(db))
+    if room == 0:
+        return {"started": 0, "approved_waiting": approved_waiting, "room": 0}
+
+    candidates = (await db.execute(
+        select(ChannelCandidate).where(
+            ChannelCandidate.decision == "approved",
+            ChannelCandidate.username.isnot(None))
+        # Свежее решение раньше (T-26: «свежий раньше»): пока остаток суток
+        # тесен, подключаются недавно одобренные — они и релевантнее.
+        .order_by(ChannelCandidate.decided_at.asc(), ChannelCandidate.id.asc())
+        .limit(room))).scalars().all()
+
+    fleet = await engage.list_accounts()
+    active = [a["account_id"] for a in fleet if a.get("status") == "active"]
+    if not active:
+        # Флот пуст — состояние, а не происшествие: у тика нет права на 503.
+        logger.warning("autoflow_approve_tick_no_accounts approved_waiting=%s",
+                       approved_waiting)
+        return {"started": 0, "approved_waiting": approved_waiting, "room": room}
+
+    started = 0
+    for candidate in candidates:
+        try:
+            await channel_add.start(db, username=candidate.username,
+                                    account_id=active[0], actor="auto:approve",
+                                    ip=None)
+        except jobs.JobBusy as e:
+            # Подключение уже идёт (внешний прогон channel_add один на всех):
+            # стоп перебора, не ошибка — следующий тик доест остаток (§0.4).
+            logger.info("autoflow_approve_tick_busy started=%s error=%s", started, e)
+            break
+        except (channel_add.ChannelExists, channel_add.ChannelDisabled) as e:
+            logger.warning("autoflow_approve_tick_skip candidate=%s error=%s",
+                           candidate.username, e)
+            continue
+        started += 1
+    return {"started": started, "approved_waiting": approved_waiting, "room": room}
 
 
 # ── сводка для экрана ─────────────────────────────────────────────────────────
