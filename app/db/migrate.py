@@ -110,6 +110,13 @@ STATEMENTS: list[str] = [
     "ALTER TABLE channels ADD COLUMN IF NOT EXISTS l1_bypass_enabled BOOLEAN "
     "NOT NULL DEFAULT FALSE",
 
+    # 2026-09-12, автоматика подбора (план 13.3): доноры автоскана «похожих».
+    # DEFAULT FALSE обязателен: выкатка не меняет отбор семян ни у одного канала;
+    # включение — осознанное действие владельца (PATCH /channels/{id}). Таблица
+    # channels на проде уже создана create_all, колонку досоздаёт только эта строка.
+    "ALTER TABLE channels ADD COLUMN IF NOT EXISTS discovery_seed BOOLEAN "
+    "NOT NULL DEFAULT FALSE",
+
     # 2026-09-12, комментарии к черновикам (просьба заказчика). Таблица новая,
     # но создаётся отсюда, а не только create_all: прод читает DDL исключительно
     # из этого списка, и типы обязаны совпадать с моделью колонка в колонку.

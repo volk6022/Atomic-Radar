@@ -39,9 +39,9 @@ from sqlalchemy.exc import IntegrityError
 from app.api.v1.runs import _row
 from app.core import clock
 from app.db.models import (AuditLog, BackfillItem, Channel, ChannelCandidate,
-                           Limit, Message, Run)
+                           DiscoveryQuery, Limit, Message, Run)
 from app.db.session import get_session_maker
-from app.services import backfill_queue, discovery, jobs
+from app.services import backfill_queue, discovery, engage, jobs
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +343,140 @@ async def reclassify_tick(ctx: dict) -> dict:
             "waiting_messages": waiting_messages}
 
 
+# ── сценарий 3: ежесуточный автоскан подбора ──────────────────────────────────
+
+async def _scan_donors(db) -> list[int]:
+    """id доноров автоскана в порядке отбора семян: флаг `discovery_seed`,
+    отслеживание и имя (симметрично требованиям ручного скана), сортировка
+    `members DESC NULLS LAST, id` — та же, что у авто-выбора семени в ручке
+    поиска. Одна выборка для тика и сводки: число доноров на «Автоматике» и
+    порция тика не должны уметь расходиться."""
+    rows = (await db.execute(
+        select(Channel.id).where(
+            Channel.discovery_seed.is_(True),
+            Channel.ingest_enabled.is_(True),
+            Channel.username.isnot(None))
+        .order_by(Channel.members.desc().nulls_last(), Channel.id)))
+    return list(rows.scalars().all())
+
+
+async def _searched_today(db, donor_ids: list[int]) -> set[int]:
+    """Какие доноры уже исканы в текущие UTC-сутки (`kind='similar'`): то же
+    окно `_utc_day_start`, что у уникальности суток. Строки по чужим семенам и
+    поиски по строке фильтр не трогают — сценарий отвечает только за доноров."""
+    if not donor_ids:
+        return set()
+    rows = (await db.execute(
+        select(DiscoveryQuery.seed_channel_id).where(
+            DiscoveryQuery.kind == "similar",
+            DiscoveryQuery.created_at >= discovery._utc_day_start(),
+            DiscoveryQuery.seed_channel_id.in_(donor_ids)))).scalars().all()
+    return set(rows)
+
+
+async def _scan_window_wait(db) -> bool:
+    """Последний завершённый прогон скана отложен лимитом Engage и назвал окно
+    возврата (`retry_after_s`), которое ещё не истекло (§3.3). Читается как
+    `discovery._waiting_budget`: более поздний обычный прогон отменяет старое
+    окно сам собой. Окна нет — False: прежний часовой ритм, молча ждать «до
+    никогда» нельзя."""
+    last = (await db.execute(
+        select(Run).where(Run.kind == "discovery_scan",
+                          Run.finished_at.is_not(None))
+        .order_by(Run.finished_at.desc(), Run.id.desc())
+        .limit(1))).scalar_one_or_none()
+    if last is None or last.status != "deferred":
+        return False
+    seconds = (last.result or {}).get("retry_after_s")
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return False
+    return clock.utcnow() < last.finished_at + timedelta(seconds=seconds)
+
+
+async def scan_tick(ctx: dict) -> dict:
+    """Один удар сценария 3 (§3.3): поставить ежесуточный автоскан по донорам.
+
+    Бьётся раз в час (`minute={0}`), а сутки следят за собой: есть по хоть
+    одному донору строка `discovery_queries` в текущие UTC-сутки — удар
+    холостой. Все семена едут одним прогоном (`seed_channel_ids`): заказов у
+    Engage всё равно не больше `discovery_queries_per_scan`, потолок живёт
+    в прогоне. Окно отложенного возврата (`retry_after_s`) бережёт бюджет:
+    отложенный ночью скан не перезаказывается каждый час до возврата лимита.
+
+    Падать не имеет права (образец — `reclassify_tick`): `JobBusy` — штатное
+    «занято», а пустой флот — состояние Engage, не происшествие; у тика нет
+    права на 503, поэтому нет активных аккаунтов — пустой итог с логом.
+    """
+    try:
+        maker = get_session_maker()
+        async with maker() as db:
+            # Доноры считаются всегда, даже при выключенном сценарии: возврат
+            # тика — единственный отчёт arq-задачи, и T-19 ждёт доноров при
+            # выключенном выключателе.
+            donor_ids = await _scan_donors(db)
+            donors = len(donor_ids)
+            lim = await thresholds(db)
+            started = busy = window_wait = False
+            seeds: list[int] = []
+            if int(lim["discovery_autoscan_enabled"]) == 1 and donors:
+                searched = await _searched_today(db, donor_ids)
+                if not searched:
+                    try:
+                        if await jobs.active_run(db, "discovery_scan") is not None:
+                            busy = True
+                        elif await _scan_window_wait(db):
+                            window_wait = True
+                        else:
+                            dlim = await discovery.thresholds(db)
+                            seeds = donor_ids[:min(donors, int(
+                                dlim["discovery_queries_per_scan"]))]
+                            fleet = await engage.list_accounts()
+                            active = [a["account_id"] for a in fleet
+                                      if a.get("status") == "active"]
+                            if not active:
+                                # Флот пуст — состояние, а не происшествие.
+                                logger.warning(
+                                    "autoflow_scan_tick_no_accounts donors=%s",
+                                    donors)
+                                seeds = []
+                            else:
+                                params = {"kind": "similar",
+                                          "seed_channel_ids": seeds,
+                                          "account_id": active[0]}
+                                run = await jobs.start(
+                                    db, kind="discovery_scan", params=params,
+                                    name=f"Поиск похожих каналов · "
+                                         f"доноры × {len(seeds)}",
+                                    user_email="auto:scan")
+                                # Тот же аудит, что у ручки поиска, но от
+                                # авто: автор строки — метка источника.
+                                db.add(AuditLog(
+                                    user_id=None, user_email="auto:scan",
+                                    action="discovery_scan_started",
+                                    detail={"kind": "similar",
+                                            "seed_channel_ids": seeds,
+                                            "account_id": active[0],
+                                            "run_id": run.id}, ip=None))
+                                await db.commit()
+                                started = True
+                    except jobs.JobBusy as e:
+                        # Гонка с чужим запуском: «занято» проходит само (§0.4),
+                        # наружу — не ошибка, состояние видно по строке runs.
+                        logger.info("autoflow_scan_tick_busy error=%s", e)
+                        busy = True
+    except Exception as e:  # noqa: BLE001 — тик не вправе уронить воркера приёма
+        logger.warning("autoflow_scan_tick_failed error=%s", e)
+        return {"started": False, "busy": False, "window_wait": False,
+                "seeds": 0, "donors": 0}
+    logger.info("autoflow_scan_tick started=%s busy=%s window_wait=%s "
+                "seeds=%s donors=%s", started, busy, window_wait, len(seeds),
+                donors)
+    return {"started": started, "busy": busy, "window_wait": window_wait,
+            "seeds": len(seeds), "donors": donors}
+
+
 # ── сводка для экрана ─────────────────────────────────────────────────────────
 
 # Сценарии, у которых бывают прогоны: вид задачи и автор строки (§0.2). Сценарий 1
@@ -419,15 +553,17 @@ async def _last_error(db, *, kind: str, author: str) -> str | None:
         .limit(1))).scalar_one_or_none()
 
 
-async def _autoscan_state(db) -> tuple[int | None, bool]:
-    """`(donors, scanned_today)` для сценария 3.
-
-    До волны Г доноров знать никто не может: флаг `channels.discovery_seed`
-    появится только там (§5 контракта), а «сканировали сегодня» считается по
-    семенам-донорам. Пока честные значения — `None` и `False`: ноль экран
-    прочитал бы как «доноров нет», а это не так («неизвестно» ≠ «нет»).
+async def _autoscan_state(db) -> tuple[int, bool]:
+    """`(donors, scanned_today)` для сценария 3 — та же выборка, что у тика:
+    доноры `_scan_donors`, «сканировали сегодня» — есть ли в текущие UTC-сутки
+    строка `similar` по донору (`_searched_today`). Ноль доноров — честный ноль:
+    с волны Г флаг колонки существует, и «неизвестно» (прочерк волны А) больше
+    не бывает.
     """
-    return None, False
+    donor_ids = await _scan_donors(db)
+    if not donor_ids:
+        return 0, False
+    return len(donor_ids), bool(await _searched_today(db, donor_ids))
 
 
 async def status(db) -> dict:

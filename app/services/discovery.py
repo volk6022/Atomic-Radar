@@ -703,9 +703,14 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
     Поисковых заказов у Engage — не больше `discovery_queries_per_scan`
     (Решение 1: «пять поисков» — объём прогона, не суточный лимит). Потолок
     живёт здесь, в службе, а не в ручке поиска: общая `POST /runs` заводит этот
-    же прогон с произвольными params и мимо ручки потолок бы обошла. Сегодня
-    поиск делает ровно один заказ; счётчик с жёсткой границей — рамка для
-    будущих мульти-целевых прогонов.
+    же прогон с произвольными params и мимо ручки потолок бы обошла.
+
+    Список `seed_channel_ids` (автоскан по донорам, §3.3) гоняет тот же цикл
+    «заказ → кандидаты → строка» по каждому донору под общей рамкой потолка —
+    иначе автоскан обошёл бы её списком. Коммит на каждом семени: отказ окна
+    одного семени не откатывает уже сделанных. Ручной путь с одним
+    `seed_channel_id` не меняется: там семя выбирает оператор, и плохое семя —
+    его ошибка, которую честнее показать.
     """
     kind = params.get("kind")
     if kind not in DiscoveryQuery.KINDS:
@@ -729,6 +734,93 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
                 webhook_url=engage.webhook_url(kind="polled"))
             return await engage.wait_for_task(task["task_id"],
                                               timeout=SCAN_WAIT_SECONDS)
+
+        # ── мульти-семя: автоскан по донорам (§3.3, волна Г) ─────────────────
+        seed_ids = params.get("seed_channel_ids")
+        if seed_ids is not None:
+            if kind != "similar":
+                raise RuntimeError(
+                    "seed_channel_ids допустим только при kind=\"similar\"")
+            if not isinstance(seed_ids, (list, tuple)) or not seed_ids:
+                raise RuntimeError(
+                    "seed_channel_ids: ожидался непустой список id каналов")
+            if params.get("seed_channel_id"):
+                raise RuntimeError(
+                    "seed_channel_id и seed_channel_ids заданы вместе — "
+                    "нужен ровно один способ выбрать семя")
+
+            found_sum = new_sum = seeds_done = 0
+            skipped_window = skipped_seed = 0
+            await report(0, f"похожие к {len(seed_ids)} донорам, "
+                            f"аккаунт {account_id}")
+            for sid in seed_ids:
+                if cancelled():
+                    # Отмена между семенами: сделанное уже закоммичено помольно.
+                    return {"cancelled": True, "seeds": seeds_done,
+                            "found_total": found_sum, "new_total": new_sum,
+                            "skipped_window": skipped_window}
+                if orders >= per_scan:
+                    break  # рамка потолка одна на прогон, см. order_search
+                seed = await db.get(Channel, int(sid))
+                if seed is None or not seed.username:
+                    # Донора могли снять с отслеживания между отбором тика и
+                    # прогоном: автопрогон пропускает семя, одиночный ручной
+                    # путь ниже по-прежнему падает RuntimeError.
+                    skipped_seed += 1
+                    continue
+                try:
+                    result = await order_search(
+                        "get_similar_channels", {"username": seed.username})
+                except engage.EngageTaskDeferred as e:
+                    # Отложено лимитом — не падение: сделанные семена уже в базе
+                    # (коммит на каждом), окно возврата тик прочитает из итога.
+                    interp = deferrals.interpret(e)
+                    await report(0, f"@{seed.username}: {interp.note}")
+                    out: dict = {"deferred": True, "code": interp.code,
+                                 "seeds": seeds_done, "found_total": found_sum,
+                                 "new_total": new_sum,
+                                 "skipped_window": skipped_window}
+                    retry_after_s = await _retry_after_seconds(kind, account_id)
+                    if retry_after_s is not None:
+                        out["retry_after_s"] = retry_after_s
+                    return out
+                items = _found_items(result)
+                new_total = 0
+                for item in items:
+                    if await _upsert_candidate(db, item, kind=kind,
+                                               seed_channel_id=seed.id,
+                                               account_id=account_id):
+                        new_total += 1
+                db.add(DiscoveryQuery(kind=kind, seed_channel_id=seed.id,
+                                      query=None, account_id=account_id,
+                                      run_id=run_id, found_total=len(items),
+                                      new_total=new_total))
+                try:
+                    # Коммит на каждом семени: отказ окна уникальности суток
+                    # одного семени не должен оставить полупустой итог.
+                    await db.commit()
+                except IntegrityError:
+                    # Семя уже искали в текущие UTC-сутки — гонка с ручным
+                    # запуском: откат и следующий семен, прогон не падает.
+                    await db.rollback()
+                    skipped_window += 1
+                    continue
+                seeds_done += 1
+                found_sum += len(items)
+                new_sum += new_total
+                await report(
+                    min((seeds_done + skipped_window + skipped_seed) * 100
+                        // len(seed_ids), 99),
+                    f"@{seed.username}: найдено {len(items)}, "
+                    f"новых кандидатов {new_total}")
+            await report(100, f"готово: семян {seeds_done}, найдено {found_sum}, "
+                              f"новых кандидатов {new_sum}, в окне суток "
+                              f"пропущено {skipped_window}")
+            logger.info("run_scan_multi run=%s seeds=%s skipped_seed=%s "
+                        "skipped_window=%s", run_id, seeds_done, skipped_seed,
+                        skipped_window)
+            return {"seeds": seeds_done, "found_total": found_sum,
+                    "new_total": new_sum, "skipped_window": skipped_window}
 
         seed_channel_id: int | None = None
         query_text: str | None = None

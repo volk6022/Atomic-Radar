@@ -216,12 +216,19 @@ class WorkerSettings:
     #
     # Тик автоматики «доклассификация ждущих» (сценарий 2) бьётся тем же ритмом:
     # сам следит за окном интервала и холостой удар стоит один SELECT.
+    #
+    # Тик автоматики «автоскан подбора» (сценарий 3) бьётся раз в час — в начале
+    # часа: сутки он следит сам (строка `discovery_queries` по донору в текущие
+    # UTC-сутки закрывает удар до полуночи), окно отложенного возврата Engage
+    # тоже, поэтому чаще часа будить его незачем.
     cron_jobs = [cron(backfill_drain_tick, minute=set(range(0, 60, 5)),
                       second=0, run_at_startup=False),
                  cron(discovery.discovery_check_tick,
                       minute=set(range(0, 60, 5)), second=0, run_at_startup=False),
                  cron(autoflow.reclassify_tick, minute=set(range(0, 60, 5)),
-                      second=0, run_at_startup=False)]
+                      second=0, run_at_startup=False),
+                 cron(autoflow.scan_tick, minute={0}, second=0,
+                      run_at_startup=False)]
     # Результат держится сутки. Он же — ключ от повторной доставки: `_job_id` считается
     # по содержимому события, и пока результат жив, тот же вебхук второй раз не
     # разбирается. Сутки — с запасом больше любого разумного окна ретраев Engage.

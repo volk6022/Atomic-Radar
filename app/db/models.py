@@ -190,6 +190,11 @@ class Channel(Base):
     # действие владельца, а не свойство схемы. Одно имя, синонимов не заводить:
     # второе название того же выключателя разъедется с этим молча.
     l1_bypass_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Донор подбора (13.3): канал, от которого ежесуточный автоскан заказывает
+    # «похожие». Флаг ставится руками владельцем; FALSE по умолчанию — выкатка
+    # не меняет поведение. Одно имя, синонимов не заводить.
+    discovery_seed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_junk: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     backfill_cursor: Mapped[int | None] = mapped_column(BigInteger)
 
