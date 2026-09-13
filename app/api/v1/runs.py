@@ -10,9 +10,9 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.api.deps import GetDB, permits, requires
 from app.api.v1.listing import ListParams, apply_sort, list_params
@@ -106,9 +106,28 @@ def _row(r: Run) -> dict:
 
 @router.get("")
 async def list_runs(db: GetDB, user=requires(Section.RUNS),
+                    author: str | None = Query(None),
                     p: ListParams = Depends(list_params)):
-    total = (await db.execute(select(func.count(Run.id)))).scalar_one()
-    q = apply_sort(select(Run), p, RUN_SORTS, default="created", tiebreak=Run.id)
+    # Фильтр автора: авто-прогоны помечены префиксом `auto:*` (тики автоматики),
+    # «ручное» — всё остальное, включая строки без автора вовсе. Конкретный
+    # человек ищется точным совпадением: авторы — произвольные email, список не
+    # закрыт, поэтому чужой адрес — честная пустая страница, а не отказ.
+    author = (author or "").strip() or None
+    if author == "auto":
+        filters = [Run.created_by.like("auto:%")]
+    elif author == "manual":
+        # NULL-автор — ручное: `NOT LIKE` на NULL выкинул бы прогон, у которого
+        # автора никогда не было.
+        filters = [or_(Run.created_by.is_(None), ~Run.created_by.like("auto:%"))]
+    elif author is not None:
+        filters = [Run.created_by == author]
+    else:
+        filters = []
+
+    total = (await db.execute(
+        select(func.count(Run.id)).where(*filters))).scalar_one()
+    q = apply_sort(select(Run).where(*filters), p, RUN_SORTS,
+                   default="created", tiebreak=Run.id)
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
 
     # Сколько сообщений ждёт обработки — то самое число, ради которого пересчёт и

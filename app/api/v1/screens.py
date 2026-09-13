@@ -34,9 +34,9 @@ from app.core import prototypes
 from app.core.access import Capability, Section, allows
 from app.core.config import get_settings
 from app.api.v1.system import get_state
-from app.db.models import (Attribution, AuditLog, Channel, Conversation, Draft,
-                           Lead, LlmTrace, Message, MessageReader,
-                           OutboundAttempt, ProfileVersion, User)
+from app.db.models import (Attribution, AuditLog, Channel, ChannelCandidate,
+                           Conversation, Draft, Lead, LlmTrace, Message,
+                           MessageReader, OutboundAttempt, ProfileVersion, User)
 from app.services import (cascade_registry, discussions, drafting, embeddings,
                           engage, llm, queue)
 
@@ -264,6 +264,35 @@ CHANNEL_SORTS = {"title": Channel.title, "members": Channel.members,
                  "leads_total": Channel.leads_total}
 
 
+async def _connected_usernames(db) -> set[str]:
+    """Username кандидатов подбора, дошедших до подключения (в нижнем регистре).
+
+    Происхождение канала (`source`, контракт автоматики §4.4) — вычисление над
+    `channel_candidates`, колонки в базе для него нет. Один запрос на страницу,
+    а не на строку — тот же приём, что со счётчиками сообщений ниже. Кандидат
+    хранит имя в том регистре, в каком его записал поиск, а сравнивать надо без
+    регистра — как `_connect_approved` в `app/services/discovery.py`.
+    """
+    names = (await db.execute(select(ChannelCandidate.username).where(
+        ChannelCandidate.decision == "connected"))).scalars()
+    return {u.lower() for u in names if u}
+
+
+def _channel_source(username: str | None, subscribed_by: str | None,
+                    connected: set[str]) -> str | None:
+    """Откуда взялся канал (§4.4). Порядок правил значим: кандидат подбора
+    сильнее руки, рука сильнее автоматики — найденный сценарием 3 и подключённый
+    автоподключением канал остаётся «discovery», хотя `subscribed_by` у него
+    уже стоит. `None` — не «неизвестно», а честное «заведён сам при первом
+    сообщении»: большинство продовых строк, экран показывает прочерк.
+    """
+    if username and username.lower() in connected:
+        return "discovery"
+    if subscribed_by:
+        return "join" if subscribed_by.startswith("auto:") else "manual"
+    return None
+
+
 @router.get("/channels")
 async def channels(db: GetDB, user=requires(Section.CHANNELS),
                    p: ListParams = Depends(list_params),
@@ -336,6 +365,9 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
     q = apply_sort(q, p, CHANNEL_SORTS, default="leads_total", tiebreak=Channel.id)
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
 
+    # Подключённые кандидаты — один запрос на страницу (см. `_connected_usernames`).
+    connected = await _connected_usernames(db)
+
     out = []
     for c in rows:
         msgs = counts.get(c.id, 0)
@@ -368,6 +400,11 @@ async def channels(db: GetDB, user=requires(Section.CHANNELS),
             # пути — сами при первом сообщении, никто руками не подключал.
             "subscribed_account_id": c.subscribed_account_id,
             "subscribed_by": c.subscribed_by,
+            # Откуда канал взялся и донор ли он автоскана (контракт автоматики
+            # §4.4). Каждая строка страницы уже прочитана целиком, поэтому вычисление
+            # здесь стоит ноль лишних чтений — дорого только второй запрос на строку.
+            "source": _channel_source(c.username, c.subscribed_by, connected),
+            "discovery_seed": c.discovery_seed,
         })
     return {**p.page(total), "rows": out,
             # По чему вообще можно сортировать — из CHANNEL_SORTS, а не своя копия
@@ -481,6 +518,35 @@ async def channel_options(db: GetDB, user=requires(Section.STREAM)):
         .order_by(Channel.title))).all()
     return [{"id": cid, "title": title, "username": username}
             for cid, title, username in rows]
+
+
+@router.get("/channels/{channel_id}")
+async def channel_card(channel_id: int, db: GetDB,
+                       user=requires(Section.CHANNELS)):
+    """Карточка одного канала — drill из реестра (контракт автоматики §4.4).
+
+    Объявлена после `/channels/options`: литеральные пути выше параметризованных,
+    иначе «options» разбирался бы как id и отвечал «канал не найден»
+    (`tests/test_routes.py`). Отдельно от списка: реестр за страницу платит
+    счётчиками и состояниями обсуждения, карточке они ни к чему, и ради одного
+    канала платить ими нечему.
+    """
+    channel = (await db.execute(
+        select(Channel).where(Channel.id == channel_id))).scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(404, f"канал {channel_id} не найден")
+    connected = await _connected_usernames(db)
+    return {
+        "id": channel.id, "title": channel.title, "username": channel.username,
+        "chat_type": channel.chat_type, "members": channel.members,
+        "ingest_enabled": channel.ingest_enabled,
+        "l1_bypass_enabled": channel.l1_bypass_enabled,
+        "discovery_seed": channel.discovery_seed,
+        "source": _channel_source(channel.username, channel.subscribed_by, connected),
+        "linked_chat_username": channel.linked_chat_username,
+        "subscribed_by": channel.subscribed_by,
+        "created_at": channel.created_at.isoformat(),
+    }
 
 
 # ── конвейер лидов ────────────────────────────────────────────────────────────

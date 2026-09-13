@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, backfill, conversations, discovery, drafts,
-                        ingest, leads, manual_sends, profile, runs, screens,
-                        system, wf_queues)
+from app.api.v1 import (alerts, auth, automation, backfill, conversations,
+                        discovery, drafts, ingest, leads, manual_sends, profile,
+                        runs, screens, system, wf_queues)
 # Псевдоним по той же причине, что и у сценариев ниже: рядом живёт `app.services.events`.
 from app.api.v1 import events as events_api
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
@@ -115,6 +115,9 @@ def create_app() -> FastAPI:
     app.include_router(events_api.router)
     app.include_router(leads.router)
     app.include_router(manual_sends.router)
+    # Сводка «Автоматики» — экран над прогонами и очередью: чтение — раздел runs,
+    # запись настроек — владелец. Правила — в самом модуле.
+    app.include_router(automation.router)
     app.include_router(runs.router)
     app.include_router(screens.router)
     # Экран «Переписки» отдельным роутером по той же причине, что и тревоги:

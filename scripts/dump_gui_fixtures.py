@@ -54,8 +54,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
-from app.db.models import (Account, Alert, Attribution, Channel,  # noqa: E402
-                           ConfigFile, Conversation,  # noqa: E402
+from app.db.models import (Account, Alert, Attribution, BackfillItem, Channel,  # noqa: E402
+                           ChannelCandidate, ConfigFile, Conversation,  # noqa: E402
                            ConversationEvent, Draft, EngageInstance, Evaluation,
                            Lead, LlmTrace, Message, MessageReader, OutboundAttempt,
                            ProfileVersion, Run, User, WfTarget, Workflow)
@@ -166,6 +166,35 @@ async def extras(db) -> None:
                status="running", progress=30, params={"scope": "pending"},
                cancel_requested=False, created_by=owner.email,
                started_at=NOW - timedelta(minutes=19)))
+
+    # ── автоматика подбора (контракт автоматики §4.5) ─────────────────────────
+    #
+    # Ручки 13.7 без этих строк показывали бы сплошные нули, и смоук проверял бы
+    # экраны, на которых ветка «есть данные» не исполнена ни разу. Одна связка —
+    # донор, его кандидат и элемент очереди: их экраны и показывают вместе.
+    donor = (await db.execute(
+        select(Channel).order_by(Channel.id))).scalars().first()
+    donor.discovery_seed = True
+    # Очередь дочитывания: активная строка у донора одна — частичный
+    # уникальный индекс дубликат не пустит, второй не заводим.
+    db.add(BackfillItem(channel_id=donor.id, position=1, state="queued",
+                        requested_by="auto:join"))
+    db.add(ChannelCandidate(
+        username=donor.username, title=donor.title, source="manual",
+        found_by_account_id=12, decision="connected",
+        decided_by="owner@local", decided_at=NOW - timedelta(days=1)))
+    # Завершённый автопрогон доклассификации: форма result — как её пишет
+    # `reclassify.py` (`summary`), иначе экран Runs показал бы выдумку.
+    db.add(Run(name="Переклассификация · недосчитанное · авто", kind="reclassify",
+               status="done", progress=100, params={"scope": "pending"},
+               created_by="auto:reclassify",
+               result={"scope": "pending", "messages": 84, "l2": True,
+                       "l3": True, "cancelled": False, "created": 12,
+                       "removed": 3, "kept": 69, "skipped_updates": 0,
+                       "skipped_removals": 0, "l3_questions": 27,
+                       "workflows": {}},
+               started_at=NOW - timedelta(hours=5),
+               finished_at=NOW - timedelta(hours=4)))
 
     db.add(LlmTrace(stage="l3", model="qwen3.5-9b", prompt_version="v1",
                     temperature=0, prompt="Ты оцениваешь сообщение из чата.",
@@ -283,6 +312,9 @@ def paths(ids: dict) -> list[tuple[str, str]]:
     d, t, wf_d = ids["draft_id"], ids["target_id"], ids["wf_draft_id"]
     cv = ids["conversation_id"]
     q = f"?workflow_id={ids['workflow_id']}"
+    # Канал-донор из посева: карточка обязана показать и флаг донора, и
+    # происхождение из подбора, а не нули первой попавшейся строки.
+    ch = ids["channel_id"]
     return [
         ("/auth/me", "/auth/me"),
         ("/dashboard", "/dashboard"),
@@ -293,6 +325,7 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/channels", "/channels"),
         ("/channels/options", "/channels/options"),
         ("/channels/discussions", "/channels/discussions"),
+        ("/channels/{id}", f"/channels/{ch}"),
         ("/messages", "/messages?limit=5"),
         ("/leads", "/leads?limit=5"),
         ("/leads/pains", "/leads/pains"),
@@ -314,6 +347,13 @@ def paths(ids: dict) -> list[tuple[str, str]]:
         ("/attribution", "/attribution"),
         ("/traces", "/traces?limit=5"),
         ("/runs", "/runs"),
+        # Экран «Автоматика» (контракт автоматики §4.5): очередь дочитывания и
+        # подбор без образцов смоуком не проверяются вовсе — ручки новые, и
+        # подставить им чужой ответ он не имеет права.
+        ("/automation", "/automation"),
+        ("/backfill/queue", "/backfill/queue"),
+        ("/discovery/candidates", "/discovery/candidates"),
+        ("/discovery/queries", "/discovery/queries"),
         ("/manual-sends/form", "/manual-sends/form"),
         ("/manual-sends/candidates", f"/manual-sends/candidates{q}"),
         ("/manual-sends/list", f"/manual-sends/list{q}&limit=5"),
@@ -363,9 +403,19 @@ async def main() -> None:
             select(Workflow).where(Workflow.key == "cold_dm"))).scalar_one()
         conversation = (await db.execute(
             select(Conversation).order_by(Conversation.id))).scalars().first()
+        # Первый донор автоскана из посева (`extras` досеивает его сам), иначе
+        # первый канал: `/channels/{id}` снимается со строки, где карточка
+        # показывает не нули, а флаг донора и происхождение из подбора.
+        donor = (await db.execute(
+            select(Channel).where(Channel.discovery_seed.is_(True))
+            .order_by(Channel.id))).scalars().first()
+        if donor is None:
+            donor = (await db.execute(
+                select(Channel).order_by(Channel.id))).scalars().first()
         ids = {"draft_id": draft.id, "target_id": target.id,
                "conversation_id": conversation.id,
-               "workflow_id": wf.id, "owner_id": owner.id, "wf_draft_id": None}
+               "workflow_id": wf.id, "owner_id": owner.id, "wf_draft_id": None,
+               "channel_id": donor.id}
     await engine.dispose()
 
     get_settings.cache_clear()

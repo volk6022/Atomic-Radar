@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, GetDB, permits
@@ -89,6 +89,7 @@ def _item(it: BackfillItem, ch: Channel | None) -> dict:
 @router.get("/queue")
 async def list_queue(db: GetDB, user: CurrentUser,
                      state: str | None = Query(None),
+                     source: str | None = Query(None),
                      limit: int = Query(50, ge=1, le=MAX_LIMIT),
                      offset: int = Query(0, ge=0)):
     """Что стоит в очереди: страница элементов и сводка по всем состояниям.
@@ -96,6 +97,12 @@ async def list_queue(db: GetDB, user: CurrentUser,
     Сводка приходит всегда, включая пустую очередь, и не зависит от фильтра:
     экран не должен различать «пусто» и «не пришло», а фильтр по состоянию —
     способ найти свою строку, а не способ узнать, сколько всего работы.
+
+    Фильтр `source` делит очередь на авто-постановку (авторы `auto:*` — швы
+    автоматики) и ручную (всё остальное, включая строки без автора вовсе —
+    они старше префикса). Как и `state`, он сужает и счётчик, и строки, но не
+    сводку: «сколько всего работы» от того, что человек смотрит на часть
+    очереди, не меняется.
 
     Порядок — `(position, id)`, тот же, в котором очередь выдаёт работу:
     экран обязан показывать живую очередь, а не произвольный порядок таблицы,
@@ -110,8 +117,23 @@ async def list_queue(db: GetDB, user: CurrentUser,
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"состояние «{state}» неизвестно, возможные: "
             f"{', '.join(BackfillItem.STATES)}")
+    # Источник — бинарный признак (авто/ручное), поэтому чужое значение —
+    # отказ с перечнем, а не пустой результат: пустая страница выглядела бы
+    # как «постановок не было», а не как опечатка в параметре.
+    source = (source or "").strip() or None
+    if source is not None and source not in ("auto", "manual"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"источник «{source}» неизвестен, возможные: auto, manual")
 
     filters = [BackfillItem.state == state] if state else []
+    if source == "auto":
+        filters.append(BackfillItem.requested_by.like("auto:%"))
+    elif source == "manual":
+        # NULL-автор — ручное: `NOT LIKE` на NULL даёт NULL и выкинул бы старые
+        # строки, поставленные до того, как у постановки появился автор.
+        filters.append(or_(BackfillItem.requested_by.is_(None),
+                           ~BackfillItem.requested_by.like("auto:%")))
     total = (await db.execute(
         select(func.count(BackfillItem.id)).where(*filters))).scalar_one()
     rows = (await db.execute(
