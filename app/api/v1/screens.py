@@ -36,7 +36,8 @@ from app.core.config import get_settings
 from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, ChannelCandidate,
                            Conversation, Draft, Lead, LlmTrace, Message,
-                           MessageReader, OutboundAttempt, ProfileVersion, User)
+                           MessageReader, OutboundAttempt, ProfileVersion, User,
+                           WfDraft, Workflow)
 from app.services import (cascade_registry, discussions, drafting, embeddings,
                           engage, llm, queue)
 
@@ -71,13 +72,35 @@ async def _counts(db) -> dict:
     leads_new = (await db.execute(
         select(func.count(Lead.id)).where(Lead.status == "new"))).scalar_one()
     channels = (await db.execute(select(func.count(Channel.id)))).scalar_one()
+
+    # Очередь черновиков давно не только старый контур: у каждого сценария своя
+    # (`wf_drafts`), и на проде ждут ревью именно там. Состояние — то же «ждёт
+    # ревью», которым `GET /workflows/{key}/drafts` открывает очередь по умолчанию
+    # (`"pending"` из `DRAFT_STATES` в `wf_queues.py`; «разобранные» —
+    # `approved`/`rejected`/`edited` — очередью не считаются). Разбивка по
+    # сценариям считается здесь же, одним запросом, а не второй ходкой в ручке
+    # дашборда: числа обязаны сходиться между бейджем меню, плиткой и разбивкой,
+    # а два независимых запроса — гарантированный способ разъехаться.
+    #
+    # Старый контур (`drafts`) складывается в тот же счётчик, пока жив: его
+    # экраны ещё обслуживаются, и выкинуть ждущие там черновики значило бы
+    # снова показать «очередь пуста» — только теперь про другой контур.
+    drafts_by_workflow = [{"key": key, "title": title, "count": n}
+                          for key, title, n in (await db.execute(
+        select(Workflow.key, Workflow.title, func.count(WfDraft.id))
+        .join(WfDraft, WfDraft.workflow_id == Workflow.id)
+        .where(WfDraft.state == "pending")
+        .group_by(Workflow.id, Workflow.key, Workflow.title, Workflow.sort_order)
+        .order_by(Workflow.sort_order, Workflow.key))).all()]
     drafts_pending = (await db.execute(
         select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
 
     return {"total_msgs": total_msgs, "msgs_24h": msgs_24h,
             "l0": l0_passed, "l1": l1_passed, "l2": l2_passed, "l3": l3_passed,
             "leads": leads, "leads_new": leads_new,
-            "channels": channels, "drafts": drafts_pending}
+            "channels": channels,
+            "drafts": drafts_pending + sum(d["count"] for d in drafts_by_workflow),
+            "drafts_by_workflow": drafts_by_workflow}
 
 
 # Тревоги переехали в `app/api/v1/alerts.py`: у них появилась отметка «прочитано»,
@@ -138,6 +161,11 @@ async def dashboard(db: GetDB, user=requires(Section.DASHBOARD)):
             {"key": "blocked", "label": "Заблокировано гейтом", "value": blocked,
              "go": "safety"},
         ],
+        # Разбивка плитки «Черновиков в очереди» по сценариям: плитка отвечает на
+        # «сколько всего ждёт», а идти человеку обычно нужно в конкретную очередь.
+        # Маршрут остаётся за оболочкой — `go` и у плитки, и у элемента очереди
+        # прежний ("drafts"), чтобы переадресация по сценариям не стала правкой API.
+        "drafts_by_workflow": c["drafts_by_workflow"],
         "queues": [
             {"key": "drafts", "label": "Черновики", "count": c["drafts"], "go": "drafts"},
             {"key": "leads", "label": "Лиды без обработки", "count": c["leads_new"],
