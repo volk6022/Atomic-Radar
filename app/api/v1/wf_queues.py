@@ -541,6 +541,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
                  p: ListParams = Depends(list_params),
                  state: str | None = None,
+                 channel: str | None = None,
+                 min_score: int | None = None,
                  account_id: int | None = None,
                  has_comments: bool | None = None):
     """Очередь заготовок сценария.
@@ -568,6 +570,16 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     строки и `total`; сводка состояний, как и у старого списка, остаётся общей
     по сценарию — чипсы отвечают на «сколько всего в каждом статусе», а не «сколько
     в срезе».
+
+    Фильтры `min_score`, `channel` и поиск `q` — тоже с того экрана, и семантика
+    взята у старого списка дословно. Не для единообразия: таблица этого экрана
+    шлёт все три, а FastAPI молча отбрасывает необъявленное, и человек доверял бы
+    срезу, которого нет, — худший из ответов ручки. Канал здесь называется
+    названием, потому что экран выбирает его из выпадающего списка тем же
+    значением, какое показывает в строке, а `q` ищет по автору, юзернейму и
+    цитате — оператор помнит либо «кому писать», либо «про что было», и заранее
+    неизвестно, что именно. Все три режут строки и `total`, но не сводку
+    `states` — по той же причине, что и `has_comments` выше.
     """
     _check(state, DRAFT_STATES, "статус")
     instance_key = await _instance_key(db, wf)
@@ -584,6 +596,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
          .where(WfDraft.workflow_id == wf.id))
     count_q = (select(func.count(WfDraft.id))
                .join(WfTarget, WfDraft.target_id == WfTarget.id)
+               .join(Channel, WfTarget.channel_id == Channel.id)
                .where(WfDraft.workflow_id == wf.id))
     states_q = (select(WfDraft.state, func.count(WfDraft.id))
                 .join(WfTarget, WfDraft.target_id == WfTarget.id)
@@ -591,6 +604,12 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     if state:
         q = q.where(WfDraft.state == state)
         count_q = count_q.where(WfDraft.state == state)
+    if channel:
+        q = q.where(Channel.title == channel)
+        count_q = count_q.where(Channel.title == channel)
+    if min_score:
+        q = q.where(WfTarget.score >= min_score)
+        count_q = count_q.where(WfTarget.score >= min_score)
     if account_id is not None:
         seen = _seen_by(account_id)
         q = q.where(seen)
@@ -603,6 +622,13 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         marked = WfDraft.id.in_(commented) if has_comments else ~WfDraft.id.in_(commented)
         q = q.where(marked)
         count_q = count_q.where(marked)
+
+    # Поиск — по тем же трём колонкам, что у старого списка: оператор помнит либо
+    # «кому писать», либо «про что было». По боли (`pain`) старый список не ищет,
+    # и здесь не ищет: два поиска с разным охватом на одном классе черновиков
+    # читались бы как разница в данных, а не как разница ручек.
+    search = [WfTarget.author_name, WfTarget.author_username, WfTarget.quote]
+    q, count_q = apply_search(q, p, search), apply_search(count_q, p, search)
 
     total = (await db.execute(count_q)).scalar_one()
     q = apply_sort(q, p, DRAFT_SORTS, default="created", tiebreak=WfDraft.id)

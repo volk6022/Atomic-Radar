@@ -28,7 +28,7 @@ os.environ.setdefault("RADAR_DEBUG", "true")
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
 from app.db.models import (Base, Channel, EngageInstance, Message, User,  # noqa: E402
-                           WfTarget, WfVerdict, Workflow)
+                           WfDraft, WfTarget, WfVerdict, Workflow)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.main import create_app  # noqa: E402
 
@@ -150,6 +150,79 @@ async def _seed() -> dict:
     return out
 
 
+async def _seed_filters() -> dict:
+    """Отдельный посев под фильтры очереди черновиков.
+
+    Общего посева не хватает по одной оси: канал там один, и фильтру по каналу
+    нечего резать. Здесь их два, цели отличаются скором, автором и цитатой, а
+    черновики заведены заранее с тремя разными состояниями — иначе сочетание
+    фильтров с `state` проверять не на чем: ленивая достройка ставит всем
+    «pending», и от фильтра по статусу срез не изменился бы никогда.
+    """
+    engine = create_async_engine(DB_URL, poolclass=None)
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
+        await conn.run_sync(Base.metadata.create_all)
+
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as db:
+        instance = EngageInstance(key="default", client_label="Основной",
+                                  base_url="http://engage:8103",
+                                  api_key_env="RADAR_ENGAGE_API_KEY")
+        db.add(instance)
+        await db.flush()
+
+        wf = Workflow(key="cold_dm", title="Личные сообщения", target_kind="user",
+                      action="dm", visibility="private",
+                      engage_instance_id=instance.id, engage_use_case="cold_dm",
+                      cascade_profile="dm_v1", sort_order=10, is_active=True)
+        db.add(wf)
+        await db.flush()
+
+        chat = Channel(peer_id=-2001, username="chat", title="Обсуждение")
+        taxes = Channel(peer_id=-2002, username="taxes", title="Налоги")
+        db.add_all([chat, taxes])
+        await db.flush()
+
+        async def target(channel, tg_id, *, score, username, name, quote, state):
+            m = Message(channel_id=channel.id, tg_message_id=tg_id, tg_date=NOW,
+                        author_peer_id=500, author_username=username,
+                        author_name=name, author_is_bot=False,
+                        is_automatic_forward=False, text=quote, processed_at=NOW)
+            db.add(m)
+            await db.flush()
+            t = WfTarget(workflow_id=wf.id, target_kind="user", message_id=m.id,
+                         channel_id=channel.id, recipient_peer_id=500,
+                         author_peer_id=500, author_username=username,
+                         author_name=name, pain=None, quote=quote, score=score,
+                         score_breakdown=[], disqualifiers=[], status="in_review")
+            db.add(t)
+            await db.flush()
+            db.add(WfDraft(workflow_id=wf.id, target_id=t.id, variants=[],
+                           state=state, prompt_version="test-v0"))
+
+        await target(chat, 2001, score=90, username="anna", name="Анна",
+                     quote="не проходит платёж за рубеж", state="pending")
+        await target(chat, 2002, score=40, username="boris", name="Борис",
+                     quote="посоветуйте бухгалтера для ИП", state="approved")
+        await target(taxes, 2003, score=70, username="clara", name="Клара",
+                     quote="ищу, кто разбирается в налогах", state="rejected")
+
+        users = {}
+        for role in ("owner", "customer", "reviewer", "viewer"):
+            u = User(email=f"{role}@local", name=role, initials=role[:2].upper(),
+                     role=role, password_hash="!нельзя-войти", totp_secret="X" * 32,
+                     totp_confirmed=True, is_active=True)
+            db.add(u)
+            users[role] = u
+        await db.commit()
+        out = {"uids": {r: u.id for r, u in users.items()}}
+
+    await engine.dispose()
+    return out
+
+
 @pytest.fixture
 def seeded():
     """Посев в собственном цикле событий, полностью закрытый за собой.
@@ -190,6 +263,38 @@ def _login(client, uid):
 @pytest.fixture
 def authed(client, seeded):
     return _login(client, seeded["uids"]["owner"])
+
+
+@pytest.fixture
+def seeded_filters():
+    return asyncio.run(_seed_filters())
+
+
+@pytest.fixture
+def client_filters(seeded_filters):
+    """Тот же подъём приложения, что у `client`, — но на посеве `_seed_filters`."""
+    previous = os.environ.get("RADAR_DATABASE_URL")
+    os.environ["RADAR_DATABASE_URL"] = DB_URL
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_maker.cache_clear()
+
+    app = create_app()
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
+
+    if previous is None:
+        os.environ.pop("RADAR_DATABASE_URL", None)
+    else:
+        os.environ["RADAR_DATABASE_URL"] = previous
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    get_session_maker.cache_clear()
+
+
+@pytest.fixture
+def authed_filters(client_filters, seeded_filters):
+    return _login(client_filters, seeded_filters["uids"]["owner"])
 
 
 PATHS = ["/api/v1/workflows/cold_dm/stream", "/api/v1/workflows/cold_dm/targets",
@@ -525,3 +630,90 @@ def test_next_and_direct_link_describe_the_draft_identically(authed):
     direct = authed.get(
         f"/api/v1/workflows/public_reply/drafts/{cursor['id']}").json()["draft"]
     assert cursor == direct
+
+
+# ── фильтры очереди черновиков ────────────────────────────────────────────────
+#
+# Таблица черновиков сценария шлёт `min_score`, `channel` и `q`; необъявленный
+# параметр FastAPI молча отбрасывает, и человек доверяет срезу, которого нет.
+# Посев — `_seed_filters`: два канала, три черновика в трёх состояниях.
+
+def test_drafts_min_score_cuts_rows_and_total_but_not_states(authed_filters):
+    """`min_score` — нижняя граница включительно, режет строки и `total`; сводка
+    `states` остаётся по всему сценарию: чипсы отвечают «сколько всего в каждом
+    статусе», а не «сколько в срезе»."""
+    base = authed_filters.get("/api/v1/workflows/cold_dm/drafts").json()
+    assert base["total"] == 3
+    assert base["created_now"] == 0  # черновики заведены посевом, не ручкой
+
+    cut = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?min_score=60").json()
+    assert cut["total"] == 2
+    assert {r["score"] for r in cut["rows"]} == {90, 70}
+
+    # 90 входит: `>=`, как у старого списка и у целей, а не строго больше.
+    edge = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?min_score=90").json()
+    assert edge["total"] == 1
+    assert [r["score"] for r in edge["rows"]] == [90]
+
+    states = {s["key"]: s["count"] for s in edge["states"]}
+    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0}
+
+
+def test_drafts_channel_filter_by_title(authed_filters):
+    """Канал в фильтре называется названием — тем же значением, которое экран
+    кладёт в select; чужое название даёт пустой список, а не 422."""
+    r = authed_filters.get("/api/v1/workflows/cold_dm/drafts?channel=Обсуждение")
+    assert r.status_code == 200
+    cut = r.json()
+    assert cut["total"] == 2
+    assert {row["channel"] for row in cut["rows"]} == {"Обсуждение"}
+
+    other = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?channel=Налоги").json()
+    assert other["total"] == 1
+    assert other["rows"][0]["channel"] == "Налоги"
+
+    unknown = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?channel=Несуществующий")
+    assert unknown.status_code == 200
+    assert unknown.json()["total"] == 0
+
+
+def test_drafts_search_finds_by_username_and_quote(authed_filters):
+    """`q` — подстрока без учёта регистра по автору, юзернейму и цитате, те же
+    три колонки, что у старого списка: оператор помнит либо «кому писать», либо
+    «про что было»."""
+    by_user = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?q=ANNA").json()
+    assert by_user["total"] == 1
+    assert by_user["rows"][0]["author_username"] == "@anna"
+
+    by_quote = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?q=БУХГАЛТЕР").json()
+    assert by_quote["total"] == 1
+    assert "бухгалтера" in by_quote["rows"][0]["quote"]
+
+
+def test_drafts_filters_combine_with_state(authed_filters):
+    """Фильтры сужают один срез, а не заменяют друг друга: каждый следующий
+    режет то, что осталось от предыдущего."""
+    assert authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?min_score=60").json()["total"] == 2
+
+    combined = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?state=pending&min_score=60").json()
+    assert combined["total"] == 1
+    assert [r["score"] for r in combined["rows"]] == [90]
+    # Сводка и здесь не срезана фильтрами: `state` и `min_score` на неё не влияют.
+    states = {s["key"]: s["count"] for s in combined["states"]}
+    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0}
+
+    assert authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?state=rejected").json()["total"] == 1
+    # Пересечение бывает и пустым: отклонённый черновик со скором 70, а не 80.
+    empty = authed_filters.get(
+        "/api/v1/workflows/cold_dm/drafts?state=rejected&min_score=80")
+    assert empty.status_code == 200
+    assert empty.json()["total"] == 0

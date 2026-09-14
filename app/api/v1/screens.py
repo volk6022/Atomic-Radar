@@ -73,18 +73,20 @@ async def _counts(db) -> dict:
         select(func.count(Lead.id)).where(Lead.status == "new"))).scalar_one()
     channels = (await db.execute(select(func.count(Channel.id)))).scalar_one()
 
-    # Очередь черновиков давно не только старый контур: у каждого сценария своя
-    # (`wf_drafts`), и на проде ждут ревью именно там. Состояние — то же «ждёт
-    # ревью», которым `GET /workflows/{key}/drafts` открывает очередь по умолчанию
-    # (`"pending"` из `DRAFT_STATES` в `wf_queues.py`; «разобранные» —
-    # `approved`/`rejected`/`edited` — очередью не считаются). Разбивка по
-    # сценариям считается здесь же, одним запросом, а не второй ходкой в ручке
-    # дашборда: числа обязаны сходиться между бейджем меню, плиткой и разбивкой,
-    # а два независимых запроса — гарантированный способ разъехаться.
+    # Очередь черновиков — только сценарная: у каждого сценария своя (`wf_drafts`),
+    # и на проде ждут ревью именно там. Состояние — то же «ждёт ревью», которым
+    # `GET /workflows/{key}/drafts` открывает очередь по умолчанию (`"pending"` из
+    # `DRAFT_STATES` в `wf_queues.py`; «разобранные» — `approved`/`rejected`/`edited`
+    # — очередью не считаются). Разбивка по сценариям считается здесь же, одним
+    # запросом, а не второй ходкой в ручке дашборда: числа обязаны сходиться между
+    # бейджем меню, плиткой и разбивкой, а два независимых запроса — гарантированный
+    # способ разъехаться.
     #
-    # Старый контур (`drafts`) складывается в тот же счётчик, пока жив: его
-    # экраны ещё обслуживаются, и выкинуть ждущие там черновики значило бы
-    # снова показать «очередь пуста» — только теперь про другой контур.
+    # Старый контур (`drafts`) в счётчик не входит: с 13.09 он спрятан из панели
+    # (`HIDDEN_NAV`) и остался архивом по прямой ссылке, а его pending — дубли тех
+    # же лидов, потому что его очередь воркер заводит лениво в сценарную (стенд
+    # 14.09: 1222 в двойном счётчике против 1034 в сценариях). Складывать его
+    # значило бы показывать очередь, которой нет ни в одном списке.
     drafts_by_workflow = [{"key": key, "title": title, "count": n}
                           for key, title, n in (await db.execute(
         select(Workflow.key, Workflow.title, func.count(WfDraft.id))
@@ -92,14 +94,12 @@ async def _counts(db) -> dict:
         .where(WfDraft.state == "pending")
         .group_by(Workflow.id, Workflow.key, Workflow.title, Workflow.sort_order)
         .order_by(Workflow.sort_order, Workflow.key))).all()]
-    drafts_pending = (await db.execute(
-        select(func.count(Draft.id)).where(Draft.state == "pending"))).scalar_one()
 
     return {"total_msgs": total_msgs, "msgs_24h": msgs_24h,
             "l0": l0_passed, "l1": l1_passed, "l2": l2_passed, "l3": l3_passed,
             "leads": leads, "leads_new": leads_new,
             "channels": channels,
-            "drafts": drafts_pending + sum(d["count"] for d in drafts_by_workflow),
+            "drafts": sum(d["count"] for d in drafts_by_workflow),
             "drafts_by_workflow": drafts_by_workflow}
 
 

@@ -188,11 +188,41 @@ def test_v6_key_decides_not_the_value():
                            "real_problem": True})[0] is False
 
 
+def test_v6_null_is_target_lead_does_not_fall_back_to_real_problem():
+    """Сломанный ответ нового промпта (`is_target_lead: null`) — не «поле не
+    задавали»: ключ на месте, и старое поле решать за него не вправе."""
+    ok, why = cascade.level3({**V6, "is_target_lead": None, "real_problem": True})
+    assert ok is False and "проблемы нет" in why
+
+
+def test_v6_only_a_real_boolean_true_counts_as_yes():
+    """Сравнение строго `is True`: строка «true» из неразобранного ответа — не «да»,
+    иначе правило кода расходится с тем, чем набор измеряли офлайн."""
+    ok, why = cascade.level3({**V6, "is_target_lead": "true"})
+    assert ok is False and "проблемы нет" in why
+
+
 def test_legacy_prompt_ignores_customer_type():
     """Старый промпт типа клиента не спрашивает — случайное поле решать не должно."""
     ok, _ = cascade.level3({"real_problem": True, "is_seller": False,
                             "answering_someone_else": False,
                             "customer_type": "personal"})
+    assert ok is True
+
+
+def test_public_profile_refuses_personal_purchase_too():
+    """I8: отказ по типу клиента — не политика профиля, а правило промптов v6+.
+    У публичного промпта этого поля нет, но если ответ v6+ когда-нибудь дойдёт до
+    `PUBLIC_V1`, физлицо отсекается тем же словом, что и в личных сообщениях."""
+    ok, why = cascade.level3({**V6, "customer_type": "personal"},
+                             profile=cascade.PUBLIC_V1)
+    assert ok is False and "физлица" in why
+
+
+def test_public_profile_still_keeps_a_v6_seller():
+    """Зеркальное I8: новое правило не сломало политику профиля — продавца
+    публичный контур не отсекает и на ответах v6+, как и на старом промпте."""
+    ok, why = cascade.level3({**V6, "is_seller": True}, profile=cascade.PUBLIC_V1)
     assert ok is True
 
 
