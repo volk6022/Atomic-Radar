@@ -608,6 +608,19 @@ def disqualifiers(text: str | None, *, profile: CascadeProfile = DM_V1) -> list[
 
 # ── L3: LLM ───────────────────────────────────────────────────────────────────
 
+# Два поколения промптов ЛС отвечают на вопрос «есть ли у автора проблема» разными
+# полями. Старые (`services/llm.py`, `public_v1`) — `real_problem`; наборы v6+ по
+# разбору Gemini 14.09 — `is_target_lead` плюс `customer_type` (company / personal /
+# unclear). Правило одно: наблюдение «проблема есть» берётся из того поля, которое
+# промпт реально вернул. Ключ решает, а не значение: `is_target_lead: false` — это
+# ответ «нет», а не «поле не задавали», и падать на `real_problem` нельзя.
+def _problem_observed(llm: dict) -> tuple[bool, str | None]:
+    """(есть ли проблема, тип клиента или None у старых промптов)."""
+    if "is_target_lead" in llm:
+        return llm.get("is_target_lead") is True, llm.get("customer_type")
+    return bool(llm.get("real_problem")), None
+
+
 def level3(llm: dict, *, profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
     """Решение по разобранному ответу модели.
 
@@ -628,7 +641,7 @@ def level3(llm: dict, *, profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
     if llm.get("error"):
         return False, f"модель не ответила: {llm['error']}"
 
-    problem = bool(llm.get("real_problem"))
+    problem, customer = _problem_observed(llm)
     seller = bool(llm.get("is_seller"))
     answering = bool(llm.get("answering_someone_else"))
     why = (llm.get("why") or "").strip()
@@ -636,6 +649,14 @@ def level3(llm: dict, *, profile: CascadeProfile = DM_V1) -> tuple[bool, str]:
 
     if not problem:
         return False, f"модель: проблемы нет{tail}"
+    # Тип клиента спрашивают только промпты v6+; у них он обязателен — так правило
+    # совпадает с тем, по которому набор измеряли офлайн (`_v5replay`, `--rule v6`).
+    if customer == "personal":
+        return False, f"модель: покупка физлица для себя{tail}"
+    if customer is not None and customer not in ("company", "unclear"):
+        return False, f"модель: тип клиента не разобран ({customer!r}){tail}"
+    if "is_target_lead" in llm and customer is None:
+        return False, f"модель: тип клиента не назван{tail}"
     if seller and profile.l3_reject_seller:
         return False, f"модель: автор сам оказывает такие услуги{tail}"
     if answering and profile.l3_reject_answering_someone_else:

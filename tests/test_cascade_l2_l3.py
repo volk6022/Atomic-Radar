@@ -144,6 +144,58 @@ def test_model_failure_is_a_refusal_with_the_reason_visible():
     assert ok is False and "не ответила" in why
 
 
+# ── L3: промпты v6+ (`is_target_lead` + `customer_type`) ──────────────────────
+# Правило §3.5 разбора Gemini 14.09, по которому наборы v6–v8 измерялись офлайн:
+# is_target_lead ∧ customer_type ∈ {company, unclear} ∧ ¬is_seller ∧ ¬answering.
+
+V6 = {"is_target_lead": True, "customer_type": "company", "is_seller": False,
+      "answering_someone_else": False, "why": "не проходит оплата поставщику"}
+
+
+def test_v6_prompt_target_lead_passes_for_company_and_unclear():
+    assert cascade.level3(V6)[0] is True
+    assert cascade.level3({**V6, "customer_type": "unclear"})[0] is True
+
+
+def test_v6_prompt_not_a_target_lead_is_no_problem():
+    ok, why = cascade.level3({**V6, "is_target_lead": False})
+    assert ok is False and "проблемы нет" in why
+
+
+def test_v6_prompt_personal_purchase_is_refused():
+    ok, why = cascade.level3({**V6, "customer_type": "personal"})
+    assert ok is False and "физлица" in why
+
+
+def test_v6_prompt_customer_type_is_required():
+    """Тип клиента у промпта v6+ обязателен: без него правило не то, по которому
+    набор измеряли, а значение вне перечня — сломанный ответ, не «unclear»."""
+    without = {k: v for k, v in V6.items() if k != "customer_type"}
+    assert cascade.level3(without)[0] is False
+    assert cascade.level3({**V6, "customer_type": "business"})[0] is False
+
+
+def test_v6_prompt_keeps_seller_and_helper_refusals():
+    assert "услуги" in cascade.level3({**V6, "is_seller": True})[1]
+    assert "помогает другому" in cascade.level3(
+        {**V6, "answering_someone_else": True})[1]
+
+
+def test_v6_key_decides_not_the_value():
+    """`is_target_lead: false` рядом с `real_problem: true` — ответ «нет» от нового
+    промпта, а не повод читать старое поле."""
+    assert cascade.level3({**V6, "is_target_lead": False,
+                           "real_problem": True})[0] is False
+
+
+def test_legacy_prompt_ignores_customer_type():
+    """Старый промпт типа клиента не спрашивает — случайное поле решать не должно."""
+    ok, _ = cascade.level3({"real_problem": True, "is_seller": False,
+                            "answering_someone_else": False,
+                            "customer_type": "personal"})
+    assert ok is True
+
+
 def test_model_verdict_reaches_the_top_level_cascade():
     v = classify("не могу оплатить инвойс, второй день банк возвращает платёж",
                  l2_enabled=True, l3_enabled=True,
