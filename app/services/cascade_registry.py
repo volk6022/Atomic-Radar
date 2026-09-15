@@ -363,10 +363,23 @@ async def save_business_description(db, *, business_description: str, actor: str
                                      activate: bool) -> ProfileVersion:
     """Новая версия `business_description` — единственное поле профиля, у которого
     версионирование уже было (`ProfileVersion`); эта функция просто даёт ему точку
-    записи, которой раньше не существовало."""
+    записи, которой раньше не существовало.
+
+    Идемпотентность (14.8.12a): сохранение **того же** текста при включении
+    (`activate=True`) не создаёт версию, а возвращает активную — иначе импорт
+    только что выгруженного набора поднимал версию без единого изменения текста,
+    и `stale_l3_verdict_count` разом объявлял устаревшими все трейсы. Предложение
+    (`activate=False`) — всегда новая строка: черновик заведомо отличается от
+    активной версии правом «включить позже», даже текстом совпадая с ней.
+    """
     text = business_description.strip()
     if not text:
         raise TaxonomyValidationError("описание бизнеса не может быть пустым")
+
+    current = await active_profile_version(db)
+    if activate and current is not None and current.business_description == text:
+        logger.info("profile_version_unchanged version=%s", current.version)
+        return current
 
     existing_versions = (await db.execute(select(ProfileVersion.version))).scalars().all()
     version = _bump_version(existing_versions)
@@ -408,14 +421,23 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
     Возвращает новую строку. Активация (или её отсутствие для предложения
     заказчика) решена заранее вызывающим кодом по `Capability.CONFIG_EDIT` /
     `CONFIG_PROPOSE` — здесь только формирование и запись снимка.
+
+    Идемпотентность (14.8.12a): при включении (`activate=True`) набор, чьё
+    итоговое состояние после слияния (с учётом `replace=False`!) совпадает с
+    активным — ярлыки как словари, порядок ярлыков не важен, — не создаёт новую
+    `CascadeVersion` и не трогает эталоны, а возвращает активную строку. Иначе
+    импорт того же файла поднимал версию, и счётчик устаревших трейсов L3 прыгал
+    без причины. Предложение (`activate=False`) — всегда новая строка: черновик
+    даже с тем же текстом отличается от активной версии правом «включить позже».
     """
     if pains is None and disqualifiers is None and noise_prototypes is None:
         raise TaxonomyValidationError("нечего сохранять: не передано ни pains, "
                                       "ни disqualifiers, ни noise_prototypes")
 
     current = await active_cascade_version(db)
-    prev_rows = (await db.execute(select(L2Prototype).where(
-        L2Prototype.cascade_version_id == current.id))).scalars().all() \
+    prev_rows = (await db.execute(select(L2Prototype)
+                                  .where(L2Prototype.cascade_version_id == current.id)
+                                  .order_by(L2Prototype.id))).scalars().all() \
         if current is not None else []
     prev_positive: dict[str, list[str]] = {}
     prev_negative: dict[str, list[str]] = {}
@@ -471,6 +493,18 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
 
     if not pain_anchors:
         raise TaxonomyValidationError("таксономия не может остаться без единой боли")
+
+    # «Нет изменений» — по ИТОГОВОМУ состоянию после слияния, а не по входу:
+    # частичное обновление (`replace=False`) могло не тронуть ни одного ярлыка,
+    # и тогда включать новую версию нечего. Ярлыки сравниваются как словари —
+    # порядок ключей (JSONB его и так переставляет) содержанием не является,
+    # порядок внутри списков — является: им живёт «первая боль с якорем» в L1.
+    if activate and current is not None \
+            and pain_anchors == dict(current.pain_anchors) \
+            and disq == dict(current.disqualifiers) \
+            and positive == prev_positive and negative == prev_negative:
+        logger.info("cascade_version_unchanged version=%s", current.version)
+        return current
 
     version_strs = (await db.execute(select(CascadeVersion.version))).scalars().all()
     version = CascadeVersion(version=_bump_version(version_strs),
@@ -533,10 +567,15 @@ async def save_taxonomy(db, *, pains: Mapping[str, tuple[Sequence[str], list[str
 async def save_l3_prompt(db, *, prompt_key: str, system_prompt: str, actor: str,
                          activate: bool) -> L3Prompt:
     """Новая версия системного промпта L3 одного контура. Версия обязана
-    подняться на любую правку текста — даже правку опечатки: `llm_traces` уже
-    хранит `prompt_version` по каждому вердикту, и подменить текст версии на
+    подниматься на любое **изменение** текста — даже правку опечатки: `llm_traces`
+    уже хранит `prompt_version` по каждому вердикту, и подменить текст версии на
     месте значило бы задним числом переписать, каким вопросом эти вердикты
-    получены."""
+    получены. Тот же текст изменением не является: сохранение при включении
+    (`activate=True`) дословно того же промпта возвращает активную версию и новую
+    строку не заводит (14.8.12a) — иначе импорт выгруженного набора объявлял
+    устаревшими все трейсы, вынесенные этим же вопросом. Предложение
+    (`activate=False`) — всегда новая строка, как и у таксономии.
+    """
     text = system_prompt.strip()
     if not text:
         raise TaxonomyValidationError("системный промпт не может быть пустым")
@@ -545,6 +584,10 @@ async def save_l3_prompt(db, *, prompt_key: str, system_prompt: str, actor: str,
             f"промпт «{prompt_key}» неизвестен; известны: {', '.join(sorted(llm.PROMPTS))}")
 
     current = await active_l3_prompt(db, prompt_key)
+    if activate and current is not None and current.system_prompt == text:
+        logger.info("l3_prompt_unchanged key=%s version=%s", prompt_key, current.version)
+        return current
+
     next_version = _bump_prompt_version(current.version if current else "", prompt_key=prompt_key)
 
     if activate:

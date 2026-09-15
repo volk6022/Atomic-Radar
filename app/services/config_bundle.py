@@ -187,8 +187,21 @@ async def import_bundle(db, bundle, *, actor: str) -> dict:
     Порядок не случаен: таксономия идёт первой, потому что только она может
     отказать по внешней причине — новым эталонным фразам нужен эмбеддер. Пройдёт
     она — остальное уже не зависит ни от чего снаружи.
+
+    Части набора, которые ничего не изменили (реестр вернул ту же активную
+    версию), перечисляются в ответе в `unchanged` — импорт только что
+    выгруженного файла обязан быть видимым «ничего не поменял», а не бампом
+    версий (14.8.12a).
     """
     validate(bundle)
+
+    # Активные версии ДО применения — по ним считается `unchanged`: сравниваются
+    # id активных строк до и после, а не тексты, потому что решает реестр.
+    prev_profile = await cascade_registry.active_profile_version(db)
+    prev_cascade = await cascade_registry.active_cascade_version(db)
+    prompt_keys = sorted((bundle.get("l3_prompts") or {}))
+    prev_prompts = {key: await cascade_registry.active_l3_prompt(db, key)
+                    for key in prompt_keys}
 
     pains_in = bundle["pains"]
     pains = {label: ([a.strip() for a in body["anchors"] if a.strip()],
@@ -244,18 +257,37 @@ async def import_bundle(db, bundle, *, actor: str) -> dict:
 
     await cascade_registry.reload(db)
 
+    # Что не изменилось: активная версия этой части та же, что до импорта.
+    # Импорт файла без правок обязан быть видимым в ответе и в журнале, иначе
+    # «применилось» неотличимо от «поднялись версии ни о чём» (14.8.12a).
+    unchanged: list[str] = []
+    if prev_profile is not None and (await cascade_registry.active_profile_version(db)).id \
+            == prev_profile.id:
+        unchanged.append("business")
+    if prev_cascade is not None and (await cascade_registry.active_cascade_version(db)).id \
+            == prev_cascade.id:
+        unchanged.append("taxonomy")
+    for key in prompt_keys:
+        after = await cascade_registry.active_l3_prompt(db, key)
+        if prev_prompts[key] is not None and after is not None \
+                and after.id == prev_prompts[key].id:
+            unchanged.append(f"l3_prompts:{key}")
+
     out = {"name": bundle.get("name"), "pains": len(pains), "noise": len(noise),
            "disqualifiers": len(disq), "prompts": sorted(applied_prompts),
            "thresholds": sorted(applied_thresholds),
            "automation": sorted(applied_automation),
            "prototypes": sum(len(p) for _, p in pains.values())
-           + sum(len(v) for v in noise.values())}
+           + sum(len(v) for v in noise.values()),
+           "unchanged": unchanged}
     # `automation` — в конце строки: ниже по файлу есть проверки журнала на
     # подстроку «thresholds= by=», и вставка между ними сломала бы их молча.
+    # `unchanged` — ещё дальше, в самом хвосте: новое поле не разрывает старые.
     logger.info("config_bundle_imported name=%s pains=%s prompts=%s thresholds=%s "
-                "by=%s automation=%s",
+                "by=%s automation=%s unchanged=%s",
                 out["name"], out["pains"], ",".join(out["prompts"]),
-                ",".join(out["thresholds"]), actor, ",".join(out["automation"]))
+                ",".join(out["thresholds"]), actor, ",".join(out["automation"]),
+                ",".join(unchanged))
     return out
 
 

@@ -614,6 +614,14 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
         .order_by(ProfileVersion.id.desc()).limit(1))).scalar_one_or_none()
     cascade_version = await cascade_registry.active_cascade_version(db)
 
+    # Пороги каскада — из строк `limits` (поверх значений кода), а не из памяти
+    # профиля: строка правится без выкатки, и показывать надо то, что действует
+    # сейчас, а не то, что процесс успел перечитать (14.8.12b). Значение
+    # `l2_min_margin` отсюда же: `apply_thresholds` записывает ту же величину в
+    # `rules.l2_min_margin` при каждой перечитке, так что числа совпадают, — но
+    # один источник честнее двух.
+    thresholds = await cascade_registry.read_thresholds(db)
+
     # Рядом с каждой болью — не только слова для L1, но и эталонные фразы для L2:
     # это две разные механики отбора одной и той же боли, и человеку, который решает,
     # «почему система на это среагировала», нужны обе.
@@ -645,7 +653,12 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
             "profile_title": rules.title,
             "l2_enabled": embeddings.enabled(),
             "l2_model": get_settings().EMBED_MODEL if embeddings.enabled() else None,
-            "l2_min_margin": rules.l2_min_margin,
+            # Оба порога — числа (косинус, 0 < v < 1), не строки; ключ
+            # `l1_bypass_pos_min` здесь с 14.9.7 — раньше действующее значение
+            # было видно только в экспорте набора, а на экране не было нигде.
+            "l2_min_margin": thresholds[cascade_registry.L2_MIN_MARGIN_LIMIT_KEY],
+            "l1_bypass_pos_min":
+                thresholds[cascade_registry.L1_BYPASS_POS_MIN_LIMIT_KEY],
             "l3_enabled": llm.enabled(),
             "l3_model": get_settings().LLM_MODEL if llm.enabled() else None,
             # Промпт берётся у профиля, а не из глобальной константы: с 25.08 у
