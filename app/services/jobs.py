@@ -377,9 +377,13 @@ async def execute(run_id: int, kind: str, params: dict) -> None:
             await _append_log(run_id, "отложено лимитом Engage — задача вернётся сама")
             logger.info("job_deferred run=%s kind=%s", run_id, kind)
         else:
+            # Отменённый прогон оставляет прогресс там, где остановился: колонка
+            # `runs.progress` NOT NULL, и `None` здесь ронял завершение отменённого
+            # прогона в IntegrityError — статус `failed` с тревогой вместо `cancelled`
+            # (найдено приёмкой 14.9 шага 6, стенд, прогон #185).
             await _touch(run_id, status="cancelled" if cancelled else "done",
-                         progress=100 if not cancelled else None,
-                         result=result, finished_at=clock.utcnow())
+                         result=result, finished_at=clock.utcnow(),
+                         **({} if cancelled else {"progress": 100}))
             await _append_log(run_id, "остановлено оператором" if cancelled else "готово")
             logger.info("job_finished run=%s kind=%s cancelled=%s", run_id, kind, cancelled)
     except Exception as e:  # noqa: BLE001 — падение задачи не должно ронять сервис

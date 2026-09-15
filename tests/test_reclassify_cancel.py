@@ -14,6 +14,10 @@
   вердикты отвеченных сообщений записаны, как при штатном завершении;
 * неспрошенные сообщения остаются «в пути» (`level=2, passed=NULL`), а не убиваются.
 
+Тот же принцип ниже проверен для стадии сверки лидов (14.09, прогон #186):
+отмена, поднятая в цикле `_reconcile_leads`, останавливает обход, коммитит
+посчитанное и помечает сводку — прежде этой проверки в сверке не было вовсе.
+
 Отмену здесь решает настоящий `run` по настоящей базе: место проверки — это гонка
 корутин у семафора, моками она не доказывается.
 
@@ -29,7 +33,7 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db.models import Base, Channel, LlmTrace, Message
+from app.db.models import Base, Channel, Lead, LlmTrace, Message
 from app.services import embeddings, llm, reclassify
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
@@ -157,3 +161,67 @@ async def test_cancel_in_l3_stops_asking_and_keeps_answers(db, monkeypatch):
     assert traces == calls["started"], "трейсы сделанных вызовов не выбрасываются"
     assert summary["created"] == calls["started"], \
         "посчитанные вердикты доезжают до лидов, а не теряются вместе с прогоном"
+
+
+async def test_cancel_during_leads_reconcile_keeps_partial(db):
+    """T-cancel-leads (14.09, прогон #186): отмена посреди сверки лидов.
+
+    Раньше сверка шла по всем сообщениям выборки без `report` и без `cancelled`:
+    12 минут тишины при нажатой отмене, итог «готово». Теперь проверка стоит в
+    самом цикле сверки; отмена останавливает обход, посчитанное коммитится,
+    а в сводке видно, сколько сообщений реально сверено.
+
+    Здесь настоящий `run` по настоящей базе: L2/L3 выключены (режим прогона
+    #186), сообщения заведомо проходят строгий L1, `cancelled` переворачивается
+    первой же строкой прогресса сверки — на ближайшей проверке цикл обязан
+    остановиться, не дочитав список.
+    """
+    channel = Channel(peer_id=-1003, username="ch3", title="Канал 3")
+    db.add(channel)
+    await db.flush()
+    total = 1200  # шаг докладов 500: строка на 500-м, остановка на 1000-м
+    for i in range(total):
+        db.add(Message(channel_id=channel.id, tg_message_id=3000 + i,
+                       tg_date=NOW - timedelta(minutes=i),
+                       author_peer_id=700 + i, author_username=f"u{i}",
+                       author_name="Имя", author_is_bot=False,
+                       is_automatic_forward=False, text=TEXT, processed_at=NOW))
+    await db.commit()
+
+    notes: list[tuple[float | None, str]] = []
+    state = {"stop": False}
+
+    async def report(pct, note):
+        notes.append((pct, note))
+        if pct is not None and note.startswith("сверка лидов:") and " из " in note:
+            state["stop"] = True
+
+    def cancelled():
+        return state["stop"]
+
+    summary = await reclassify.run(db, l2_enabled=False, l3_enabled=False,
+                                   scope="all", report=report, cancelled=cancelled)
+
+    assert state["stop"], "строка прогресса сверки обязана была случиться"
+    assert summary["cancelled"] is True, "отмена на сверке — это статус отмены"
+    reconciled = summary["reconciled"]
+    assert reconciled["of"] == total
+    assert 0 < reconciled["leads"] < total, "сверка остановилась посреди списка"
+    assert reconciled["targets"] == 0, "цели после отмены на лидах не начинаются"
+    assert summary["created"] == reconciled["leads"], \
+        "каждое сверенное сообщение с вердиктом «лид» доезжает до очереди"
+
+    leads = (await db.execute(select(func.count(Lead.id)))).scalar_one()
+    assert leads == summary["created"] > 0, \
+        "посчитанное закоммичено, а не потеряно вместе с отменой"
+    # Вердикты применены `_apply` ко всем сообщениям ещё на L0/L1 — до сверок,
+    # и коммит в конце доезжает до всех. Частичной остаётся только сверка:
+    # лиды созданы для сверенной части, хвост ждёт следующего полного прогона.
+    done = (await db.execute(
+        select(func.count(Message.id))
+        .where(Message.cascade_passed.is_not(None)))).scalar_one()
+    assert done == total, "вердикты ко всем сообщениям применены, как и раньше"
+    assert summary["created"] < total, \
+        "в очередь попала только сверенная часть — хвост досчитает следующий прогон"
+    assert any("остановлено на сверке лидов" in note for _, note in notes)
+    assert not any(note.startswith("готово") for _, note in notes)

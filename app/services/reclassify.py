@@ -47,6 +47,19 @@ EMBED_CHUNK = 256
 # L3 — десятки минут.
 WEIGHTS = {"l0l1": 5, "l2": 25, "l3": 65, "leads": 5}
 
+# Полоса сверки (95→100) делится между лидами и целями пополам: обе сверки идут
+# по одному и тому же списку сообщений, и оснований ценить одну вдвое дороже
+# другой нет. LEADS_BASE/TARGETS_BASE — стартовый процент каждой стадии.
+LEADS_BASE = WEIGHTS["l0l1"] + WEIGHTS["l2"] + WEIGHTS["l3"]  # 95
+TARGETS_BASE = LEADS_BASE + WEIGHTS["leads"] / 2              # 97.5
+
+# Как часто внутри сверок докладывать прогресс и спрашивать про отмену. На каждом
+# сообщении — это тысячи обращений к report ради пары целых процентов (порог
+# записи в jobs._tracked — целый процент); раз в 500 сообщений на выборке в 124
+# тысячи — доклад каждые несколько секунд, и отмена подхватывается с той же
+# задержкой, с какой её отдаёт кеш jobs._tracked (обновляется раз в 3 с).
+RECONCILE_STEP = 500
+
 SCOPES = ("all", "pending")
 
 
@@ -394,7 +407,10 @@ def _apply_legacy_l3(messages: list[Message], verdicts: dict,
 
 
 async def _reconcile_leads(db, messages, verdicts, *, create_only: bool = False,
-                           skipped: dict[str, int] | None = None) -> tuple[int, int, int]:
+                           skipped: dict[str, int] | None = None,
+                           report=_noop_report, cancelled=_never_cancelled,
+                           base: float = LEADS_BASE,
+                           reconciled: dict[str, int] | None = None) -> tuple[int, int, int]:
     """Привести очередь лидов в соответствие со свежими вердиктами.
 
     Лид, переставший проходить каскад, из очереди убирается — держать в ней то, что
@@ -422,6 +438,19 @@ async def _reconcile_leads(db, messages, verdicts, *, create_only: bool = False,
     Лид, который и в обычном режиме остался бы на месте (человеческий статус,
     решение по черновику, «ещё в пути»), считается `kept` — его ничего не
     пропускает, он и так не трогался.
+
+    `report`, `cancelled`, `base` — те же инструменты, что у ступеней выше. На
+    проде сверка идёт по всем сообщениям выборки (сотни тысяч), и без докладов
+    она выглядит как повисший прогон, а без проверки отмены — как неотменяемый
+    (прогон #186: двенадцать минут тишины при нажатой отмене). Умолчания —
+    «молчать» и «никогда не отменяться»: прямые вызовы без обвязки работают
+    как раньше. Отмена здесь не бросает `Cancelled`, а останавливает обход:
+    коммит после сверок в прогоне один, и до него обязаны дойти и применённые
+    вердикты, и посчитанное здесь.
+
+    `reconciled` — необязательный выходной словарь: сколько сообщений реально
+    сверено (ключ `"leads"`; при полном проходе — все). `run` переносит это в
+    сводку: отмена посреди сверки должна быть видна снаружи, а не только в логе.
     """
     leads = {row.message_id: row
              for row in (await db.execute(select(Lead))).scalars().all()}
@@ -430,6 +459,12 @@ async def _reconcile_leads(db, messages, verdicts, *, create_only: bool = False,
     created = removed = kept = 0
     skipped = {} if skipped is None else skipped
 
+    total = len(messages)
+    # Начало стадии — строка без процента: она попадает в лог всегда, даже если
+    # целые проценты дальше не сменятся ни разу. Именно её не хватало в #186.
+    await report(None, f"сверка лидов: сообщений {total}")
+
+    done = 0
     for m in messages:
         v = verdicts[m.id]
         lead = leads.get(m.id)
@@ -480,6 +515,17 @@ async def _reconcile_leads(db, messages, verdicts, *, create_only: bool = False,
                     await db.delete(lead)
                     removed += 1
 
+        done += 1
+        if done % RECONCILE_STEP == 0 or done == total:
+            # Сначала отмена, потом доклад: остановленный обход не должен
+            # успевать строкой, за которой ничего не стоит.
+            if cancelled():
+                break
+            await report(base + WEIGHTS["leads"] / 2 * done / total,
+                         f"сверка лидов: {done} из {total}")
+
+    if reconciled is not None:
+        reconciled["leads"] = done
     return created, removed, kept
 
 
@@ -487,7 +533,10 @@ async def _reconcile_targets(db, bound, messages, *, l2_enabled: bool, l3_enable
                              ranked: dict[int, list],
                              llm_answers: dict[int, dict],
                              channels: dict[int, Channel],
-                             create_only: bool = False) -> dict:
+                             create_only: bool = False,
+                             report=_noop_report, cancelled=_never_cancelled,
+                             base: float = TARGETS_BASE,
+                             reconciled: dict[str, int] | None = None) -> dict:
     """Записать вердикты сценариев и привести их цели в соответствие.
 
     Отдельным проходом после `_reconcile_leads`, а не внутри него: очередь лидов и
@@ -501,12 +550,23 @@ async def _reconcile_targets(db, bound, messages, *, l2_enabled: bool, l3_enable
 
     `create_only` — частичный прогон: цели только создаются, перезапись и удаление
     пропускаются (`kept`), по той же причине, что и у очереди лидов.
+
+    `report`, `cancelled`, `base`, `reconciled` — как в `_reconcile_leads`:
+    длинный обход обязан докладывать прогресс и уметь останавливаться, и отмена
+    возвращает посчитанное, а не рвёт прогон.
     """
     if not bound:
         return {}
 
+    total = len(messages)
+    # Строка начала стадии — без процента: пишется в лог всегда. Число сценариев
+    # рядом с числом сообщений подсказывает оператору, насколько стадия долгая.
+    await report(None, f"сверка целей: {total}, сценариев {len(bound)}")
+
     wf_summary: dict = {}
+    done = 0
     for m in messages:
+        done += 1
         channel = channels.get(m.channel_id)
         if channel is None:
             # Внешний ключ этого не допускает. Если всё же случилось — сообщение
@@ -520,6 +580,14 @@ async def _reconcile_targets(db, bound, messages, *, l2_enabled: bool, l3_enable
             llm_by_prompt=llm_answers.get(m.id),
             l1_bypass=channel.l1_bypass_enabled, create_only=create_only,
             summary=wf_summary)
+        if done % RECONCILE_STEP == 0 or done == total:
+            if cancelled():
+                break
+            await report(base + WEIGHTS["leads"] / 2 * done / total,
+                         f"сверка целей: {done} из {total}")
+
+    if reconciled is not None:
+        reconciled["targets"] = done
     return wf_summary
 
 
@@ -539,6 +607,12 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
     Коммит делается один раз в конце — включая случай отмены: то, что успели
     посчитать, терять незачем, а частично разобранный поток ничем не хуже
     неразобранного.
+
+    Отмена проверяется и в сверках (лиды, цели), а не только в ступенях:
+    остановка посреди сверки возвращает посчитанное и помечает сводку
+    `cancelled=True` со счётчиком `reconciled` — сколько сообщений реально
+    сверено. Отмена, случившаяся на ступенях, сверкам не мешает: их работа
+    как раз и состоит в том, чтобы записать посчитанное.
     """
     if scope not in SCOPES:
         raise ValueError(f"неизвестный охват «{scope}», ожидается один из {SCOPES}")
@@ -556,7 +630,8 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
                "l3": l3_enabled, "cancelled": False,
                "created": 0, "removed": 0, "kept": 0,
                "skipped_updates": 0, "skipped_removals": 0,
-               "l3_questions": 0, "workflows": {}}
+               "l3_questions": 0, "workflows": {},
+               "reconciled": {"leads": 0, "targets": 0, "of": 0}}
     if not messages:
         await report(100, "нечего пересчитывать")
         return summary
@@ -574,6 +649,17 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
     llm_errors: dict[int, dict[str, str]] = {}
     try:
         await report(0, f"сообщений в работе: {len(messages)}")
+        # Выключенные ступени обязаны быть названы в логе: оператор видит
+        # «лидов создано N» и должен понимать, чем они получены, — без этой
+        # строки «181 лид при выключенной модели» выглядит как поломка (#186).
+        # pct=None: строка пишется в лог всегда, без порога целого процента.
+        off = [name for name, on in (("L2", l2_enabled), ("L3", l3_enabled))
+               if not on]
+        if off:
+            names = ", ".join(f"{name} выключена" for name in off)
+            tail = ("лиды считаются по строгому L1 (без модели)" if not l2_enabled
+                    else "лиды считаются словарём L1 и близостью L2 (без модели)")
+            await report(None, f"{names} — {tail}")
         for m in messages:
             v = _run_l0l1(m, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
                           l1_bypass=channels[m.channel_id].l1_bypass_enabled)
@@ -613,17 +699,50 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         _apply_legacy_l3(messages, verdicts, llm_answers, llm_errors)
         await report(None, "остановлено; посчитанное сохранено")
 
+    # Сверки выполняются и после отмены на ступенях — их смысл как раз в том,
+    # чтобы записать посчитанное. Но отмене, случившейся на самих сверках, они
+    # обязаны подчиняться; на отмену со ступеней вместо настоящей проверки
+    # подставляется «никогда», чтобы сверки дочитали список до конца.
+    reconcile_cancelled = _never_cancelled if was_cancelled else cancelled
+
     skipped: dict[str, int] = {}
+    reconciled: dict[str, int] = {}
     created, removed, kept = await _reconcile_leads(db, messages, verdicts,
                                                     create_only=create_only,
-                                                    skipped=skipped)
+                                                    skipped=skipped,
+                                                    report=report,
+                                                    cancelled=reconcile_cancelled,
+                                                    base=LEADS_BASE,
+                                                    reconciled=reconciled)
     summary.update(created=created, removed=removed, kept=kept)
     summary["skipped_updates"] = skipped.get("updates", 0)
     summary["skipped_removals"] = skipped.get("removals", 0)
-    summary["workflows"] = await _reconcile_targets(
-        db, bound, messages, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
-        ranked=ranked, llm_answers=llm_answers, channels=channels,
-        create_only=create_only)
+    leads_done = reconciled.get("leads", len(messages))
+
+    if reconcile_cancelled():
+        # Отмена случилась на сверке лидов: цели не начинаем — они судят те же
+        # сообщения, и дочитывать список вместо остановки значило бы игнорировать
+        # нажатую кнопку ещё на несколько минут.
+        summary["reconciled"] = {"leads": leads_done, "targets": 0,
+                                 "of": len(messages)}
+        summary["cancelled"] = True
+        await report(None, f"остановлено на сверке лидов: сверено {leads_done} "
+                           f"из {len(messages)}; посчитанное сохранено")
+    else:
+        summary["workflows"] = await _reconcile_targets(
+            db, bound, messages, l2_enabled=l2_enabled, l3_enabled=l3_enabled,
+            ranked=ranked, llm_answers=llm_answers, channels=channels,
+            create_only=create_only, report=report,
+            cancelled=reconcile_cancelled, base=TARGETS_BASE,
+            reconciled=reconciled)
+        targets_done = reconciled.get("targets", len(messages))
+        summary["reconciled"] = {"leads": leads_done, "targets": targets_done,
+                                 "of": len(messages)}
+        if reconcile_cancelled():
+            summary["cancelled"] = True
+            await report(None, f"остановлено на сверке целей: сверено "
+                               f"{targets_done} из {len(messages)}; "
+                               f"посчитанное сохранено")
 
     # Счётчик лидов в канале — производная величина. При частичном охвате пересчитать
     # её по одним лишь тронутым сообщениям нельзя: получится «в канале два лида»
@@ -636,7 +755,7 @@ async def run(db, *, l2_enabled: bool, l3_enabled: bool, l3_limit: int | None = 
         channel.leads_total = counts.get(channel.id, 0)
 
     await db.commit()
-    if not was_cancelled:
+    if not summary["cancelled"]:
         await report(100, f"готово: лидов создано {created}, удалено {removed}, "
                           f"оставлено {kept}")
     return summary
