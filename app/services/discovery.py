@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core import clock
 from app.db.models import Channel, ChannelCandidate, DiscoveryQuery, Limit, LlmTrace, Run
 from app.db.session import get_session_maker
-from app.services import cascade_registry, deferrals, engage, llm
+from app.services import backfill_queue, cascade_registry, deferrals, engage, llm
 
 logger = logging.getLogger(__name__)
 
@@ -238,9 +238,14 @@ async def check_card(db, candidate, *, account_id: int,
         return await _reject(
             db, candidate, decided_by=CARD_ACTOR,
             reason=f"{candidate.members} участников — меньше порога {min_members}")
-    if not candidate.linked_chat_username:
+    if (not candidate.linked_chat_username
+            and candidate.chat_type not in backfill_queue.GROUP_CHAT_TYPES):
         # Без группы обсуждения комментарии не читаются — канал для сценария B
-        # бесполезен, каким бы большим он ни был (отсев по B.3).
+        # бесполезен, каким бы большим он ни был (отсев по B.3). Группа — сама
+        # чат: правило «нет группы обсуждения» к ней неприменимо, читать надо
+        # её саму (живость так и делает). Отданный карточкой группы
+        # родительский канал в `linked_chat_username` не трогается — он нужен
+        # `channel_add`.
         return await _reject(db, candidate, decided_by=CARD_ACTOR,
                              reason="нет группы обсуждения — комментарии "
                                     "не читаются")
@@ -264,6 +269,39 @@ async def _history_page(account_id: int, username: str, *, min_date: str,
     return result.get("posts") or []
 
 
+async def _count_history(account_id: int, username: str, *, min_date: str,
+                         min_comments: int,
+                         sample: list[str] | None = None) -> int:
+    """Сообщения в чате за окно живости: страницы истории, пока счётчик не
+    закроет порог. Тексты первой страницы — в `sample` (для шага модели):
+    второй ходки в Telegram ради выборки нет. Та же петля, что читала группу
+    обсуждения канала, — у группы-кандидата читается она сама."""
+    comments = 0
+    max_id = 0
+    first_page = True
+    while comments < min_comments:
+        page = await _history_page(account_id, username,
+                                   min_date=min_date, max_id=max_id)
+        if not page:
+            break
+        comments += len(page)
+        if first_page and sample is not None:
+            sample.extend(p.get("text") for p in page if p.get("text"))
+            first_page = False
+        ids = [p["message_id"] for p in page if p.get("message_id")]
+        if not ids:
+            break
+        oldest = min(ids)
+        if max_id and oldest >= max_id:
+            # Курсор не сдвинулся — история кончилась или Engage вернул ту же
+            # страницу; крутить один вызов до конца бюджета нельзя.
+            break
+        max_id = oldest - 1
+        if len(page) < LIVENESS_PAGE:
+            break
+    return comments
+
+
 async def check_liveness(db, candidate, *, account_id: int,
                          now: datetime | None = None,
                          sample: list[str] | None = None, report=None,
@@ -274,6 +312,11 @@ async def check_liveness(db, candidate, *, account_id: int,
     ходки в Telegram ради неё не делаем (§5). `now` вынесен параметром для
     проверяемости окна, как у `backfill_drain.tick`. `out` — как у `check_card`:
     откладывание лимитом записывает `(аккаунт, действие, код)` для окна прогона.
+
+    Группа-кандидат (`chat_type` из `backfill_queue.GROUP_CHAT_TYPES`) — сама
+    чат: постов канала у неё нет, живость меряется сообщениями самой группы
+    (`candidate.username`), счётчик постов остаётся пустым и порог постов к
+    группе не применяется.
     """
     now = now or clock.utcnow()
     min_date = (now - LIVENESS_WINDOW).isoformat()
@@ -281,37 +324,26 @@ async def check_liveness(db, candidate, *, account_id: int,
     min_posts = int(lim["discovery_min_posts_7d"])
     min_comments = int(lim["discovery_min_comments_7d"])
 
+    is_group = candidate.chat_type in backfill_queue.GROUP_CHAT_TYPES
     try:
-        posts = await _history_page(account_id, candidate.username, min_date=min_date)
-        if sample is not None:
-            sample.extend(p.get("text") for p in posts if p.get("text"))
-        # Полная страница (100) закрывает порог постов сама; листать дальше
-        # ради точного числа незачем — лишние чтения из дневного бюджета.
-        post_count = len(posts)
-
-        comments = 0
-        max_id = 0
-        first_group_page = True
-        while comments < min_comments:
-            page = await _history_page(account_id, candidate.linked_chat_username,
-                                       min_date=min_date, max_id=max_id)
-            if not page:
-                break
-            comments += len(page)
-            if first_group_page and sample is not None:
-                sample.extend(p.get("text") for p in page if p.get("text"))
-                first_group_page = False
-            ids = [p["message_id"] for p in page if p.get("message_id")]
-            if not ids:
-                break
-            oldest = min(ids)
-            if max_id and oldest >= max_id:
-                # Курсор не сдвинулся — история кончилась или Engage вернул ту же
-                # страницу; крутить один вызов до конца бюджета нельзя.
-                break
-            max_id = oldest - 1
-            if len(page) < LIVENESS_PAGE:
-                break
+        if is_group:
+            # Постов канала не считается вовсе: `liveness_posts_7d` остаётся
+            # пустым (None) — «не измерялось», а не ноль.
+            post_count = None
+            comments = await _count_history(
+                account_id, candidate.username, min_date=min_date,
+                min_comments=min_comments, sample=sample)
+        else:
+            posts = await _history_page(account_id, candidate.username,
+                                        min_date=min_date)
+            if sample is not None:
+                sample.extend(p.get("text") for p in posts if p.get("text"))
+            # Полная страница (100) закрывает порог постов сама; листать дальше
+            # ради точного числа незачем — лишние чтения из дневного бюджета.
+            post_count = len(posts)
+            comments = await _count_history(
+                account_id, candidate.linked_chat_username, min_date=min_date,
+                min_comments=min_comments, sample=sample)
     except (engage.EngageTaskFailed, engage.EngageUnavailable) as e:
         # `EngageTaskDeferred` внутри — общий предок ловит все три вида, различает
         # трактовка. Поля живости не трогаем: шаг не доделан, а не «мёртв».
@@ -330,7 +362,7 @@ async def check_liveness(db, candidate, *, account_id: int,
     candidate.liveness_checked_at = now
     await db.commit()
 
-    if post_count < min_posts:
+    if post_count is not None and post_count < min_posts:
         return await _reject(
             db, candidate, decided_by=LIVENESS_ACTOR,
             reason=f"{post_count} постов за 7 суток — меньше порога {min_posts}")
@@ -584,13 +616,29 @@ async def run_check(*, report, cancelled) -> dict:
     return stats
 
 
-def _found_items(result) -> list[dict]:
+def _found_items(result, *, kind: str | None = None) -> list[dict]:
     """Список найденных каналов из ответа поиска. Форма ответа Engage не
     зафиксирована (RECON, п. 1: живым вызовом проверить не удалось), поэтому
     берётся первый список словарей из известных ключей. Элемент без title
-    считается в `found_total`, но строкой не становится (§3.2)."""
+    считается в `found_total`, но строкой не становится (§3.2).
+
+    У поиска по строке (`kind="search"`) форма известна из кода воркера
+    `search_public_chats`: полный список лежит в `results`, а `channels`/`chats`
+    — его разрез по типу чата. Ключ `channels` там есть всегда, и прежний
+    «первый список» при пустом разрезе каналов терял найденные группы молча;
+    без `results` (старая форма) списки складываются — группы, потом каналы."""
     if isinstance(result, list):
         return [r for r in result if isinstance(r, dict)]
+    if kind == "search":
+        rows = result.get("results") if isinstance(result, dict) else None
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+        items: list[dict] = []
+        for key in ("chats", "channels"):
+            rows = result.get(key) if isinstance(result, dict) else None
+            if isinstance(rows, list):
+                items.extend(r for r in rows if isinstance(r, dict))
+        return items
     for key in ("channels", "chats", "similar", "results", "items", "posts"):
         rows = result.get(key) if isinstance(result, dict) else None
         if isinstance(rows, list):
@@ -784,7 +832,7 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
                     if retry_after_s is not None:
                         out["retry_after_s"] = retry_after_s
                     return out
-                items = _found_items(result)
+                items = _found_items(result, kind=kind)
                 new_total = 0
                 for item in items:
                     if await _upsert_candidate(db, item, kind=kind,
@@ -855,7 +903,7 @@ async def run_scan(run_id: int, *, params: dict, report, cancelled) -> dict:
             if retry_after_s is not None:
                 out["retry_after_s"] = retry_after_s
             return out
-        items = _found_items(result)
+        items = _found_items(result, kind=kind)
         await report(40, f"найдено {len(items)} каналов")
 
         new_total = 0
