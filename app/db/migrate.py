@@ -206,6 +206,16 @@ STATEMENTS: list[str] = [
     "ALTER TABLE manual_sends ADD CONSTRAINT manual_sends_conversation_id_fkey "
     "FOREIGN KEY (conversation_id) REFERENCES conversations(id); "
     "END IF; END $$",
+
+    # 2026-09-19, PLAN 16.2: у журнала исходящих появилась жизнь между «заказано»
+    # и «доставлено» — ручная отправка черновика ждёт вебхук Engage, и статус
+    # ожидания с причиной обязан быть виден. Таблица пуста и на проде, и на
+    # стенде (писателя до 16.2 не существовало), поэтому NOT NULL DEFAULT на
+    # state ставится без оговорок: дополнять старые строки не из чего.
+    "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS state VARCHAR(16) "
+    "NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS engage_task_id VARCHAR(64)",
+    "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS error TEXT",
 ]
 
 

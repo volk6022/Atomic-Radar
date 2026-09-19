@@ -217,6 +217,68 @@ async def action(*, account_id: int, action: str, payload: dict, webhook_url: st
     return r.json()
 
 
+async def send_message(*, account_id: int, recipient_peer_id: int | None,
+                       recipient_username: str | None, text: str,
+                       webhook_url: str, idempotency_key: str,
+                       reply_to_message_id: int | None = None,
+                       instance: str | None = None) -> dict:
+    """Заказ отправки личного сообщения. Единственный вызывающий — `OutboundGate.send`.
+
+    Почему эта функция существует отдельно от `action` (выше), а не через него:
+    белый список `action` закрытый и заведомо не содержит `send_message` — так
+    было сделано, чтобы ни одна ветка Radar, кроме гейта, физически не могла
+    заказать отправку. Писать сюда отдельный вход в обход гейта значило бы
+    обнулить эту защиту, поэтому функция не проверяет «можно ли слать» вовсе:
+    разрешение — дело `OutboundGate`, здесь только транспорт. Добавлять имя в
+    белый список `action` тоже нельзя — тогда отправка стала бы доступна всем
+    прочим вызывающим `action` (каскад, обсуждения, discovery) мимо гейта.
+
+    Адресация: `peer_id`, если известен, иначе `recipient_username` — воркер
+    Engage разыскивает получателя как `recipient_username or peer_id`. Оба поля
+    передаются вызывающим, но в payload уходит ровно одно: выбор — часть
+    контракта с Engage, а не договорённость на каждый звонок.
+
+    `idempotency_key` делает повторную подачу заказа безопасной: Engage (16.8)
+    отвечает на неё прежним `task_id`, не создавая вторую задачу и не отправляя
+    второе сообщение.
+
+    Ответ — приём задачи (`task_id` и статус), а не результат: номер доставленного
+    сообщения приезжает позже вебхуком `kind="send"` на `webhook_url`.
+    """
+    payload: dict = {"text": text, "idempotency_key": idempotency_key}
+    if recipient_peer_id is not None:
+        payload["peer_id"] = recipient_peer_id
+    else:
+        payload["recipient_username"] = recipient_username
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+
+    body = {"account_id": account_id, "action": "send_message", "payload": payload,
+            "webhook_url": webhook_url, "priority": 5}
+    try:
+        r = await _get_client(instance).post("/v1/action", json=body)
+    except httpx.HTTPError as e:
+        logger.warning("engage_send_unreachable instance=%s account=%s error=%s",
+                       instance or DEFAULT_INSTANCE, account_id, e)
+        raise EngageUnavailable(f"Engage недоступен: {type(e).__name__}") from e
+
+    if r.status_code >= 400:
+        logger.warning("engage_send_error instance=%s account=%s status=%s",
+                       instance or DEFAULT_INSTANCE, account_id, r.status_code)
+        raise EngageUnavailable(f"Engage ответил {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+async def task(task_id: str, *, instance: str | None = None) -> dict:
+    """Прочитать задачу Engage: `GET /v1/tasks/{id}`.
+
+    Тот же маршрут, который крутит `wait_for_task`, но без ожидания: нужен там,
+    где ответ на задачу уже пришёл (вебхуком), а данных в нём не хватило —
+    например, `task_failed` без причины, и её надо допросить у самой задачи.
+    """
+    return await _get(f"/v1/tasks/{task_id}", instance=instance)
+
+
 # ── обратный адрес и опрос результата ─────────────────────────────────────────
 
 def webhook_url(**params) -> str:
@@ -226,6 +288,11 @@ def webhook_url(**params) -> str:
     договорённости с Engage, и её нужно знать и приёмнику, и тому, кто ставит
     задачу из фонового прогона. Секрет в пути, а не в заголовке: у Engage в задаче
     есть только `webhook_url`, заголовок он поставить не может.
+
+    Произвольные параметры едут query-параметрами — по ним приёмник узнаёт, что
+    именно приехало. Кроме `kind` у отправки сообщения (16.2) в адресе едут
+    `account_id` и `outbound_id` (номер строки `wf_outbound`): задача на стороне
+    Engage знает только адрес, и без них вебхук не смог бы найти свою попытку.
     """
     s = get_settings()
     if not s.INGEST_TOKEN:

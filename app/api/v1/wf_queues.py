@@ -36,7 +36,8 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Date, cast, func, literal_column, select
 
@@ -51,7 +52,8 @@ from app.core.outbound_gate import OutboundGate, SendRequest
 from app.db.models import (Account, AuditLog, Channel, DraftComment, EngageInstance,
                            ManualSend, Message, MessageReader, WfDraft, WfOutbound,
                            WfTarget, WfVerdict, Workflow)
-from app.services import (draft_comments, drafting,
+from app.services import (conversations as conversations_service,
+                          draft_comments, draft_send, drafting,
                           engage, manual_sends as manual_sends_service,
                           wf_drafting, workflows as workflow_service)
 
@@ -59,8 +61,15 @@ logger = logging.getLogger("radar")
 
 router = APIRouter(prefix="/api/v1/workflows/{key}", tags=["workflow-data"])
 
-TARGET_STATUSES = ("new", "in_review", "approved", "rejected")
-DRAFT_STATES = ("pending", "approved", "rejected", "edited")
+# «contacted» — цель, по которой отправка доставлена (вебхук kind="send"):
+# из «approved» цель уходит навсегда, как из «new» — после отклонения. Ни один
+# экран не предлагает к цели-«contacted» новых действий: писать человеку второй
+# раз — решение для другого механизма, а не для этого статуса.
+TARGET_STATUSES = ("new", "in_review", "approved", "rejected", "contacted")
+# «sent» — черновик, чья отправка доставлена. Ставит его только вебхук; «заказано,
+# но не доехало» остаётся «approved» — точка невозврата по-прежнему доставленное
+# сообщение, а не факт заказа.
+DRAFT_STATES = ("pending", "approved", "rejected", "edited", "sent")
 
 # Пять положений фильтра потока, а не четыре: у сценария есть состояние, которого у
 # общего потока нет вовсе, — «сценарий сюда ещё не доходил». См. `stream()`.
@@ -536,6 +545,38 @@ async def _source_by_message(db, channel_by_id: dict, targets: list) -> dict:
     return dict(zip(order, await drafting.source_links_many(db, pairs)))
 
 
+async def _outbound_by_draft(db, draft_ids: list[int]) -> dict[int, WfOutbound]:
+    """Последняя попытка отправки для каждого черновика страницы — одним запросом.
+
+    «Последняя» — по id, а не по времени: id растут вместе с созданием, и одна
+    секунда на две попытки не перевернёт бейдж. Запросов на строку здесь быть не
+    должно по той же причине, что и у `readers`: список — не место для N+1.
+    """
+    if not draft_ids:
+        return {}
+    rows = (await db.execute(
+        select(WfOutbound)
+        .where(WfOutbound.draft_id.in_(draft_ids))
+        .order_by(WfOutbound.id))).scalars().all()
+    return {row.draft_id: row for row in rows}
+
+
+def _outbound_view(row: WfOutbound | None) -> dict | None:
+    """Бейдж отправки в строке и карточке черновика: была ли попытка и чем кончилась.
+
+    `null` — отправку не заказывали вовсе, это нормальное состояние очереди, а не
+    пропуск поля. Состояния живого цикла: `pending` (заказано, ждём вебхук),
+    `deferred` (Engage отложил по лимиту), `delivered` (доставлено), `failed`
+    (заказ не принят или задача упала).
+    """
+    if row is None:
+        return None
+    return {"id": row.id, "state": row.state, "task_id": row.engage_task_id,
+            "delivered_message_id": row.delivered_message_id,
+            "conversation_id": row.conversation_id, "error": row.error,
+            "created_at": row.created_at.isoformat() if row.created_at else None}
+
+
 @router.get("/drafts")
 async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
@@ -643,6 +684,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         db, instance_key, [t.message_id for _, t, _ in rows])
     source = await _source_by_message(db, {c.id: c for _, _, c in rows},
                                       [t for _, t, _ in rows])
+    outbound = await _outbound_by_draft(db, [d.id for d, _, _ in rows])
 
     out = [{
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -660,6 +702,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         "reject_reason": d.reject_reason,
         "prompt_version": d.prompt_version,
         "source_message_link": d.source_message_link,
+        "outbound": _outbound_view(outbound.get(d.id)),
         "created_at": d.created_at.isoformat() if d.created_at else None,
     } for d, t, c in rows]
 
@@ -670,7 +713,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 
 def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
          readers: list[dict], source: dict | None = None,
-         comments: list[dict] | None = None) -> dict:
+         comments: list[dict] | None = None,
+         outbound: dict | None = None) -> dict:
     """Черновик целиком — для карточки, а не для строки таблицы.
 
     Одна форма на курсорную выдачу и на прямую ссылку: экран у них общий, и разойдись
@@ -683,7 +727,9 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
 
     Отзывы (`comments`) функция сама не достаёт — она синхронная и без сессии базы;
     их приносит вызывающая ручка (`draft_comments.list_for`), чтобы курсор и
-    прямая ссылка не могли показать карточку с разным числом отзывов.
+    прямая ссылка не могли показать карточку с разным числом отзывов. Бейдж
+    отправки (`outbound`) — по той же причине: его достаёт вызывающая ручка,
+    иначе карточка и строка списка разошлись бы в том, заказана ли отправка.
     """
     return {
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -709,6 +755,7 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
         "decided_at": d.decided_at.isoformat() if d.decided_at else None,
         "prompt_version": d.prompt_version,
         "source_message_link": d.source_message_link,
+        "outbound": outbound,
     }
 
 
@@ -780,8 +827,10 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
         readers = await _readers_by_message(db, instance_key, [row[1].message_id])
         source = await _source_by_message(db, {row[2].id: row[2]}, [row[1]])
         comments = await draft_comments.list_for(db, "wf", row[0].id)
+        outbound = await _outbound_by_draft(db, [row[0].id])
         one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []),
-                   source.get(row[1].message_id), comments)
+                   source.get(row[1].message_id), comments,
+                   _outbound_view(outbound.get(row[0].id)))
 
     # `readers` и `tg_link` продублированы на верхний уровень конверта — как у
     # прямой ссылки на карточку: конверты у ручек обязаны совпадать, экран их не
@@ -848,7 +897,9 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
         db, await _instance_key(db, wf), [t.message_id])).get(t.message_id, [])
     source = await _source_by_message(db, {row[2].id: row[2]}, [t])
     comments = await draft_comments.list_for(db, "wf", d.id)
-    one = _one(wf, d, t, row[2], readers, source.get(t.message_id), comments)
+    outbound = await _outbound_by_draft(db, [d.id])
+    one = _one(wf, d, t, row[2], readers, source.get(t.message_id), comments,
+               _outbound_view(outbound.get(d.id)))
     return {"remaining": await _pending(db, wf), "state": d.state,
             "workflow": wf.key,
             "readers": one["readers"], "tg_link": one["tg_link"],
@@ -1135,18 +1186,27 @@ async def _gate_verdict(db, wf: Workflow, draft: WfDraft, target: WfTarget,
                 "reasons": ["проверки исходящих написаны под личные сообщения; "
                             f"для действия «{wf.action}» гейт ещё не заведён"]}
 
+    # Факты касания — из нитки диалога (решение владельца, PLAN 16.11): раньше
+    # здесь стояли константы `False/0`, и «этому человеку уже писали» в показе
+    # гейта не участвовало вовсе. Нитки нет — человеку не писали, значения те же;
+    # нитка есть — «уже писали», пауза и потолок режут вердикт честно.
+    if target.recipient_peer_id is not None:
+        previously_contacted, sent_count, last_sent_at = (
+            await conversations_service.contact_facts(
+                db, peer_id=target.recipient_peer_id))
+    else:
+        previously_contacted, sent_count, last_sent_at = False, 0, None
+
     gate = OutboundGate(engage_client=None, mode_provider=lambda: current_mode(db),
                         journal=None)
     req = SendRequest(
         draft_id=draft.id, conversation_id=0, account_id=0,
         recipient_peer_id=target.recipient_peer_id or 0, text=text,
-        draft_state="approved", is_first_message=True,
-        # Те же заглушки, что в `drafts.py`: истории отправок по этому контуру пока
-        # нет ни одной. Значения намеренно совпадают дословно — `wf_drafts` обязан
-        # оставаться точной тенью `drafts`, пока экраны не переехали.
-        sent_count=0, last_sent_at=None,
+        draft_state="approved",
+        is_first_message=sent_count == 0, sent_count=sent_count,
+        last_sent_at=last_sent_at,
         recipient_local_hour=(clock.utcnow().hour + 3) % 24,
-        recipient_is_admin=False, previously_contacted=False,
+        recipient_is_admin=False, previously_contacted=previously_contacted,
     )
     verdict = await gate.evaluate(req, clock.utcnow())
     return {"checked": True, "allowed": verdict.allowed, "reasons": verdict.reasons}
@@ -1332,22 +1392,98 @@ async def reopen_draft(draft_id: int, request: Request, db: GetDB,
             "previous": previous, "remaining": await _pending(db, wf)}
 
 
+# ── ручная отправка одобренного черновика (PLAN 16.2) ─────────────────────────
+
+def _dm_only(wf: Workflow) -> None:
+    """Ручная отправка заведена только для личных сообщений — 409 остальным.
+
+    Проверка в ручке, а не только в сервисе: у публичного ответа и реакции нет
+    адресата-человека, и даже «посмотреть, что показал бы preflight» им нечем —
+    прогон выдал бы уверенный отказ, посчитанный не про то.
+    """
+    if wf.action != "dm":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"ручная отправка заведена только для личных сообщений, "
+            f"у сценария действие «{wf.action}»")
+
+
+@router.get("/drafts/{draft_id}/send-preflight")
+async def send_preflight(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
+                         user=permits(Section.DRAFTS, Capability.DRAFT_SEND)):
+    """Что покажет кнопка «отправить»: адресат, аккаунт, вердикт гейта, бейдж.
+
+    Ничего не пишет и ничего не отправляет — сетевые ходы только читающие
+    (флот и остатки Engage). Отдельно от `send` по той же причине, по которой
+    гейт отделён от отправки: решение человека должно опираться на то же самое,
+    что увидит сервер, а не на догадку «наверное, прошло бы».
+
+    Право — DRAFT_SEND, а не DRAFT_DECIDE: одобрить черновик может разборщик,
+    отправлять людям от имени заказчика — нет.
+    """
+    _dm_only(wf)
+    d = await _wf_draft_or_404(db, wf, draft_id)
+    return await draft_send.preflight(db, workflow=wf, draft=d, now=clock.utcnow())
+
+
+@router.post("/drafts/{draft_id}/send", status_code=status.HTTP_202_ACCEPTED)
+async def send_approved_draft(draft_id: int, request: Request, db: GetDB,
+                              wf: Workflow = GetWorkflow,
+                              user=permits(Section.DRAFTS, Capability.DRAFT_SEND),
+                              body: dict = Body(default={})):
+    """Заказать отправку одобренного черновика через Engage.
+
+    Тело пустое намеренно: всё, что нужно решению, уже в базе — черновик, его
+    одобрение, читатель сообщения. Подтверждением служит сам вызов с правом
+    DRAFT_SEND (в интерфейсе ему предшествует отдельный шаг, делает 16.4).
+
+    Ответ `202`, а не `200`: заказ принят, сообщение ещё не доставлено — подтверждение
+    приедет вебхуком `kind="send"` позже. До него черновик остаётся `approved`, а
+    попытка — `pending`; бейдж в карточке читает `wf_outbound`.
+    """
+    try:
+        _dm_only(wf)
+    except HTTPException as e:
+        # Форма отказа едина для всех причин заказа: `detail` + `reasons` (пустой
+        # список, когда гейт не считался). GUI рисует одну и ту же панель отказа.
+        return JSONResponse(status_code=e.status_code,
+                            content={"detail": e.detail, "reasons": []})
+    d = await _wf_draft_or_404(db, wf, draft_id)
+    try:
+        row = await draft_send.order(db, workflow=wf, draft=d, actor=user.email,
+                                     now=clock.utcnow())
+    except draft_send.DraftSendBlocked as e:
+        # 409 с причинами целиком: «чинить по одной и получать новый отказ» —
+        # худший цикл для оператора, и в этом ответе он не воспроизводится.
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={
+            "detail": "; ".join(e.reasons) or "отправка заблокирована",
+            "reasons": e.reasons})
+    except draft_send.DraftSendConflict as e:
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={
+            "detail": str(e), "reasons": []})
+    except engage.EngageUnavailable as e:
+        # Попытка уже помечена `failed` с причиной; черновик остался `approved`.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from e
+
+    logger.info("wf_draft_sent workflow=%s draft=%s outbound=%s account=%s by=%s",
+                wf.key, draft_id, row.id, row.engage_account_id, user.email)
+    return {"outbound_id": row.id, "task_id": row.engage_task_id,
+            "state": row.state, "account_id": row.engage_account_id}
+
+
 # ── активность сценария ───────────────────────────────────────────────────────
 
-# Ручка отвечает на вопрос «что ушло», и половина её чисел сегодня — гарантированные
-# нули. Сказано это здесь, а не оставлено читателю как упражнение: **автоматической
-# отправки в контуре нет вовсе**. `wf_outbound` пуст, и писателя у него не существует —
-# `OutboundGate` зовётся из `drafts.py` и отсюда с `journal=None` и ничего никуда не
-# шлёт. Прежняя `outbound_attempts` пуста по той же причине.
-#
-# Поэтому `automatic` — константа, а не «есть ли строки в журнале». Пустой журнал и
-# отсутствующий отправитель — разные утверждения: первое означает «пока ничего не
-# отправляли», второе «отправлять некому», и на экране они читаются по-разному.
-# Вычисляй мы флаг по данным, первая же строка в журнале объявила бы контур рабочим.
-# Появится отправитель — правится одно место, здесь.
+# Ручка отвечает на вопрос «что ушло», и её `automatic` — по-прежнему константа.
+# С 16.2 у `wf_outbound` появился писатель — ручная отправка одобренных черновиков
+# (`app/services/draft_send.py`), но отправляет там ЧЕЛОВЕК: нажал кнопку, увидел
+# подтверждение. **Автоматической отправки в контуре нет по-прежнему** — ни тика,
+# ни воркера, которые заказывали бы отправку сами. Флаг отвечает именно на это,
+# поэтому появление ручных заказов его не меняет; заведётся автомат — правится
+# одним местом здесь.
 AUTOMATIC_SENDING = False
-SENDING_NOTE = ("автоматической отправки в этом контуре ещё нет: журнал исходящих "
-                "пуст, отправитель не заведён")
+SENDING_NOTE = ("автоматической отправки в этом контуре нет: одобренные черновики "
+                "уходят только вручную, по кнопке с подтверждением — "
+                "автоматический отправитель не заведён")
 
 # Лента — обозримый хвост, а не выгрузка: сводки выше отвечают на «сколько», лента
 # нужна только чтобы глазом узнать последнее.
@@ -1407,14 +1543,23 @@ def _window_start(until: datetime, days: int) -> datetime:
 def _outbound_status(row: WfOutbound) -> str:
     """Чем кончилась попытка — словами, а не набором флагов.
 
-    Исходов три, а не два: «гейт не пустил», «гейт пустил, но доставки нет» и
-    «доставлено». Средний легко принять за сбой записи, но он законный — так выглядит
-    сухой прогон, и слить его с отказом гейта значило бы объявить заблокированным то,
-    что никто не блокировал.
+    Исходов стало больше, чем два (16.2): «гейт не пустил», «заказ не дошёл до
+    Engage», «Engage отложил по лимиту», «заказано, доставки ещё нет» и
+    «доставлено». «Заказано, доставки нет» легко принять за сбой записи, но он
+    законный — так выглядит ожидание вебхука, и слить его с отказом гейта
+    значило бы объявить заблокированным то, что никто не блокировал. Строки без
+    состояния — репетиции старого контура и посев — отвечают как раньше.
     """
     if row.delivered_message_id is not None:
         return "доставлено"
-    return "заблокировано гейтом" if not row.allowed else "отправка не подтверждена"
+    if not row.allowed:
+        return "заблокировано гейтом"
+    state = getattr(row, "state", None)
+    if state == "failed":
+        return "отправка не удалась"
+    if state == "deferred":
+        return "отложено: суточный лимит Engage"
+    return "отправка не подтверждена"
 
 
 @router.get("/activity")
@@ -1429,10 +1574,11 @@ async def activity(db: GetDB, wf: Workflow = GetWorkflow,
     Такое число хуже отсутствующего — на него смотрят как на качество работы.
 
     **Половина чисел — гарантированные нули, и это не поломка.** Автоматической
-    отправки в контуре не существует: `wf_outbound` пуст, писателя у него нет (см.
-    `AUTOMATIC_SENDING` выше), поэтому `delivered` и `blocked` сегодня всегда нули.
-    Ручка сообщает об этом состоянием — `sending.automatic: false` и текст рядом, — а
-    не молчаливым нулём, который экран нарисует как «за неделю не отправили ничего».
+    отправки в контуре не существует (см. `AUTOMATIC_SENDING` выше): ручные заказы
+    16.2 в `delivered` попадают только после подтверждения от человека. До первой
+    ручной отправки `delivered` и `blocked` — нули, и ручка сообщает об этом
+    состоянием — `sending.automatic: false` и текст рядом, — а не молчаливым
+    нулём, который экран нарисует как «за неделю не отправили ничего».
     Единственный настоящий источник отправленного — `manual_sends`, то есть форма, в
     которую человек вносит то, что послал из Telegram сам.
 

@@ -1206,6 +1206,18 @@ class WfOutbound(Base):
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     delivered_message_id: Mapped[int | None] = mapped_column(BigInteger)
     text_snapshot: Mapped[str | None] = mapped_column(Text)
+
+    # ── жизненный цикл заказа (PLAN 16.2) ─────────────────────────────────────
+    # pending → deferred → delivered либо failed. Записи прежних лет (репетиции
+    # гейта с journal=None их не создавали, таблица пуста) живут без стадии —
+    # migrate.py досоздаёт колонку с DEFAULT 'pending'.
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # Номер задачи Engage, под которым заказ принят (ответ POST /v1/action).
+    engage_task_id: Mapped[str | None] = mapped_column(String(64))
+    # Чем кончилось: причина откладывания (deferred) или отказа (failed). У
+    # доставленной и ожидающей попыток пусто.
+    error: Mapped[str | None] = mapped_column(Text)
+
     created_at: Mapped[datetime] = _created()
 
     __table_args__ = (

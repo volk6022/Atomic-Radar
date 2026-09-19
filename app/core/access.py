@@ -91,6 +91,13 @@ class Capability(StrEnum):
     """
     # конвейер лидов
     DRAFT_DECIDE = "draft.decide"
+    # Ручная отправка одобренного черновика (PLAN 16.2). Отправка — ослабление, и по
+    # правилу «ужесточение шире ослабления» место ей было бы у владельца. Но у неё
+    # свой набор предохранителей: режим LIVE не требуется (попытка идёт мимо проверки
+    # режима), текст уже одобрен человеком, гардрейлы действуют, а каждая попытка
+    # попадает в аудит. Поэтому она у владельца и заказчика — по образцу SAFETY:
+    # разборщику писать людям от имени заказчика не положено.
+    DRAFT_SEND = "draft.send"
     DRAFT_REOPEN = "draft.reopen"
     LEAD_STATUS = "lead.status"
     BULK_DECIDE = "bulk.decide"
@@ -134,6 +141,9 @@ _OWNER_CUSTOMER = frozenset({Role.OWNER, Role.CUSTOMER})
 
 CAPABILITIES: dict[Capability, frozenset[Role]] = {
     Capability.DRAFT_DECIDE: _STAFF,
+    # Ручная отправка — владельцу и заказчику (16.2): это тот же случай, что и
+    # SAFETY, «отправляет руками заказчик», только теперь руками из Radar.
+    Capability.DRAFT_SEND: _OWNER_CUSTOMER,
     Capability.DRAFT_REOPEN: _STAFF,
     Capability.LEAD_STATUS: _STAFF,
     # Наёмный разборщик решает по одному. Одна ошибка в фильтре — и триста лидов

@@ -42,11 +42,13 @@ from app.core import clock
 from app.core.access import Capability, Section, allows
 from app.core.cascade import L1_BYPASS_MIN_TEXT
 from app.core.config import get_settings
-from app.db.models import AuditLog, BackfillItem, Channel, Message
+from app.db.models import (AuditLog, BackfillItem, Channel, EngageInstance, Message,
+                           WfDraft, WfOutbound, WfTarget, Workflow)
 from app.services import alerts, channels as channels_service
 from app.services import autoflow
 from app.services import cascade_registry
 from app.services import channel_add
+from app.services import conversations as conversations_service
 from app.services import discussions as discussions_service
 from app.services import backfill_drain, engage
 from app.services import ingest as ingest_service
@@ -161,6 +163,10 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
         return result
 
     if event == "task_failed":
+        if q.get("kind") == "send":
+            # Отказ доставки отправленного черновика (16.2): своё ведение журнала,
+            # без `runs` — у отправки нет прогона.
+            return await _handle_send_failed(db, body, q)
         # Провал шага бэкфилла — не ошибка приёма. Логируем и отвечаем 200: Engage
         # иначе будет ретраить доставку вебхука, хотя переигрывать тут нечего.
         #
@@ -178,6 +184,11 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
         return {"accepted": 0, "error": body.get("error_code")}
 
     if event == "task_deferred":
+        if q.get("kind") == "send":
+            # Отложенная отправка (16.2): лимит аккаунта исчерпан, Engage вернётся
+            # к задаче сам. Журнал переходит в `deferred`, черновик остаётся
+            # «approved» — заказ ещё жив, его нельзя повторять.
+            return await _handle_send_deferred(db, body, q)
         # Отложено по бюджету (E4): суточный лимит аккаунта исчерпан, Engage
         # сам вернётся к задаче по перепланировке. Это не провал шага — шаг
         # не начинался, — поэтому и 200, и никаких ретраев: переигрывать тут
@@ -217,6 +228,15 @@ async def process_event(db, body: dict, q: Mapping[str, str]) -> dict:
         return {"accepted": 0, "ignored": event}
 
     result = body.get("result") or {}
+
+    if q.get("kind") == "send":
+        # Доставка отправленного черновика (16.2). Ветер стоит ДО общей проверки
+        # «found»: у отправки «получателя не разыскали» — не «нечего класть в
+        # базу», а провал заказа, иначе попытка остаётся `pending` навсегда.
+        if not result.get("found", True):
+            return await _handle_send_failed(db, body, q, result=result)
+        return await _handle_send_complete(db, result, q)
+
     if not result.get("found", True):
         reason_code = result.get("reason")
         reason_text = _translate_engage_reason(reason_code)
@@ -308,6 +328,152 @@ def _translate_engage_reason(reason: str | None) -> str:
     if not reason:
         return "Engage не назвал причину"
     return _ENGAGE_REASON_TEXT.get(reason.strip().lower(), f"Engage: {reason}")
+
+
+# ── доставка отправленного черновика (PLAN 16.2) ──────────────────────────────
+
+async def _send_outbound(db, q: Mapping[str, str]) -> WfOutbound | None:
+    """Строка журнала `wf_outbound` из адреса вебхука, `None` — строки нет.
+
+    Разные missing — разные реакции. Адреса без номера (`outbound_id`) не должно
+    существовать: его ставит сам заказ (`draft_send.order` через `engage.webhook_url`),
+    и 400 здесь честнее тишины — так падает заметно. А вот строки с номером может
+    уже не быть (старый повтор после чистки) — это «нечего делать», а не ошибка:
+    4xx заставил бы Engage ретраить вебхук, который переигрывать нечем.
+    """
+    raw = q.get("outbound_id")
+    if not raw:
+        raise HTTPException(400, "в webhook_url не передан outbound_id отправки")
+    row = await db.get(WfOutbound, int(raw))
+    if row is None:
+        logger.warning("engage_send_unknown_outbound id=%s", raw)
+    return row
+
+
+def _failure_text(*sources) -> str:
+    """Причина отказа словами: `error_class: error` из первого словаря, где они есть."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        error_class, error = src.get("error_class"), src.get("error")
+        if error_class or error:
+            return ": ".join(str(p) for p in (error_class, error) if p)
+    return ""
+
+
+async def _handle_send_complete(db, result: dict, q: Mapping[str, str]) -> dict:
+    """Доставка: журнал, нитка диалога, черновик, цель — одним вебхуком.
+
+    Порядок неслучаен. Нитка и событие заводятся ЗДЕСЬ, а не при заказе: диалог
+    начинается доставленным сообщением, а не намерением его отправить (решение
+    владельца №3 — одна нитка на человека, касания в ней видны). Черновик и цель
+    двигает только доставка: точка невозврата — доставленное сообщение, а не факт
+    заказа, поэтому до этого вебхука черновик остаётся `approved`.
+
+    Идемпотентно: Engage доставляет вебхуки at-least-once, повтор того же события
+    не должен заводить второе касание в нитке или переписывать свёртку.
+    """
+    row = await _send_outbound(db, q)
+    if row is None:
+        return {"accepted": 0, "send": "outbound_not_found"}
+    if row.state == "delivered":
+        return {"accepted": 0, "send": "already_delivered"}
+
+    delivered_message_id = result.get("telegram_message_id")
+    row.state = "delivered"
+    row.delivered_message_id = delivered_message_id
+    row.error = None
+
+    target = await db.get(WfTarget, row.target_id) if row.target_id else None
+    draft = await db.get(WfDraft, row.draft_id) if row.draft_id else None
+    conv = await conversations_service.ensure_thread(
+        db, peer_id=row.recipient_peer_id,
+        engage_account_id=row.engage_account_id, source="draft",
+        peer_username=target.author_username if target is not None else None,
+        target_id=row.target_id)
+    # actor — тот, кто одобрил текст: вебхук приходит без сессии, и из всех
+    # доступных источников это самый честный ответ на «чьё это касание».
+    await conversations_service.add_event(
+        db, conv, kind="outbound", source=f"draft:{row.draft_id}",
+        actor=draft.decided_by if draft is not None else None,
+        at=clock.utcnow(), text=row.text_snapshot,
+        tg_message_id=delivered_message_id, workflow_id=row.workflow_id)
+    row.conversation_id = conv.id
+
+    if draft is not None:
+        draft.state = "sent"
+    if target is not None:
+        target.status = "contacted"
+
+    await db.commit()
+    logger.info("engage_send_delivered outbound=%s draft=%s peer=%s message=%s",
+                row.id, row.draft_id, row.recipient_peer_id, delivered_message_id)
+    return {"accepted": 1, "outbound_id": row.id,
+            "delivered_message_id": delivered_message_id,
+            "conversation_id": conv.id}
+
+
+async def _handle_send_failed(db, body: dict, q: Mapping[str, str],
+                              result: dict | None = None) -> dict:
+    """Отказ доставки: попытка кончилась, черновику можно заказать новую.
+
+    Причину берём из конверта вебхука (`error_class`/`error`, Engage 16.8); если
+    полей нет — допросим саму задачу, она знает больше конверта. Черновик при
+    отказе остаётся `approved`: сообщение не ушло, одобрение текста в силе.
+    """
+    row = await _send_outbound(db, q)
+    if row is None:
+        return {"accepted": 0, "send": "outbound_not_found"}
+    if row.state == "delivered":
+        # Поздний отказ после доставки (перестановка событий, ретрай): сообщение
+        # уже ушло, верить отказу задним числом нельзя.
+        return {"accepted": 0, "send": "already_delivered"}
+
+    error = _failure_text(body, result or {})
+    if not error:
+        task_id = str(body.get("task_id") or "")
+        if task_id:
+            try:
+                task = await engage.task(task_id)
+            except engage.EngageUnavailable as e:
+                logger.warning("engage_send_probe_unreachable task=%s error=%s",
+                               task_id, e)
+            else:
+                error = _failure_text(task, task.get("result") or {})
+    if not error:
+        # Ничего структурного нигде не нашлось — остаётся перевод известного кода.
+        error = _translate_engage_reason(
+            str((result or {}).get("reason") or body.get("error_code") or ""))
+
+    row.state = "failed"
+    row.error = error or None
+    await db.commit()
+    logger.warning("engage_send_failed outbound=%s draft=%s error=%s",
+                   row.id, row.draft_id, error)
+    return {"accepted": 1, "outbound_id": row.id, "state": "failed"}
+
+
+async def _handle_send_deferred(db, body: dict, q: Mapping[str, str]) -> dict:
+    """Отложено по лимиту: заказ жив, повторять его нельзя.
+
+    `deferred` — не терминальное состояние: Engage вернётся к задаче сам, и
+    следующим событием будет `task_complete` (доставка) либо `task_failed`.
+    Поэтому в `already`-проверках заказа `deferred` — активное состояние.
+    """
+    row = await _send_outbound(db, q)
+    if row is None:
+        return {"accepted": 0, "send": "outbound_not_found"}
+    if row.state == "delivered":
+        return {"accepted": 0, "send": "already_delivered"}
+
+    reason = _translate_engage_reason(str(body.get("error_code") or ""))
+    until = str(body.get("deferred_until") or "")
+    row.state = "deferred"
+    row.error = reason + (f"; возврат до {until}" if until else "")
+    await db.commit()
+    logger.info("engage_send_deferred outbound=%s draft=%s until=%s",
+                row.id, row.draft_id, until)
+    return {"accepted": 1, "outbound_id": row.id, "state": "deferred"}
 
 
 async def _handle_chat_info(db, result: dict, q) -> dict:
