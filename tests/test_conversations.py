@@ -145,7 +145,10 @@ def anon(app):
 
 
 def unread_conv(i: int, state: str = "new") -> Conversation:
-    return Conversation(id=i, lead_id=1, account_id=1, peer_id=1000 + i, state=state,
+    # С 16.1 у нитки нет `account_id` — аккаунт живёт как id Engage без FK;
+    # source обязателен (NOT NULL), для лид-ниток старого контура это "draft".
+    return Conversation(id=i, lead_id=1, engage_account_id=1, source="draft",
+                        peer_id=1000 + i, state=state,
                         sent_count=0, last_inbound_at=NOW, read_at=None)
 
 
@@ -233,7 +236,8 @@ def test_thread_header_carries_the_peer_and_counters(db, client):
     header = client.get(f"{LIST}/101").json()["conversation"]
 
     assert header["peer_name"] == "Иван" and header["peer_username"] == "@ivan"
-    assert header["account"] == 1 and header["state"] == "awaiting_reply"
+    assert header["engage_account_id"] == 1 and header["state"] == "awaiting_reply"
+    assert header["source"] == "draft" and header["target_id"] is None
     assert header["sent_count"] == 3 and header["unread"] is True
     assert header["read_at"] is None
 

@@ -98,14 +98,32 @@ def test_cancel_route_is_declared_after_the_list_but_reachable():
 
 def test_migrations_only_add_never_drop():
     """Список выполняется на живой базе при каждом старте. Любое выражение, теряющее
-    данные, однажды выполнится не на той базе."""
+    данные, однажды выполнится не на той базе.
+
+    Уточнено в 16.1 (диалоги): снимать можно только *отсутствие* данных — NOT NULL
+    и ограничение, — строк это не удаляет, а повторный старт делает безвредным
+    guard'ы и `IF EXISTS`. По-прежнему запрещены DELETE/TRUNCATE и любой DROP,
+    теряющий данные или структуру: колонки, таблицы, схемы, индексы. Каждый шаг
+    обязан быть идемпотентным: `IF NOT EXISTS`/`IF EXISTS` либо DO-блок с проверкой
+    по каталогу — у ADD CONSTRAINT идемпотентности синтаксисом не бывает.
+    """
     from app.db.migrate import STATEMENTS
+    losing = ("DROP COLUMN", "DROP TABLE", "DROP SCHEMA", "DROP INDEX",
+              "DELETE", "TRUNCATE")
     for stmt in STATEMENTS:
         upper = stmt.upper()
-        assert "DROP" not in upper, stmt
-        assert "DELETE" not in upper, stmt
-        assert "TRUNCATE" not in upper, stmt
-        assert "IF NOT EXISTS" in upper, stmt
+        for token in losing:
+            assert token not in upper, stmt
+        # Идемпотентность у каждого шага своя: синтаксисом (IF EXISTS/IF NOT EXISTS),
+        # guard'ом в DO-блоке, или природой операции — DROP/SET NOT NULL в Postgres
+        # уже применённое состояние применяют молча, а UPDATE с предикатом
+        # `... IS NULL` заполняет только пустое и второй раз не делает ничего.
+        idempotent = ("IF NOT EXISTS" in upper or "IF EXISTS" in upper
+                      or "DO $$" in upper
+                      or upper.endswith("DROP NOT NULL")
+                      or upper.endswith("SET NOT NULL")
+                      or (upper.startswith("UPDATE") and "IS NULL" in upper))
+        assert idempotent, stmt
 
 
 def test_new_run_columns_are_declared_in_the_model():

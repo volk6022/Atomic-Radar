@@ -349,12 +349,43 @@ class Draft(Base):
 
 
 class Conversation(Base):
+    """Нитка переписки с одним человеком — одна на `peer_id` на весь флот.
+
+    Решение владельца (PLAN 16.11): диалог — это пара «человек ↔ Radar», а не
+    «человек ↔ аккаунт». Аккаунт — атрибут нитки: фиксируется первым касанием
+    (`engage_account_id`) и дальше не меняется, сколько бы аккаунтов флота ни
+    побывало в переписке. Поэтому уникальность глобальная, без аккаунта в ключе.
+
+    Привязка к источнику — максимум одна из двух: либо старый контур (`lead_id`),
+    либо цель нового (`target_id`), либо ни та ни другая — нитка «человек написал
+    сам» (`source="unsolicited"`, заведёт PLAN 16.3). Правило «не обе сразу»
+    держит CHECK `ck_conversation_binding`, а не NOT NULL: у двух привязок разные
+    контуры, и исключающее ИЛИ здесь спокойнее пары обязательных колонок.
+
+    Сценарий (`workflow_id`) — атрибут события, а не нитки: сценарии заведутся
+    и закроются, а переписка с человеком одна.
+    """
     __tablename__ = "conversations"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    lead_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("leads.id"), nullable=False)
-    account_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("accounts.id"), nullable=False)
+    # Nullable с 16.1: до того нитка могла указать только на старый контур,
+    # и завести диалог для цели `wf_targets` было невозможно физически.
+    lead_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("leads.id"))
+    # Как в `wf_outbound`/`manual_sends` — id аккаунта в Engage, без FK: локальная
+    # `accounts` — мёртвое зеркало (на проде 0 строк), а отправлять всё равно
+    # придётся через Engage, который знает только свои id. Автомат передаёт аккаунт
+    # всегда; NULL — «unsolicited» (заведёт 16.3) и ручные записи, где человек
+    # оставил поле аккаунта пустым: терять факт отправки ради аккуратности
+    # справочника нельзя.
+    engage_account_id: Mapped[int | None] = mapped_column(BigInteger)
     peer_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Первое касание: цель, из которой вырос диалог. NULL у «unsolicited».
+    target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
+    peer_username: Mapped[str | None] = mapped_column(String(64))
+    # Откуда взялась нитка. Справочник — CONVERSATION_SOURCES в
+    # app/services/conversations.py; CHECK в схеме нет намеренно, чтобы новый
+    # источник не требовал миграции.
+    source: Mapped[str] = mapped_column(String(24), nullable=False)
 
     state: Mapped[str] = mapped_column(String(24), nullable=False, default="new")
     sent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -395,7 +426,12 @@ class Conversation(Base):
         return or_(and_(cls.read_at.is_(None), cls.last_inbound_at.isnot(None)),
                    cls.last_inbound_at > cls.read_at)
 
-    __table_args__ = (UniqueConstraint("peer_id", name="uq_conversation_peer"),)
+    __table_args__ = (
+        UniqueConstraint("peer_id", name="uq_conversation_peer"),
+        # Нитка привязана к старому лиду ИЛИ к цели, или ни к чему («unsolicited»).
+        CheckConstraint("NOT (lead_id IS NOT NULL AND target_id IS NOT NULL)",
+                        name="ck_conversation_binding"),
+    )
 
 
 class ConversationEvent(Base):
@@ -403,6 +439,12 @@ class ConversationEvent(Base):
 
     Так сделано, потому что «почему бот это написал» — вопрос, который зададут, и
     ответить на него по текущему состоянию невозможно: оно уже перезаписано.
+
+    Справочник `kind` — EVENT_KINDS в app/services/conversations.py; проверка живёт
+    в `add_event`, потому что чужое значение — ошибка программиста, а не данных.
+    `at` — момент события по его источнику (у ручной отправки — `sent_at`, у прочих
+    — момент записи), `created_at` — момент записи в базу; это разные моменты, и
+    путать их значилось бы переписывать историю.
     """
     __tablename__ = "conversation_events"
 
@@ -410,6 +452,19 @@ class ConversationEvent(Base):
     conversation_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("conversations.id"), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Кто/что породило событие: `draft:<id>` / `manual_send:<id>` / `engage_history`
+    # / `reply` / `webhook`. Строка, а не пара FK, потому что источники живут в
+    # разных таблицах и будут добавляться.
+    source: Mapped[str | None] = mapped_column(String(64))
+    # Кто говорил: оператор (email), сценарий, никто (входящий от человека).
+    actor: Mapped[str | None] = mapped_column(String(255))
+    text: Mapped[str | None] = mapped_column(Text)
+    tg_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Сценарий — атрибут события (PLAN 16.11), не нитки: переписка с человеком
+    # одна, а сценариев в ней может побывать сколько угодно.
+    workflow_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("workflows.id"))
+    # Момент события по источнику; NOT NULL — у события без времени нет смысла.
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created()
 
@@ -1129,7 +1184,13 @@ class WfOutbound(Base):
         Integer, ForeignKey("workflows.id"), nullable=False)
     target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
     draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
-    conversation_id: Mapped[int | None] = mapped_column(BigInteger)
+    # С 16.1 — настоящий FK: у диалога появился владелец схемы. Nullable, потому
+    # что у публичного ответа переписки нет — есть сообщение в треде, на которое
+    # ответили. Адрес доставки продублирован здесь снимком, потому что цель со
+    # временем может быть переоценена, а журнал обязан показывать, что происходило
+    # на самом деле.
+    conversation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("conversations.id"))
     # Как и в `manual_sends` — id аккаунта в Engage. В старой `outbound_attempts`
     # здесь был внешний ключ на локальную `accounts`, но та таблица мертва, а
     # отправлять всё равно придётся через Engage, который знает только свои id.
@@ -1178,6 +1239,10 @@ class ManualSend(Base):
     # экран флота берёт список прямо из Engage. Одного числа хватает, потому что
     # инстанс задан сценарием — пара (workflow, аккаунт) однозначна.
     engage_account_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Нитка диалога (PLAN 16.6а): ручная отправка — касание человека, и с 16.1 она
+    # заводит (или находит) нитку и пишет в неё событие. NULL — запись «мимо Radar»:
+    # адресата не нашли, диалога нет, а факт отправки терять нельзя.
+    conversation_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("conversations.id"))
 
     text: Mapped[str] = mapped_column(Text, nullable=False)
     # Снимок того, что предлагал Radar на момент отправки. Черновик потом могут

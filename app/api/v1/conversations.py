@@ -23,7 +23,7 @@ from app.api.deps import GetDB, requires
 from app.api.v1.listing import ListParams, apply_sort, list_params
 from app.core import clock
 from app.core.access import Section
-from app.db.models import Conversation, ConversationEvent, Lead
+from app.db.models import Conversation, ConversationEvent, Lead, Message, WfTarget
 
 router = APIRouter(prefix="/api/v1", tags=["conversations"])
 
@@ -37,11 +37,37 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
 
 
-def _peer(lead: Lead | None) -> dict:
-    """Имя собеседника. У диалога оно живёт у лида, а не в самой нитке."""
-    return {"peer_name": lead.author_name if lead else None,
-            "peer_username": ("@" + lead.author_username)
-                             if lead and lead.author_username else None}
+async def _peer_info(db, conv: Conversation) -> dict:
+    """Имя и username собеседника. Откуда брать — по привязке нитки:
+
+    * старый контур (`lead_id`) — у лида, как раньше;
+    * цель нового контура (`target_id`) — у наводки, а если автор там не назвался —
+      у сообщения, из которого наводка выросла: публичные посты бывают анонимными;
+    * «unsolicited» — то, что запомнилось при первом касании (чаще всего ник).
+
+    Ровно один запрос в первых двух случаях и ни одного в третьем: список
+    добирает имена построчно, и лишний запрос здесь удваивал бы плату за страницу.
+    """
+    if conv.lead_id is not None:
+        lead = (await db.execute(
+            select(Lead).where(Lead.id == conv.lead_id))).scalar_one_or_none()
+        name = lead.author_name if lead else None
+        username = lead.author_username if lead else None
+    elif conv.target_id is not None:
+        row = (await db.execute(
+            select(WfTarget, Message)
+            .join(Message, WfTarget.message_id == Message.id)
+            .where(WfTarget.id == conv.target_id))).first()
+        if row is None:
+            name = username = None
+        else:
+            target, message = row
+            name = target.author_name or message.author_name
+            username = target.author_username or message.author_username
+    else:
+        name = username = conv.peer_username
+    return {"peer_name": name,
+            "peer_username": ("@" + username) if username else None}
 
 
 @router.get("/conversations")
@@ -87,11 +113,14 @@ async def conversations(db: GetDB, user=requires(Section.CONVERSATIONS),
     rows = (await db.execute(q.limit(p.limit).offset(p.offset))).scalars().all()
     out = []
     for c in rows:
-        lead = (await db.execute(
-            select(Lead).where(Lead.id == c.lead_id))).scalar_one_or_none()
         out.append({
-            "id": c.id, "lead_id": c.lead_id, "peer_id": c.peer_id, **_peer(lead),
-            "account": c.account_id, "state": c.state, "sent_count": c.sent_count,
+            "id": c.id, "lead_id": c.lead_id, "peer_id": c.peer_id,
+            **await _peer_info(db, c),
+            # Аккаунт — id в Engage, как у `wf_outbound`/`manual_sends`: локальное
+            # зеркало `accounts` мертво, и нитки на него не ссылаются с 16.1.
+            "engage_account_id": c.engage_account_id,
+            "source": c.source, "target_id": c.target_id,
+            "state": c.state, "sent_count": c.sent_count,
             "last_sent_at": _iso(c.last_sent_at), "last_inbound_at": _iso(c.last_inbound_at),
             "unread": c.unread,
         })
@@ -134,14 +163,15 @@ async def conversation_thread(conversation_id: int, db: GetDB,
         .order_by(ConversationEvent.created_at.asc(), ConversationEvent.id.asc())
     )).scalars().all()
 
-    lead = (await db.execute(
-        select(Lead).where(Lead.id == conv.lead_id))).scalar_one_or_none()
+    peer = await _peer_info(db, conv)
 
     return {
         "conversation": {
             "id": conv.id, "lead_id": conv.lead_id, "peer_id": conv.peer_id,
-            **_peer(lead),
-            "account": conv.account_id, "state": conv.state,
+            **peer,
+            "engage_account_id": conv.engage_account_id,
+            "source": conv.source, "target_id": conv.target_id,
+            "state": conv.state,
             "sent_count": conv.sent_count,
             "last_sent_at": _iso(conv.last_sent_at),
             "last_inbound_at": _iso(conv.last_inbound_at),
@@ -149,7 +179,11 @@ async def conversation_thread(conversation_id: int, db: GetDB,
             "handed_off_at": _iso(conv.handed_off_at),
             "read_at": _iso(conv.read_at), "unread": conv.unread,
         },
-        "events": [{"id": e.id, "kind": e.kind, "payload": e.payload,
+        # `created_at` — момент записи в журнал, `at` — момент события по его
+        # источнику: у ручной отправки это то, когда человек реально отправил,
+        # а не когда записал. Показываются оба, потому что разница содержательна.
+        "events": [{"id": e.id, "kind": e.kind, "source": e.source, "actor": e.actor,
+                    "text": e.text, "at": _iso(e.at), "payload": e.payload,
                     "created_at": e.created_at.isoformat()} for e in events],
     }
 

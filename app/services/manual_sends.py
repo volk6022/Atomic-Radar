@@ -30,6 +30,7 @@ from sqlalchemy import func, or_, select
 
 from app.core import clock
 from app.db.models import Channel, ManualSend, Message, WfDraft, WfTarget, Workflow
+from app.services import conversations
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,10 @@ async def record(db, *, workflow: Workflow, text: str, recorded_by: str,
     )
     db.add(entry)
     await db.flush()
+    # Ручная отправка — касание человека: заводит (или находит) нитку диалога и
+    # кладёт в неё событие (PLAN 16.6а). Запись без адресата остаётся без нитки —
+    # это не ошибка, а дыра в данных Radar; диалог ради факта не выдумываем.
+    await conversations.link_manual_send(db, entry, actor=recorded_by)
     logger.info("manual_send_recorded id=%s workflow=%s target=%s by=%s chars=%s",
                 entry.id, workflow.key, entry.target_id, recorded_by, len(body))
     return entry
@@ -245,6 +250,9 @@ def describe(entry: ManualSend, *, target: WfTarget | None = None,
         "target_id": entry.target_id,
         "draft_id": entry.draft_id,
         "engage_account_id": entry.engage_account_id,
+        # Нитка диалога, которую запись завела (или нашла); None — запись «мимо
+        # Radar». Экран по ней ведёт из ленты отправок в переписку.
+        "conversation_id": entry.conversation_id,
         "text": entry.text,
         "suggested_text": entry.suggested_text,
         "matches_suggestion": matches_suggestion(entry),

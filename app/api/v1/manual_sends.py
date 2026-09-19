@@ -23,7 +23,7 @@ from app.api.deps import GetDB, permits, requires
 from app.core.access import Capability, Role, Section
 from app.db.models import (AuditLog, Channel, EngageInstance, ManualSend, Message,
                            WfTarget, Workflow)
-from app.services import engage, manual_sends, workflows
+from app.services import conversations, engage, manual_sends, workflows
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/manual-sends", tags=["manual-sends"])
@@ -190,6 +190,11 @@ async def correct(entry_id: int, body: CorrectRequest, request: Request, db: Get
         changed = manual_sends.correct(entry, fields)
     except manual_sends.ManualSendError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
+    # Правка времени отправки обязана доехать до нитки диалога (PLAN 16.6а):
+    # событие manual_send:<id> и last_sent_at нитки говорят то же, что и запись.
+    if "sent_at" in changed:
+        await conversations.resync_manual_send_time(db, entry)
 
     # Правка, которая ничего не изменила, в журнал не пишется: иначе журнал заполнится
     # событиями «поправил, ничего не поменяв» и перестанет быть читаемым.

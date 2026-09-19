@@ -1,4 +1,4 @@
-"""Диалоги по HTTP — на настоящем Postgres.
+"""Диалоги по HTTP и на уровне сервиса — на настоящем Postgres.
 
 Каждая строка посева существует ради одной ошибки, а не ради объёма:
 
@@ -9,6 +9,11 @@
 * диалог, прочитанный и оживший новым входящим, — ловит отметку, которая
   ставится один раз и больше не двигается;
 * события одной секунды — ловят сортировку нитки без второго ключа.
+
+С 16.1 тут и сервисный слой (`app/services/conversations.py`): нитка одна на
+`peer_id` на весь флот, свёртка состояний в `add_event`, привязка ручных
+отправок и бэкфилл. Эти правила держат внешние ключи и уникальность — проверять
+их подделками нечем.
 
 База берётся из `RADAR_TEST_DATABASE_URL`; без переменной тесты пропускаются.
 Посев стирает схему public этой базы — она должна быть одноразовой.
@@ -21,7 +26,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("RADAR_SECRET_KEY", "test-secret-key-not-for-production")
@@ -30,10 +36,12 @@ os.environ.setdefault("RADAR_DEBUG", "true")
 from app.core import clock  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
-from app.db.models import (Base, Account, Channel, Conversation,  # noqa: E402
-                           ConversationEvent, Lead, Message, User)
+from app.db.models import (Base, Channel, Conversation,  # noqa: E402
+                           ConversationEvent, EngageInstance, Lead, ManualSend,
+                           Message, User, WfTarget, Workflow)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.services import conversations, manual_sends  # noqa: E402
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
 
@@ -56,8 +64,6 @@ async def _seed() -> dict:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as db:
         db.add(Channel(peer_id=-1001, username="chat", title="Обсуждение"))
-        db.add(Account(engage_account_id=12, engage_instance="default",
-                       label="Основной", status="ok"))
         await db.flush()
 
         msg = Message(channel_id=1, tg_message_id=1000, tg_date=NOW,
@@ -75,16 +81,19 @@ async def _seed() -> dict:
         # Четыре диалога — четыре исхода правила из задачи. Входящее первого — на
         # секунду в прошлом от «сейчас» посева: отметка прочтения в тестах ниже
         # ставится настоящим временем, и совпадение микросекунд сделало бы исход
-        # неопределённым.
-        a = Conversation(lead_id=1, account_id=1, peer_id=501, state="new",
+        # неопределённым. `source="draft"` — нитки старого контура: они от лида.
+        a = Conversation(lead_id=1, engage_account_id=1, source="draft", peer_id=501,
+                         state="new",
                          sent_count=1, last_inbound_at=NOW - timedelta(seconds=1),
                          read_at=None)
-        b = Conversation(lead_id=1, account_id=1, peer_id=502, state="new",
+        b = Conversation(lead_id=1, engage_account_id=1, source="draft", peer_id=502,
+                         state="new",
                          sent_count=1, last_inbound_at=None, read_at=None)
-        c = Conversation(lead_id=1, account_id=1, peer_id=503, state="replied",
+        c = Conversation(lead_id=1, engage_account_id=1, source="draft", peer_id=503,
+                         state="replied",
                          sent_count=2, last_inbound_at=NOW - 2 * HOUR,
                          read_at=NOW - HOUR)
-        d = Conversation(lead_id=1, account_id=1, peer_id=504,
+        d = Conversation(lead_id=1, engage_account_id=1, source="draft", peer_id=504,
                          state="awaiting_reply", sent_count=1,
                          last_inbound_at=NOW, read_at=NOW - 3 * HOUR)
         db.add_all([a, b, c, d])
@@ -95,18 +104,18 @@ async def _seed() -> dict:
         # времени, а пара с равной меткой — по `id`, то есть в порядке появления.
         # Имена «первое»/«второе» отражают именно порядок вставки: доразрыв по id —
         # единственное, что делает выдачу воспроизводимой, когда метки совпали.
+        # `at` у посева совпадает с `created_at`: это журнальные строки без своей
+        # хронологии, момент события = момент записи.
         same = NOW - 2 * HOUR
         db.add_all([
-            ConversationEvent(conversation_id=a.id, kind="inbound",
+            ConversationEvent(conversation_id=a.id, kind="inbound", at=NOW - HOUR,
                               payload={"text": "новое"}, created_at=NOW - HOUR),
-            ConversationEvent(conversation_id=a.id, kind="outbound",
-                              payload={"text": "первое из той же секунды"},
-                              created_at=same),
-            ConversationEvent(conversation_id=a.id, kind="inbound",
+            ConversationEvent(conversation_id=a.id, kind="outbound", at=same,
+                              payload={"text": "первое из той же секунды"}, created_at=same),
+            ConversationEvent(conversation_id=a.id, kind="inbound", at=NOW - 3 * HOUR,
                               payload={"text": "старое"}, created_at=NOW - 3 * HOUR),
-            ConversationEvent(conversation_id=a.id, kind="outbound",
-                              payload={"text": "второе из той же секунды"},
-                              created_at=same),
+            ConversationEvent(conversation_id=a.id, kind="outbound", at=same,
+                              payload={"text": "второе из той же секунды"}, created_at=same),
         ])
 
         users = {}
@@ -232,7 +241,8 @@ def test_thread_header(authed, seeded):
     header = authed.get(f"{LIST}/{seeded['unread']}").json()["conversation"]
     assert header["peer_name"] == "Иван Горлов"
     assert header["peer_username"] == "@ivan"
-    assert header["account"] == 1 and header["state"] == "new"
+    assert header["engage_account_id"] == 1 and header["state"] == "new"
+    assert header["source"] == "draft" and header["target_id"] is None
     assert header["sent_count"] == 1 and header["unread"] is True
     assert header["read_at"] is None
 
@@ -286,3 +296,281 @@ def test_guest_is_refused_everywhere(client, seeded):
     assert client.get(LIST).status_code == 403
     assert client.get(f"{LIST}/{cid}").status_code == 403
     assert client.post(f"{LIST}/{cid}/read").status_code == 403
+
+
+# ── сервисный слой: нитки, события, привязка отправок (16.1) ──────────────────
+
+T0 = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+async def db():
+    """Сессия поверх свежей схемы — для сервисов, без HTTP. Схема стирается
+    на каждом тесте: тот же контракт, что у `test_manual_sends_db`."""
+    engine = create_async_engine(DB_URL, poolclass=None)
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        yield session
+    await engine.dispose()
+
+
+async def service_seed(db) -> dict:
+    """Минимум для сервисных тестов: сценарий ЛС и сценарий публичных ответов,
+    по одной цели каждого вида, лид — чтобы CHECK'у «обе привязки разом» было
+    к чему приводить нарушение."""
+    instance = EngageInstance(key="default", client_label="Основной",
+                              base_url="http://engage:8103",
+                              api_key_env="RADAR_ENGAGE_API_KEY")
+    channel = Channel(peer_id=-1001, username="ch", title="Канал про ВЭД")
+    db.add_all([instance, channel])
+    await db.flush()
+
+    msg = Message(channel_id=channel.id, tg_message_id=2000, tg_date=T0,
+                  author_peer_id=600, author_username="julia",
+                  author_name="Юлия Импортова", author_is_bot=False,
+                  is_automatic_forward=False, text="не проходит платёж за рубеж",
+                  processed_at=T0)
+    db.add(msg)
+    await db.flush()
+
+    dm = Workflow(key="cold_dm", title="Личные сообщения", target_kind="user",
+                  action="dm", visibility="private", engage_instance_id=instance.id,
+                  engage_use_case="cold_dm", cascade_profile="dm_v1", sort_order=10)
+    public = Workflow(key="public_reply", title="Публичные ответы",
+                      target_kind="message", action="reply", visibility="public",
+                      engage_instance_id=instance.id, engage_use_case="service_testing",
+                      cascade_profile="dm_v1", sort_order=20)
+    db.add_all([dm, public])
+    await db.flush()
+
+    user_target = WfTarget(workflow_id=dm.id, target_kind="user", message_id=msg.id,
+                           channel_id=channel.id, recipient_peer_id=600,
+                           author_peer_id=600, author_username="julia",
+                           author_name="Юлия Импортова", pain="не может оплатить",
+                           quote=msg.text, score=50, status="new")
+    message_target = WfTarget(workflow_id=public.id, target_kind="message",
+                              message_id=msg.id, channel_id=channel.id,
+                              chat_peer_id=-1002, reply_to_message_id=2000,
+                              author_username="julia", author_name="Юлия Импортова",
+                              quote=msg.text, score=50, status="new")
+    db.add_all([user_target, message_target])
+    await db.flush()
+
+    db.add(Lead(message_id=msg.id, channel_id=channel.id, author_peer_id=600,
+                author_username="julia", author_name="Юлия Импортова",
+                pain="не может оплатить", quote=msg.text, score=50))
+    await db.commit()
+    return {"dm": dm, "public": public, "user_target": user_target,
+            "message_target": message_target}
+
+
+async def test_one_thread_per_peer_across_accounts(db):
+    """Решение владельца (PLAN 16.11): нитка одна на человека на весь флот.
+    Второй писатель с другим аккаунтом получает ту же нитку и ничего не
+    переписывает — аккаунт и цель фиксируются первым касанием."""
+    s = await service_seed(db)
+    first = await conversations.ensure_thread(
+        db, peer_id=600, engage_account_id=3, source="draft",
+        target_id=s["user_target"].id)
+    second = await conversations.ensure_thread(
+        db, peer_id=600, engage_account_id=9, source="manual")
+    await db.commit()
+
+    assert second.id == first.id
+    assert second.engage_account_id == 3, "аккаунт — первое касание, не перезаписывается"
+    assert second.target_id == s["user_target"].id
+    assert (await db.execute(select(func.count(Conversation.id)))).scalar_one() == 1
+
+
+async def test_add_event_moves_counters_and_states(db):
+    """Свёртка состояний — по таблице из задачи 16.1: отправка/ручная ждут ответа,
+    входящий снимает ожидание, ручная после входящего снова ставит нитку в
+    `awaiting_reply`,     пометки счётчиков не трогают."""
+    await service_seed(db)
+    conv = await conversations.ensure_thread(db, peer_id=600, engage_account_id=3,
+                                             source="draft")
+    t1, t2, t3 = T0, T0 + HOUR, T0 + 2 * HOUR
+
+    await conversations.add_event(db, conv, kind="outbound", source="draft:1",
+                                  actor="wf:cold_dm", at=t1)
+    assert conv.state == "awaiting_reply" and conv.waiting_since == t1
+    assert conv.sent_count == 1 and conv.last_sent_at == t1
+
+    await conversations.add_event(db, conv, kind="inbound", source="engage_history",
+                                  actor=None, at=t2)
+    assert conv.state == "replied" and conv.waiting_since is None
+    assert conv.last_inbound_at == t2
+
+    await conversations.add_event(db, conv, kind="manual", source="manual_send:7",
+                                  actor="andrey@x", at=t3, text="и ещё раз привет")
+    assert conv.state == "awaiting_reply" and conv.waiting_since == t3
+    assert conv.sent_count == 2 and conv.last_sent_at == t3
+
+    await conversations.add_event(db, conv, kind="note", source="web",
+                                  actor="andrey@x", at=t3)
+    await conversations.add_event(db, conv, kind="system", source="webhook",
+                                  actor=None, at=t3)
+    assert conv.sent_count == 2, "пометки — не переписка, счётчики не двигаются"
+    await db.commit()
+
+
+async def test_events_leave_human_states_alone(db):
+    """`handed_off`/`closed` ставит человек (16.5), и события их не меняют —
+    иначе автомат выводил бы нитку из решения оператора."""
+    await service_seed(db)
+    conv = await conversations.ensure_thread(db, peer_id=600, engage_account_id=3,
+                                             source="draft")
+    conv.state = "closed"
+    await conversations.add_event(db, conv, kind="inbound", source="engage_history",
+                                  actor=None, at=T0)
+    assert conv.state == "closed" and conv.waiting_since is None
+    await db.commit()
+
+
+async def test_foreign_kind_and_source_are_refused(db):
+    """Чужие значения справочников — ошибка программиста, а не данных."""
+    with pytest.raises(ValueError, match="источник нитки"):
+        await conversations.ensure_thread(db, peer_id=1, engage_account_id=1,
+                                          source="twitter")
+    conv = await conversations.ensure_thread(db, peer_id=2, engage_account_id=1,
+                                             source="draft")
+    with pytest.raises(ValueError, match="вид события"):
+        await conversations.add_event(db, conv, kind="like", source="draft:1",
+                                      actor=None, at=T0)
+
+
+async def test_unsolicited_may_go_without_account(db):
+    """Нитка «человек написал сам» заводится без аккаунта и без привязки —
+    единственный источник, которому это разрешено."""
+    conv = await conversations.ensure_thread(db, peer_id=800, engage_account_id=None,
+                                             source="unsolicited",
+                                             peer_username="stranger")
+    await db.commit()
+    assert conv.engage_account_id is None and conv.target_id is None
+    assert conv.state == "new"
+
+
+async def test_manual_send_to_a_user_target_opens_the_thread(db):
+    """Ручная отправка по наводке-«user» заводит нитку и событие `manual_send:<id>`
+    — с текстом, сценарием и временем отправки."""
+    s = await service_seed(db)
+    entry = await manual_sends.record(db, workflow=s["dm"], text="привет",
+                                      recorded_by="andrey@x",
+                                      target_id=s["user_target"].id,
+                                      engage_account_id=3, sent_at=T0)
+    await db.commit()
+
+    assert entry.conversation_id is not None
+    conv = await db.get(Conversation, entry.conversation_id)
+    assert conv.peer_id == 600 and conv.source == "manual"
+    assert conv.engage_account_id == 3 and conv.target_id == s["user_target"].id
+    assert conv.sent_count == 1 and conv.state == "awaiting_reply"
+    assert conv.last_sent_at == T0
+
+    events = (await db.execute(select(ConversationEvent).where(
+        ConversationEvent.conversation_id == conv.id))).scalars().all()
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "manual" and ev.source == f"manual_send:{entry.id}"
+    assert ev.text == "привет" and ev.actor == "andrey@x"
+    assert ev.at == T0 and ev.workflow_id == s["dm"].id
+
+
+async def test_manual_send_without_account_still_opens_the_thread(db):
+    """Человек мог оставить аккаунт пустым (список недоступен — «запись факта
+    от него не зависит»): нитка заводится и без аккаунта. У автомата пустого
+    аккаунта не бывает, но запрет здесь значил бы терять факт отправки."""
+    s = await service_seed(db)
+    entry = await manual_sends.record(db, workflow=s["dm"], text="привет",
+                                      recorded_by="andrey@x",
+                                      target_id=s["user_target"].id)
+    await db.commit()
+    assert entry.conversation_id is not None
+    conv = await db.get(Conversation, entry.conversation_id)
+    assert conv.engage_account_id is None and conv.source == "manual"
+
+
+async def test_manual_send_to_a_public_target_does_not_open_a_thread(db):
+    """Диалог — только про ЛС (решение владельца, 16.11): публичный ответ нитки
+    не заводит, `conversation_id` остаётся пустым, и это не ошибка."""
+    s = await service_seed(db)
+    entry = await manual_sends.record(db, workflow=s["public"], text="в тред",
+                                      recorded_by="andrey@x",
+                                      target_id=s["message_target"].id)
+    await db.commit()
+
+    assert entry.conversation_id is None
+    assert (await db.execute(select(func.count(Conversation.id)))).scalar_one() == 0
+
+
+async def test_backfill_links_once_and_then_zero(db):
+    """Бэкфилл привязывает отправки, записанные до 16.1, и на втором прогоне
+    находит ноль. Запись без адресата не привязывается никогда — диалога для
+    неё не придумать."""
+    s = await service_seed(db)
+    old = ManualSend(workflow_id=s["dm"].id, target_id=s["user_target"].id,
+                     engage_account_id=3, text="старая запись", recorded_by="andrey@x")
+    orphan = ManualSend(workflow_id=s["dm"].id, text="мимо радара",
+                        recorded_by="andrey@x")
+    db.add_all([old, orphan])
+    await db.flush()
+
+    assert await conversations.backfill_manual_sends(db) == 1
+    await db.commit()
+    assert old.conversation_id is not None
+    assert orphan.conversation_id is None
+    assert await conversations.backfill_manual_sends(db) == 0
+
+
+async def test_binding_check_refuses_lead_and_target_together(db):
+    """Нитка привязана к лиду ИЛИ к цели, или ни к чему — CHECK держит «не обе
+    сразу» на уровне схемы, а не надежды на писателей."""
+    s = await service_seed(db)
+    db.add(Conversation(lead_id=1, target_id=s["user_target"].id, peer_id=610,
+                        engage_account_id=3, source="draft"))
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+async def test_contact_facts_before_and_after_the_event(db):
+    """Факты для гардрейла «этому человеку уже писали» (16.2): без нитки —
+    (False, 0, None); нитка без отправок — всё ещё «не писали»; событие
+    отправки делает человека «протронутым»."""
+    await service_seed(db)
+    assert await conversations.contact_facts(db, peer_id=600) == (False, 0, None)
+
+    conv = await conversations.ensure_thread(db, peer_id=600, engage_account_id=3,
+                                             source="draft")
+    assert await conversations.contact_facts(db, peer_id=600) == (False, 0, None)
+
+    await conversations.add_event(db, conv, kind="outbound", source="draft:1",
+                                  actor="wf:cold_dm", at=T0)
+    assert await conversations.contact_facts(db, peer_id=600) == (True, 1, T0)
+
+
+async def test_correcting_sent_at_moves_the_event_and_the_thread(db):
+    """Правка времени отправки доезжает до события `manual_send:<id>` и до
+    `last_sent_at` нитки — все три места говорят одно."""
+    s = await service_seed(db)
+    entry = await manual_sends.record(db, workflow=s["dm"], text="привет",
+                                      recorded_by="andrey@x",
+                                      target_id=s["user_target"].id,
+                                      engage_account_id=3, sent_at=T0)
+    await db.commit()
+    conv = await db.get(Conversation, entry.conversation_id)
+    assert conv.last_sent_at == T0
+
+    t_late = T0 + timedelta(hours=3)
+    assert manual_sends.correct(entry, {"sent_at": t_late}) == ["sent_at"]
+    await conversations.resync_manual_send_time(db, entry)
+    await db.commit()
+
+    ev = (await db.execute(select(ConversationEvent).where(
+        ConversationEvent.source == f"manual_send:{entry.id}"))).scalar_one()
+    assert ev.at == t_late
+    assert conv.last_sent_at == t_late

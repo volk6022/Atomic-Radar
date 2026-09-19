@@ -7,9 +7,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, automation, backfill, conversations,
-                        discovery, drafts, ingest, leads, manual_sends, profile,
-                        runs, screens, system, wf_queues)
+from app.api.v1 import (alerts, auth, automation, backfill, discovery, drafts, ingest,
+                        leads, manual_sends, profile, runs, screens, system, wf_queues)
+# Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
+# первый, и `include_router` уходит в модуль сервисов. Тот же приём, что у `events`
+# и `workflows` ниже.
+from app.api.v1 import conversations as conversations_api
 # Псевдоним по той же причине, что и у сценариев ниже: рядом живёт `app.services.events`.
 from app.api.v1 import events as events_api
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
@@ -19,7 +22,8 @@ from app.core.config import get_settings
 from app.db.migrate import apply as apply_migrations
 from app.db.models import Base
 from app.db.session import get_engine, get_session_maker
-from app.services import cascade_registry, engage, engage_registry, jobs, queue, workflows
+from app.services import (cascade_registry, conversations, engage, engage_registry,
+                          jobs, queue, workflows)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("radar")
@@ -59,6 +63,14 @@ async def lifespan(app: FastAPI):
         # пуст, — так уже работающая установка переживает выкатку без ручного шага.
         engage_registry.install()
         async with get_session_maker()() as db:
+            # Нитки диалогов для ручных отправок, записанных до 16.1 (PLAN 16.6а):
+            # на первой выкатке привязывает существующие строки, дальше честно
+            # находит ноль. Сразу после миграций и до остального бутстрапа, чтобы
+            # чужая неудача (Engage недоступен и т.п.) не отменяла привязку.
+            linked = await conversations.backfill_manual_sends(db)
+            await db.commit()
+            logger.info("conversations_backfill linked=%s", linked)
+
             await engage_registry.ensure_bootstrap(db)
             await engage_registry.reload(db)
             # Сценарий ЛС существовал молча — установка работает ровно по нему.
@@ -122,7 +134,7 @@ def create_app() -> FastAPI:
     app.include_router(screens.router)
     # Экран «Переписки» отдельным роутером по той же причине, что и тревоги:
     # у него есть отметка «прочитано», то есть побочный эффект.
-    app.include_router(conversations.router)
+    app.include_router(conversations_api.router)
     app.include_router(profile.router)
     app.include_router(workflows_api.router)
     # Данные сценария отдельным роутером: у реестра выше права намеренно слабые
