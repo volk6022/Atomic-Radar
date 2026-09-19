@@ -20,8 +20,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core import cascade
-from app.db.models import Channel, Lead, Message, MessageReader
-from app.services import embeddings, llm, targeting
+from app.db.models import Channel, Conversation, Lead, Message, MessageReader
+from app.services import conversations, embeddings, llm, targeting
 
 logger = logging.getLogger(__name__)
 
@@ -39,28 +39,32 @@ def parse_dt(raw) -> datetime | None:
 
 
 async def get_or_create_channel(db, *, peer_id: int, username: str | None,
-                                title: str | None) -> Channel:
+                                title: str | None, chat_type: str | None = None) -> Channel:
     """Канал заводится сам при первом же сообщении из него.
 
     Требовать предварительной регистрации значило бы терять сообщения из групп,
-    про которые оператор ещё не знает, — а именно они и интересны.
+    про которые оператор ещё не знает, — а именно они и интересны. `chat_type`
+    доезжает из конверта вотчера: без него строки каналов стояли с пустым типом
+    (PLAN 16.3), и по ним нельзя было отличить группу от пересылки.
     """
     channel = (await db.execute(
         select(Channel).where(Channel.peer_id == peer_id))).scalar_one_or_none()
     if channel is not None:
-        # Название группы меняется; храним последнее известное.
         if title and channel.title != title:
             channel.title = title
         if username and channel.username != username:
             channel.username = username
+        if chat_type and not channel.chat_type:
+            channel.chat_type = chat_type
         return channel
 
     channel = Channel(peer_id=peer_id, username=username,
                       title=title or (username and "@" + username) or str(peer_id),
-                      ingest_enabled=True)
+                      chat_type=chat_type, ingest_enabled=True)
     db.add(channel)
     await db.flush()
-    logger.info("channel_created peer=%s username=%s title=%s", peer_id, username, title)
+    logger.info("channel_created peer=%s username=%s title=%s type=%s",
+                peer_id, username, title, chat_type)
     return channel
 
 
@@ -202,10 +206,12 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
     chat_id = payload.get("chat_id")
     if chat_id is None:
         return {"accepted": 0, "reason": "нет chat_id"}
+    if payload.get("chat_type") == "private":
+        return await ingest_private_message(db, payload)
 
     channel = await get_or_create_channel(
         db, peer_id=chat_id, username=payload.get("chat_username"),
-        title=payload.get("chat_title"))
+        title=payload.get("chat_title"), chat_type=payload.get("chat_type"))
 
     name = " ".join(x for x in (payload.get("from_first_name"),
                                 payload.get("from_last_name")) if x) or None
@@ -234,6 +240,44 @@ async def ingest_incoming_message(db, payload: dict) -> dict:
         await _mark_readers(db, message_ids=[message.id], account_id=account_id)
 
     return {"accepted": 1, "created": int(created), "workflows": summary}
+
+
+async def ingest_private_message(db, payload: dict) -> dict:
+    """Личное сообщение — это событие диалога, а не сообщение канала (PLAN 16.3).
+
+    Нитка одна на человека на весь флот: `ensure_thread` вернёт существующую (её
+    `source` не трогаем) или заведёт `unsolicited` — человек написал первым, либо
+    это чужая переписка аккаунта. Ни строки `channels`, ни `messages` для ЛС не
+    появляется: до 16.3 они плодили «каналы» без типа. Боты — мимо.
+    """
+    if payload.get("from_is_bot"):
+        return {"accepted": 0, "reason": "бот"}
+    from_peer_id = payload.get("from_peer_id")
+    if from_peer_id is None:
+        return {"accepted": 0, "reason": "нет from_peer_id"}
+
+    account_id = payload.get("account_id")
+    username = (payload.get("sender_username") or "").lstrip("@") or None
+    existed = (await db.execute(
+        select(Conversation.id).where(Conversation.peer_id == from_peer_id)
+    )).scalar_one_or_none()
+    conv = await conversations.ensure_thread(
+        db, peer_id=from_peer_id, engage_account_id=account_id,
+        source="unsolicited", peer_username=username)
+
+    name = " ".join(x for x in (payload.get("from_first_name"),
+                                payload.get("from_last_name")) if x) or None
+    event = await conversations.add_event(
+        db, conv, kind="inbound", source="engage:incoming", actor=None,
+        at=parse_dt(payload.get("date")) or datetime.now(timezone.utc),
+        text=payload.get("message"), tg_message_id=payload.get("message_id"),
+        payload={"account_id": account_id, "chat_id": payload.get("chat_id"),
+                 "from_name": name})
+    await db.commit()
+    logger.info("private_inbound account=%s peer=%s conversation=%s new=%s",
+                account_id, from_peer_id, conv.id, existed is None)
+    return {"accepted": 1, "conversation_id": conv.id, "event_id": event.id,
+            "unsolicited": existed is None}
 
 
 async def ingest_history(db, *, chat_id: int, chat_username: str | None,
