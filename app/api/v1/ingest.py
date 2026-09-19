@@ -672,6 +672,12 @@ async def _handle_chat_info_join(db, result: dict, q) -> dict:
     channel.subscribed_account_id = account_id
     channel.subscribed_by = subscribed_by
     channel.subscribed_at = clock.utcnow()
+    if channel.chat_type in discussions_service.GROUP_TYPES:
+        # Кандидат из поиска по строке — сама группа (3.f/3.g): аккаунт в неё
+        # только что вступил, а `linked_joined_at` ставила лишь стадия `linked`.
+        # Без отметки очередь дочитывания отвечала NotJoined на уже
+        # подключённую группу (goswift, dss_group_export — 20.09).
+        channel.linked_joined_at = clock.utcnow()
     await db.commit()
     logger.info("channel_added channel=%s peer=%s username=%s account=%s by=%s linked=%s",
                channel.id, peer_id, username, account_id, subscribed_by, linked)

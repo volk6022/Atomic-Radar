@@ -225,6 +225,38 @@ def test_channel_add_finale_enqueues(db_ready):
     assert email == "auto:channel_add"
 
 
+def test_direct_group_add_marks_it_joined(db_ready):
+    """Кандидат-группа из поиска по строке подключается стадией `channel`:
+    аккаунт вступил, и группа обязана считаться вступившей — иначе очередь
+    дочитывания отвечает NotJoined на только что подключённую группу (20.09,
+    goswift/dss_group_export на проде)."""
+
+    async def go():
+        async with get_session_maker()() as db:
+            result = {"peer_id": -1009001, "username": "swift_lost",
+                      "title": "SWIFT — пропали деньги", "type": "supergroup",
+                      "members_count": 18566, "linked_chat_username": None}
+            q = {"account_id": "1", "run_id": "0", "subscribed_by": "owner@x",
+                 "stage": "channel"}
+            out = await ingest_api._handle_chat_info_join(db, result, q)
+            group = (await db.execute(
+                select(Channel).where(Channel.peer_id == -1009001))).scalar_one()
+            plain = {"peer_id": -1009002, "username": "just_channel",
+                     "title": "Канал", "type": "channel", "members_count": 5,
+                     "linked_chat_username": None}
+            await ingest_api._handle_chat_info_join(db, plain, q)
+            chan = (await db.execute(
+                select(Channel).where(Channel.peer_id == -1009002))).scalar_one()
+            return {"out": out, "group_joined": group.linked_joined_at is not None,
+                    "group_account": group.subscribed_account_id,
+                    "channel_joined": chan.linked_joined_at is not None}
+
+    out = asyncio.run(go())
+    assert out["out"]["accepted"] == 1
+    assert out["group_joined"] is True and out["group_account"] == 1
+    assert out["channel_joined"] is False, "у канала без группы отметки вступления нет"
+
+
 @pytest.mark.parametrize("db_ready", [{"autoflow_join_backfill_enabled": 0}],
                          indirect=True)
 def test_after_join_disabled_does_nothing(db_ready, monkeypatch):
