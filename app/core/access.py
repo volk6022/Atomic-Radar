@@ -98,6 +98,10 @@ class Capability(StrEnum):
     # попадает в аудит. Поэтому она у владельца и заказчика — по образцу SAFETY:
     # разборщику писать людям от имени заказчика не положено.
     DRAFT_SEND = "draft.send"
+    # 16.5: ответ из Переписок — тоже «писать людям от имени заказчика»;
+    # смена состояния нитки (передать/закрыть) — рабочий инструмент разборщика.
+    CONVERSATION_REPLY = "conversation.reply"
+    CONVERSATION_STATE = "conversation.state"
     DRAFT_REOPEN = "draft.reopen"
     LEAD_STATUS = "lead.status"
     BULK_DECIDE = "bulk.decide"
@@ -144,6 +148,8 @@ CAPABILITIES: dict[Capability, frozenset[Role]] = {
     # Ручная отправка — владельцу и заказчику (16.2): это тот же случай, что и
     # SAFETY, «отправляет руками заказчик», только теперь руками из Radar.
     Capability.DRAFT_SEND: _OWNER_CUSTOMER,
+    Capability.CONVERSATION_REPLY: _OWNER_CUSTOMER,
+    Capability.CONVERSATION_STATE: _STAFF,
     Capability.DRAFT_REOPEN: _STAFF,
     Capability.LEAD_STATUS: _STAFF,
     # Наёмный разборщик решает по одному. Одна ошибка в фильтре — и триста лидов

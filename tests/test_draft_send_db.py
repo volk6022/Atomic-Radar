@@ -33,6 +33,7 @@ from app.db.models import (AuditLog, Base, Channel, Conversation,  # noqa: E402
                            Workflow)
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.core import clock  # noqa: E402
 from app.services import conversations, engage  # noqa: E402
 
 DB_URL = os.environ.get("RADAR_TEST_DATABASE_URL")
@@ -193,8 +194,14 @@ def reviewer(client, seeded):
 
 
 def _stub_engage(monkeypatch, *, send_error=None) -> list[dict]:
-    """Engage без сети: флот с одним активным аккаунтом, остаток 17, задача t-1."""
+    """Engage без сети: флот с одним активным аккаунтом, остаток 17, задача t-1.
+
+    Часы тоже подменяются: гейт считает тихие часы получателя от текущего
+    времени, и без подмены набор краснел ночью по МСК (20.09 02:37 — «тихие
+    часы: 0:00 попадает в 0:00-8:00»)."""
     sends: list[dict] = []
+    monkeypatch.setattr(clock, "utcnow",
+                        lambda: datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc))
 
     async def list_accounts(*, instance=None):
         return [{"account_id": 3, "status": "active"}]

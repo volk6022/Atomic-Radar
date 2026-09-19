@@ -16,14 +16,20 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
-from app.api.deps import GetDB, requires
+from app.api.deps import GetDB, permits, requires
 from app.api.v1.listing import ListParams, apply_sort, list_params
 from app.core import clock
-from app.core.access import Section
+from app.core.access import Capability, Section
 from app.db.models import Conversation, ConversationEvent, Lead, Message, WfTarget
+from app.services import conversation_reply, engage
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["conversations"])
 
@@ -207,3 +213,77 @@ async def conversation_mark_read(conversation_id: int, db: GetDB,
     conv.read_at = clock.utcnow()
     await db.commit()
     return {"id": conv.id, "read_at": _iso(conv.read_at), "unread": conv.unread}
+
+
+async def _conv_or_404(db, conversation_id: int) -> Conversation:
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(404, f"диалог {conversation_id} не найден")
+    return conv
+
+
+@router.get("/conversations/{conversation_id}/reply-preflight")
+async def reply_preflight(conversation_id: int, db: GetDB, text: str = "",
+                          user=permits(Section.CONVERSATIONS,
+                                       Capability.CONVERSATION_REPLY)):
+    """Что покажет кнопка «ответить»: аккаунт, вердикт гейта, живая попытка.
+
+    Ничего не пишет — сетевые ходы только читающие. Право — CONVERSATION_REPLY:
+    ответ в диалоге — это писать людям от имени заказчика, как DRAFT_SEND.
+    """
+    conv = await _conv_or_404(db, conversation_id)
+    return await conversation_reply.preflight(db, conv=conv, text=text,
+                                             now=clock.utcnow())
+
+
+@router.post("/conversations/{conversation_id}/reply",
+             status_code=status.HTTP_202_ACCEPTED)
+async def reply(conversation_id: int, db: GetDB,
+                user=permits(Section.CONVERSATIONS, Capability.CONVERSATION_REPLY),
+                body: dict = Body(default={})):
+    """Заказать ответ в диалоге через Engage: `{"text": str}` → 202.
+
+    Заказ принят, сообщение ещё не доставлено — подтверждение приедет вебхуком
+    `kind="send"`; до него попытка `pending`. Форма отказа едина с черновиком:
+    409 `{detail, reasons}`.
+    """
+    conv = await _conv_or_404(db, conversation_id)
+    try:
+        row = await conversation_reply.order(
+            db, conv=conv, text=str(body.get("text") or ""), actor=user.email,
+            now=clock.utcnow())
+    except conversation_reply.ReplyBlocked as e:
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={
+            "detail": "; ".join(e.reasons) or "ответ заблокирован",
+            "reasons": e.reasons})
+    except conversation_reply.ReplyConflict as e:
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={
+            "detail": str(e), "reasons": []})
+    except engage.EngageUnavailable as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from e
+    logger.info("conversation_reply conversation=%s outbound=%s account=%s by=%s",
+                conv.id, row.id, row.engage_account_id, user.email)
+    return {"outbound_id": row.id, "task_id": row.engage_task_id,
+            "state": row.state, "account_id": row.engage_account_id}
+
+
+@router.post("/conversations/{conversation_id}/handoff")
+async def handoff(conversation_id: int, db: GetDB,
+                  user=permits(Section.CONVERSATIONS, Capability.CONVERSATION_STATE)):
+    """Передать диалог человеку вне Радара: `state=handed_off`, момент передачи."""
+    conv = await conversation_reply.set_state(
+        db, conv=await _conv_or_404(db, conversation_id), state="handed_off",
+        actor=user.email, now=clock.utcnow())
+    return {"id": conv.id, "state": conv.state,
+            "handed_off_at": _iso(conv.handed_off_at)}
+
+
+@router.post("/conversations/{conversation_id}/close")
+async def close(conversation_id: int, db: GetDB,
+                user=permits(Section.CONVERSATIONS, Capability.CONVERSATION_STATE)):
+    """Закрыть диалог: `state=closed`; ответ в закрытый диалог гейт не пропустит."""
+    conv = await conversation_reply.set_state(
+        db, conv=await _conv_or_404(db, conversation_id), state="closed",
+        actor=user.email, now=clock.utcnow())
+    return {"id": conv.id, "state": conv.state,
+            "handed_off_at": _iso(conv.handed_off_at)}

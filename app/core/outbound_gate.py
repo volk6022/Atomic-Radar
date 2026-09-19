@@ -51,6 +51,8 @@ class SendRequest:
     # одобренного черновика (16.2): режим не проверяется, вместо него право
     # DRAFT_SEND, подтверждение в интерфейсе и аудит.
     origin: str = "auto"
+    # Ответ во входящем диалоге (16.5): пауза и потолок — только на первое касание.
+    first_touch: bool = True
     # Куда писать, если по peer_id адресата разыскали только по username.
     recipient_username: str | None = None
     workflow_id: int | None = None
@@ -108,6 +110,7 @@ class OutboundGate:
             recipient_is_admin=req.recipient_is_admin,
             previously_contacted=req.previously_contacted,
             origin=req.origin,
+            first_touch=req.first_touch,
         )
         return SendVerdict(allowed=not reasons, reasons=reasons)
 

@@ -1180,10 +1180,15 @@ class WfOutbound(Base):
     __tablename__ = "wf_outbound"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    workflow_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("workflows.id"), nullable=False)
+    # С 16.5 nullable: у ответа из Переписок сценария может не быть — нитка
+    # `unsolicited` заведена входящим, а не целью сценария.
+    workflow_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("workflows.id"))
     target_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_targets.id"))
     draft_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("wf_drafts.id"))
+    # Кто заказал (16.5): вебхук доставки приходит без сессии, а событие нитки
+    # обязано знать автора касания; у черновика это `decided_by`, у ответа — здесь.
+    actor: Mapped[str | None] = mapped_column(String(255))
     # С 16.1 — настоящий FK: у диалога появился владелец схемы. Nullable, потому
     # что у публичного ответа переписки нет — есть сообщение в треде, на которое
     # ответили. Адрес доставки продублирован здесь снимком, потому что цель со

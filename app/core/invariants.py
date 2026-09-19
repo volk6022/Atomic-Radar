@@ -104,6 +104,7 @@ def check_all(
     recipient_is_admin: bool,
     previously_contacted: bool,
     origin: str = "auto",
+    first_touch: bool = True,
 ) -> list[str]:
     """Все нарушения разом, а не первое попавшееся.
 
@@ -117,14 +118,17 @@ def check_all(
     `mode_provider` в обоих случаях, а «ослабление уже, чем решение»: пропуск одной
     проверки не превращает список причин в другой список.
     """
+    # `first_touch=False` — ответ во входящем диалоге (16.5): пауза, потолок
+    # сообщений и «уже писали» — предохранители первого касания (решение
+    # владельца, PLAN 16.11 п.3), а тихие часы получателя действуют на всё.
     checks = (
         not_in_dry_run(mode) if origin != "manual" else None,
         draft_is_approved(draft_state),
-        no_link_in_first_message(text, is_first),
-        within_message_cap(sent_count),
-        gap_respected(last_sent_at, now),
+        no_link_in_first_message(text, is_first) if first_touch else None,
+        within_message_cap(sent_count) if first_touch else None,
+        gap_respected(last_sent_at, now) if first_touch else None,
         outside_quiet_hours(local_hour),
         recipient_not_admin(recipient_is_admin),
-        not_already_contacted(previously_contacted),
+        not_already_contacted(previously_contacted) if first_touch else None,
     )
     return [c for c in checks if c is not None]

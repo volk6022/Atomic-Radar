@@ -216,6 +216,9 @@ STATEMENTS: list[str] = [
     "NOT NULL DEFAULT 'pending'",
     "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS engage_task_id VARCHAR(64)",
     "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS error TEXT",
+    # 16.5: ответ из Переписок — попытка без сценария и с автором в строке.
+    "ALTER TABLE wf_outbound ALTER COLUMN workflow_id DROP NOT NULL",
+    "ALTER TABLE wf_outbound ADD COLUMN IF NOT EXISTS actor VARCHAR(255)",
 ]
 
 

@@ -42,8 +42,9 @@ from app.core import clock
 from app.core.access import Capability, Section, allows
 from app.core.cascade import L1_BYPASS_MIN_TEXT
 from app.core.config import get_settings
-from app.db.models import (AuditLog, BackfillItem, Channel, EngageInstance, Message,
-                           WfDraft, WfOutbound, WfTarget, Workflow)
+from app.db.models import (AuditLog, BackfillItem, Channel, Conversation,
+                           EngageInstance, Message, WfDraft, WfOutbound, WfTarget,
+                           Workflow)
 from app.services import alerts, channels as channels_service
 from app.services import autoflow
 from app.services import cascade_registry
@@ -386,16 +387,26 @@ async def _handle_send_complete(db, result: dict, q: Mapping[str, str]) -> dict:
 
     target = await db.get(WfTarget, row.target_id) if row.target_id else None
     draft = await db.get(WfDraft, row.draft_id) if row.draft_id else None
-    conv = await conversations_service.ensure_thread(
-        db, peer_id=row.recipient_peer_id,
-        engage_account_id=row.engage_account_id, source="draft",
-        peer_username=target.author_username if target is not None else None,
-        target_id=row.target_id)
+    conv = None
+    if row.draft_id is None and row.conversation_id is not None:
+        # Ответ из Переписок (16.5): нитка уже есть — заказ шёл из неё.
+        conv = await db.get(Conversation, row.conversation_id)
+    if conv is None:
+        conv = await conversations_service.ensure_thread(
+            db, peer_id=row.recipient_peer_id,
+            engage_account_id=row.engage_account_id,
+            source="draft" if draft is not None else "manual",
+            peer_username=target.author_username if target is not None else None,
+            target_id=row.target_id)
     # actor — тот, кто одобрил текст: вебхук приходит без сессии, и из всех
-    # доступных источников это самый честный ответ на «чьё это касание».
+    # доступных источников это самый честный ответ на «чьё это касание»;
+    # у ответа из Переписок автор записан в саму попытку.
+    if draft is not None:
+        source, actor = f"draft:{row.draft_id}", draft.decided_by
+    else:
+        source, actor = f"reply:{row.id}", row.actor
     await conversations_service.add_event(
-        db, conv, kind="outbound", source=f"draft:{row.draft_id}",
-        actor=draft.decided_by if draft is not None else None,
+        db, conv, kind="outbound", source=source, actor=actor,
         at=clock.utcnow(), text=row.text_snapshot,
         tg_message_id=delivered_message_id, workflow_id=row.workflow_id)
     row.conversation_id = conv.id
