@@ -219,6 +219,8 @@ async def action(*, account_id: int, action: str, payload: dict, webhook_url: st
 
 async def send_message(*, account_id: int, recipient_peer_id: int | None,
                        recipient_username: str | None, text: str,
+                       context_chat_id: int | None = None,
+                       context_message_id: int | None = None,
                        webhook_url: str, idempotency_key: str,
                        reply_to_message_id: int | None = None,
                        instance: str | None = None) -> dict:
@@ -245,11 +247,19 @@ async def send_message(*, account_id: int, recipient_peer_id: int | None,
     Ответ — приём задачи (`task_id` и статус), а не результат: номер доставленного
     сообщения приезжает позже вебхуком `kind="send"` на `webhook_url`.
     """
+    # Оба адреса, если известны: воркер Engage берёт username первым (его Telegram
+    # разрешает всегда), peer_id — запасной. Одного peer_id аккаунту не хватает:
+    # «min»-пользователя из группы в сессии нет, и первые шесть живых отправок
+    # 20.09 упали PEER_ID_INVALID. Контекст (чат и сообщение цели) даёт воркеру
+    # подгрузить пир перед отправкой.
     payload: dict = {"text": text, "idempotency_key": idempotency_key}
     if recipient_peer_id is not None:
         payload["peer_id"] = recipient_peer_id
-    else:
-        payload["recipient_username"] = recipient_username
+    if recipient_username:
+        payload["recipient_username"] = recipient_username.lstrip("@")
+    if context_chat_id is not None and context_message_id is not None:
+        payload["context_chat_id"] = context_chat_id
+        payload["context_message_id"] = context_message_id
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 

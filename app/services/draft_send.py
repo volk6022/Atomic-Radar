@@ -42,7 +42,7 @@ from sqlalchemy import select
 from app.api.v1.system import current_mode
 from app.core import clock
 from app.core.outbound_gate import OutboundGate, SendRequest
-from app.db.models import (AuditLog, EngageInstance, Message, MessageReader,
+from app.db.models import (AuditLog, Channel, EngageInstance, Message, MessageReader,
                            WfDraft, WfOutbound, WfTarget, Workflow)
 from app.services import conversations as conversations_service
 from app.services import engage
@@ -123,15 +123,19 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
     # ему «в личку» нечего. Юзернейм — цели, а если у той пусто, то сообщения:
     # доехавший позже лучше пустоты, адресовать по нему умеет сам воркер Engage.
     peer_id = username = name = None
+    context_chat_id = context_message_id = None
     if target is not None and target.target_kind == "user":
         peer_id = target.recipient_peer_id
         username = target.author_username
         name = target.author_name
-        if username is None:
-            message = await db.get(Message, target.message_id)
-            if message is not None:
-                username = message.author_username
-                name = name or message.author_name
+        message = await db.get(Message, target.message_id)
+        if message is not None:
+            username = username or message.author_username
+            name = name or message.author_name
+            # Контекст для воркера: в каком чате и каким сообщением видели человека.
+            channel = await db.get(Channel, message.channel_id)
+            if channel is not None:
+                context_chat_id, context_message_id = channel.peer_id, message.tg_message_id
     if workflow.action != "dm":
         reasons.append(f"ручная отправка заведена только для личных сообщений, "
                        f"у сценария действие «{workflow.action}»")
@@ -207,6 +211,7 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
             recipient_is_admin=False, previously_contacted=previously_contacted,
             origin="manual", recipient_username=username,
             workflow_id=workflow.id, target_id=target.id,
+            context_chat_id=context_chat_id, context_message_id=context_message_id,
         )
         # mode_provider обязан быть асинхронным: гейт читает его через `await`
         # (в бою он ходит в базу). Здесь режим уже прочитан для снимка — отдаём

@@ -28,7 +28,9 @@ class SpyEngage:
                            recipient_username: str | None, text: str,
                            webhook_url: str, idempotency_key: str,
                            reply_to_message_id: int | None = None,
-                           instance: str | None = None) -> dict:
+                           instance: str | None = None,
+                           context_chat_id: int | None = None,
+                           context_message_id: int | None = None) -> dict:
         self.calls.append({
             "account_id": account_id, "recipient_peer_id": recipient_peer_id,
             "recipient_username": recipient_username, "text": text,

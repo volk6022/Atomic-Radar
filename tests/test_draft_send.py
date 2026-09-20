@@ -408,23 +408,26 @@ class _Client:
         return _Resp()
 
 
-def test_send_message_payload_prefers_peer_id(monkeypatch):
-    """Адресация — часть контракта: в payload уходит ровно одно из двух."""
+def test_send_message_payload_carries_both_addresses_and_context(monkeypatch):
+    """Адресация — часть контракта: оба адреса, если известны, и контекст, где
+    аккаунт видел человека. 20.09 один peer_id дал PEER_ID_INVALID на всех шести
+    живых отправках — «min»-пользователя из группы в сессии нет."""
     sink = {}
     monkeypatch.setattr(engage, "_get_client", lambda instance=None: _Client(sink))
 
     asyncio.run(engage.send_message(
-        account_id=3, recipient_peer_id=123456, recipient_username="ivan_p",
-        text=TEXT, webhook_url="http://w", idempotency_key="radar-wf-outbound-1"))
+        account_id=3, recipient_peer_id=123456, recipient_username="@ivan_p",
+        text=TEXT, webhook_url="http://w", idempotency_key="radar-wf-outbound-1",
+        context_chat_id=-1001, context_message_id=77))
 
     assert sink["path"] == "/v1/action"
     assert sink["body"]["action"] == "send_message"
     assert sink["body"]["account_id"] == 3
     assert sink["body"]["webhook_url"] == "http://w"
-    # peer_id приоритетнее username: оба известны — едет peer_id.
     assert sink["body"]["payload"] == {"text": TEXT,
                                        "idempotency_key": "radar-wf-outbound-1",
-                                       "peer_id": 123456}
+                                       "peer_id": 123456, "recipient_username": "ivan_p",
+                                       "context_chat_id": -1001, "context_message_id": 77}
 
 
 def test_send_message_by_username_without_peer_id(monkeypatch):
