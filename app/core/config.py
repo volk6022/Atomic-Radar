@@ -12,6 +12,10 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "postgresql+asyncpg://radar:radar@localhost:5432/radar"
 
+    # Одновременных запросов L3 к модели на этот инстанс (слоты llama-server делят все
+    # инстансы Радара на одной карте — capacity-note §4). 0 — умолчание из кода (4).
+    L3_CONCURRENCY: int = 0
+
     # Подпись cookie-сессии. Пустая по умолчанию, и это проверяется при старте:
     # рабочий ключ, случайно уехавший в репозиторий, хуже упавшего сервиса.
     SECRET_KEY: str = ""

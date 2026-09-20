@@ -28,6 +28,7 @@ import logging
 from sqlalchemy import func, or_, select
 
 from app.core import cascade
+from app.core.config import get_settings
 from app.db.models import Channel, Draft, Lead, LlmTrace, Message, WfVerdict
 from app.services import drafting, embeddings, llm, targeting
 
@@ -35,6 +36,8 @@ log = logging.getLogger("radar.reclassify")
 
 # Столько запросов к модели держим в воздухе одновременно. Ровно по числу слотов
 # llama-server: больше — очередь на стороне сервера, меньше — простой карты.
+# С 20.09 — из настроек (`RADAR_L3_CONCURRENCY`): второй инстанс Радара делит
+# те же слоты, и потолок задаётся на инстанс, а не в коде (capacity-note §4).
 L3_CONCURRENCY = 4
 
 # Размер пачки эмбеддингов на один шаг прогресса. Сам клиент режет запросы мельче;
@@ -300,7 +303,7 @@ async def _stage_l3(db, jobs, *, limit, report, cancelled, base: float,
         if m.id not in contexts:
             contexts[m.id] = await _context_for(db, m)
 
-    sem = asyncio.Semaphore(L3_CONCURRENCY)
+    sem = asyncio.Semaphore(get_settings().L3_CONCURRENCY or L3_CONCURRENCY)
     done = {"n": 0}
     total = len(jobs)
 
