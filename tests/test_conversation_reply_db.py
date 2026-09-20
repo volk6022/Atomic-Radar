@@ -70,7 +70,7 @@ async def db():
 def fleet(monkeypatch):
     """Engage без сети: аккаунт 3 активен, остатков нет, заказ принимается."""
     async def list_accounts(*, instance=None):
-        return [{"account_id": 3, "status": "active"}]
+        return [{"account_id": 3, "status": "active", "warmup_tier": "ready"}]
 
     async def limits(*, account_ids=None, instance=None):
         return {"accounts": [{"account_id": 3, "actions": [

@@ -100,13 +100,16 @@ async def _plan(db, *, conv: Conversation, text: str | None, now: datetime) -> _
         except engage.EngageUnavailable as e:
             reasons.append(f"Engage недоступен: {e}")
         else:
-            account_status = next(
-                (a.get("status") for a in fleet
-                 if a.get("account_id") == account_id), None)
+            row = next((a for a in fleet if a.get("account_id") == account_id), {})
+            account_status = row.get("status")
             if account_status != "active":
                 reasons.append(
                     f"аккаунт {account_id} не активен "
                     f"(статус «{account_status or 'нет во флоте'}»)")
+            elif row.get("warmup_tier") not in (None, "ready"):
+                reasons.append(
+                    f"аккаунт {account_id} ещё в прогреве (тир "
+                    f"«{row.get('warmup_tier')}», отправка — только с «ready»)")
         try:
             raw = await engage.limits(account_ids=[account_id], instance=instance_key)
         except engage.EngageUnavailable:

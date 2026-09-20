@@ -204,7 +204,7 @@ def _stub_engage(monkeypatch, *, send_error=None) -> list[dict]:
                         lambda: datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc))
 
     async def list_accounts(*, instance=None):
-        return [{"account_id": 3, "status": "active"}]
+        return [{"account_id": 3, "status": "active", "warmup_tier": "ready"}]
 
     async def limits(*, account_ids=None, instance=None):
         return {"accounts": [{"account_id": a, "actions": [

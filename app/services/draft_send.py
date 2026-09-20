@@ -162,13 +162,19 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
             except engage.EngageUnavailable as e:
                 reasons.append(f"Engage недоступен: {e}")
             else:
-                account_status = next(
-                    (a.get("status") for a in fleet
-                     if a.get("account_id") == account_id), None)
+                row = next((a for a in fleet if a.get("account_id") == account_id), {})
+                account_status = row.get("status")
                 if account_status != "active":
                     reasons.append(
                         f"аккаунт {account_id} не активен "
                         f"(статус «{account_status or 'нет во флоте'}»)")
+                # Прогрев: `send_message` Engage разрешает только тиру `ready`
+                # (safety_defaults). 20.09 все шесть заказов упали 409 «not warmed»
+                # после зелёного preflight — тир обязан быть в причинах.
+                elif row.get("warmup_tier") not in (None, "ready"):
+                    reasons.append(
+                        f"аккаунт {account_id} ещё в прогреве (тир "
+                        f"«{row.get('warmup_tier')}», отправка — только с «ready»)")
             # Остаток сообщений — витрина для оператора, не предохранитель:
             # дневной потолок считает Engage, и его отказ не мешает показу.
             try:

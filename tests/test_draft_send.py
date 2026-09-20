@@ -127,7 +127,7 @@ def stub_engage(monkeypatch, *, fleet=None, limits=None, send=None):
     calls = {"send": [], "webhook": []}
 
     async def list_accounts(*, instance=None):
-        return fleet if fleet is not None else [{"account_id": 3, "status": "active"}]
+        return fleet if fleet is not None else [{"account_id": 3, "status": "active", "warmup_tier": "ready"}]
 
     async def limits_stub(*, account_ids=None, instance=None):
         if limits is not None:
@@ -256,6 +256,19 @@ async def test_inactive_account_is_a_block(monkeypatch):
         await draft_send.order(db, workflow=workflow(), draft=draft(),
                                actor="o@l", now=NOW)
     assert any("не активен" in r for r in e.value.reasons)
+
+
+async def test_account_still_warming_is_a_block(monkeypatch):
+    """20.09: шесть заказов упали 409 «Account not warmed» после зелёного preflight —
+    тир прогрева обязан быть причиной, а не сюрпризом Engage."""
+    stub_engage(monkeypatch, fleet=[{"account_id": 3, "status": "active",
+                                     "warmup_tier": "intermediate"}])
+    db = plan_script()
+
+    with pytest.raises(draft_send.DraftSendBlocked) as e:
+        await draft_send.order(db, workflow=workflow(), draft=draft(),
+                               actor="o@l", now=NOW)
+    assert any("в прогреве" in r and "intermediate" in r for r in e.value.reasons)
 
 
 async def test_unreachable_fleet_is_a_block_not_a_crash(monkeypatch):
