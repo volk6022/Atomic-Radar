@@ -418,7 +418,7 @@ def test_send_message_payload_carries_both_addresses_and_context(monkeypatch):
     asyncio.run(engage.send_message(
         account_id=3, recipient_peer_id=123456, recipient_username="@ivan_p",
         text=TEXT, webhook_url="http://w", idempotency_key="radar-wf-outbound-1",
-        context_chat_id=-1001, context_message_id=77))
+        context_chat_id=-1001, context_message_id=77, context_chat_username="@ved_chat"))
 
     assert sink["path"] == "/v1/action"
     assert sink["body"]["action"] == "send_message"
@@ -427,7 +427,8 @@ def test_send_message_payload_carries_both_addresses_and_context(monkeypatch):
     assert sink["body"]["payload"] == {"text": TEXT,
                                        "idempotency_key": "radar-wf-outbound-1",
                                        "peer_id": 123456, "recipient_username": "ivan_p",
-                                       "context_chat_id": -1001, "context_message_id": 77}
+                                       "context_chat_id": -1001, "context_message_id": 77,
+                                       "context_chat_username": "ved_chat"}
 
 
 def test_send_message_by_username_without_peer_id(monkeypatch):

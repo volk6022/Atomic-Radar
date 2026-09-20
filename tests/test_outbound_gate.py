@@ -30,7 +30,8 @@ class SpyEngage:
                            reply_to_message_id: int | None = None,
                            instance: str | None = None,
                            context_chat_id: int | None = None,
-                           context_message_id: int | None = None) -> dict:
+                           context_message_id: int | None = None,
+                           context_chat_username: str | None = None) -> dict:
         self.calls.append({
             "account_id": account_id, "recipient_peer_id": recipient_peer_id,
             "recipient_username": recipient_username, "text": text,

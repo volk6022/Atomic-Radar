@@ -123,7 +123,7 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
     # ему «в личку» нечего. Юзернейм — цели, а если у той пусто, то сообщения:
     # доехавший позже лучше пустоты, адресовать по нему умеет сам воркер Engage.
     peer_id = username = name = None
-    context_chat_id = context_message_id = None
+    context_chat_id = context_message_id = context_chat_username = None
     if target is not None and target.target_kind == "user":
         peer_id = target.recipient_peer_id
         username = target.author_username
@@ -136,6 +136,7 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
             channel = await db.get(Channel, message.channel_id)
             if channel is not None:
                 context_chat_id, context_message_id = channel.peer_id, message.tg_message_id
+                context_chat_username = channel.username
     if workflow.action != "dm":
         reasons.append(f"ручная отправка заведена только для личных сообщений, "
                        f"у сценария действие «{workflow.action}»")
@@ -212,6 +213,7 @@ async def _plan(db, *, workflow: Workflow, draft: WfDraft, now: datetime) -> _Pl
             origin="manual", recipient_username=username,
             workflow_id=workflow.id, target_id=target.id,
             context_chat_id=context_chat_id, context_message_id=context_message_id,
+            context_chat_username=context_chat_username,
         )
         # mode_provider обязан быть асинхронным: гейт читает его через `await`
         # (в бою он ходит в базу). Здесь режим уже прочитан для снимка — отдаём

@@ -56,6 +56,7 @@ class SendRequest:
     # Где аккаунт видел получателя (чат и сообщение цели) — воркер подгружает пир.
     context_chat_id: int | None = None
     context_message_id: int | None = None
+    context_chat_username: str | None = None
     # Куда писать, если по peer_id адресата разыскали только по username.
     recipient_username: str | None = None
     workflow_id: int | None = None
@@ -149,6 +150,7 @@ class OutboundGate:
             text=req.text,
             context_chat_id=req.context_chat_id,
             context_message_id=req.context_message_id,
+            context_chat_username=req.context_chat_username,
             webhook_url=self._webhook(kind="send", account_id=req.account_id,
                                       outbound_id=req.outbound_id),
             idempotency_key=f"radar-wf-outbound-{req.outbound_id}",

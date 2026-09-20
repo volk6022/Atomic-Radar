@@ -221,6 +221,7 @@ async def send_message(*, account_id: int, recipient_peer_id: int | None,
                        recipient_username: str | None, text: str,
                        context_chat_id: int | None = None,
                        context_message_id: int | None = None,
+                       context_chat_username: str | None = None,
                        webhook_url: str, idempotency_key: str,
                        reply_to_message_id: int | None = None,
                        instance: str | None = None) -> dict:
@@ -260,6 +261,10 @@ async def send_message(*, account_id: int, recipient_peer_id: int | None,
     if context_chat_id is not None and context_message_id is not None:
         payload["context_chat_id"] = context_chat_id
         payload["context_message_id"] = context_message_id
+        # Публичный чат по @username разрешается в любой сессии; числовой id —
+        # только у участника (20.09: ChannelInvalid у аккаунта, который чат лишь читал).
+        if context_chat_username:
+            payload["context_chat_username"] = context_chat_username.lstrip("@")
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 
