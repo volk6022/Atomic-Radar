@@ -182,7 +182,11 @@ class ItemPatch(BaseModel):
 async def get_key(db: GetDB, probe: int = Query(0, ge=0, le=1),
                   user=requires(Section.INTEL)):
     k = await _key(db)
-    if k is not None and probe:
+    if probe:
+        # Проба без сохранённого адреса «проверяла» бы настройки процесса и молча
+        # отвечала «связь есть» (стенд 21.09) — честнее отказать.
+        if k is None:
+            raise HTTPException(409, "ключ Intel ещё не сохранён — сначала укажите адрес")
         await _probe(db, k)
     return _key_view(k)
 
