@@ -43,6 +43,31 @@ def _critic(result: dict | None) -> float | None:
         return None
 
 
+def _tokens(stats: dict | None) -> int | None:
+    """`stats.tokens` у настоящего Intel — словарь `{main:{prompt,completion}, aux:{…},
+    grand_total}`; число отдавала только заглушка стенда (21.09: первый живой прогон
+    упал на UPDATE `tokens INTEGER`). Берём `grand_total`, без него — сумму main."""
+    t = (stats or {}).get("tokens")
+    if isinstance(t, dict):
+        if t.get("grand_total") is not None:
+            t = t["grand_total"]
+        else:
+            main = t.get("main") or {}
+            t = (main.get("prompt") or 0) + (main.get("completion") or 0)
+    try:
+        return int(t) if t is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _elapsed(stats: dict | None) -> float | None:
+    try:
+        v = (stats or {}).get("elapsed_seconds")
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 async def _counts(db, batch_id: int) -> dict:
     rows = (await db.execute(
         select(ResearchItem.status, func.count())
@@ -187,8 +212,8 @@ async def run_batch(run_id: int, *, batch_id: int, report, cancelled) -> dict:
                     stats = result.get("stats") or {}
                     await _finish_item(
                         db, item, status="completed", result=result,
-                        critic_score=_critic(result), tokens=stats.get("tokens"),
-                        elapsed_seconds=stats.get("elapsed_seconds"), error=None)
+                        critic_score=_critic(result), tokens=_tokens(stats),
+                        elapsed_seconds=_elapsed(stats), error=None)
                     polls.pop(item_id, None)
                 elif status == "failed":
                     msg = (data.get("progress") or {}).get("message") or "Intel: failed"

@@ -124,8 +124,16 @@ class FakeIntel:
         if st == "404":
             raise intel_client.IntelNotFound(task_id)
         if st == "completed":
+            # Форма `stats` — дамп настоящего Intel (прод 21.09), не выдумка заглушки:
+            # `tokens` там словарь, и число ломало UPDATE `tokens INTEGER`.
             return {"status": "completed", "result": {"structured_output": {"ok": True},
-                    "critic": {"score": 7.5}, "stats": {"tokens": 1200, "elapsed_seconds": 41.2}}}
+                    "critic": {"score": 7.5},
+                    "stats": {"turns": 4, "tool_calls": {"web_scrape": 2, "web_serp": 1},
+                              "tokens": {"main": {"prompt": 13630, "completion": 3323,
+                                                  "last_prompt": 3761},
+                                         "aux": {"prompt": 0, "completion": 0},
+                                         "grand_total": 16953},
+                              "elapsed_seconds": 77.2, "mode_used": "quality"}}}
         if st == "failed":
             return {"status": "failed", "progress": {"message": "модель молчит"}}
         return {"status": st, "result": None}
@@ -182,7 +190,7 @@ async def test_batch_runs_within_concurrency_and_records_results(db, monkeypatch
     assert out == {"batch_id": 1, "total": 4, "done": 2, "failed": 2, "status": "done"}
     assert fake.in_flight_max <= 2, "не больше concurrency задач в полёте"
     items = {r.row_no: r for r in (await db.execute(select(ResearchItem))).scalars().all()}
-    assert items[1].status == "completed" and float(items[1].critic_score) == 7.5 and items[1].tokens == 1200
+    assert items[1].status == "completed" and float(items[1].critic_score) == 7.5 and items[1].tokens == 16953
     assert items[3].status == "failed" and items[3].error == "модель молчит"
     assert items[4].status == "failed" and "404" in items[4].error
     batch = await db.get(ResearchBatch, 1)
@@ -216,3 +224,14 @@ async def test_cancel_keeps_in_flight_and_cancels_pending(db, monkeypatch):
     items = {r.row_no: r.status for r in (await db.execute(select(ResearchItem))).scalars().all()}
     assert sorted(items.values()) == ["cancelled", "cancelled", "completed", "completed"], items
     assert len(fake.submitted) == 2, "после отмены новые запросы не ставились"
+
+
+def test_tokens_accepts_real_and_stub_shapes():
+    assert intel_research._tokens({"tokens": {"main": {"prompt": 10, "completion": 5},
+                                              "aux": {}, "grand_total": 15}}) == 15
+    assert intel_research._tokens({"tokens": {"main": {"prompt": 10, "completion": 5}}}) == 15
+    assert intel_research._tokens({"tokens": 1200}) == 1200
+    assert intel_research._tokens({"tokens": "x"}) is None
+    assert intel_research._tokens({}) is None
+    assert intel_research._elapsed({"elapsed_seconds": "77.2"}) == 77.2
+    assert intel_research._elapsed({}) is None
