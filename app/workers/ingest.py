@@ -221,12 +221,14 @@ class WorkerSettings:
     # часа: сутки он следит сам (строка `discovery_queries` по донору в текущие
     # UTC-сутки закрывает удар до полуночи), окно отложенного возврата Engage
     # тоже, поэтому чаще часа будить его незачем.
-    cron_jobs = [cron(backfill_drain_tick, minute=set(range(0, 60, 5)),
-                      second=0, run_at_startup=False),
-                 cron(discovery.discovery_check_tick,
-                      minute=set(range(0, 60, 5)), second=0, run_at_startup=False),
-                 cron(autoflow.reclassify_tick, minute=set(range(0, 60, 5)),
-                      second=0, run_at_startup=False),
+    # Фаза тиков — из настроек (`RADAR_TICK_PHASE_MINUTE`, 0–4): второй инстанс на том же
+    # железе сдвигается, чтобы не бить в модель в ту же минуту (capacity-note §4).
+    phase = max(0, min(4, get_settings().TICK_PHASE_MINUTE))
+    every5 = set(range(phase, 60, 5))
+    cron_jobs = [cron(backfill_drain_tick, minute=every5, second=0, run_at_startup=False),
+                 cron(discovery.discovery_check_tick, minute=every5, second=0,
+                      run_at_startup=False),
+                 cron(autoflow.reclassify_tick, minute=every5, second=0, run_at_startup=False),
                  cron(autoflow.scan_tick, minute={0}, second=0,
                       run_at_startup=False)]
     # Результат держится сутки. Он же — ключ от повторной доставки: `_job_id` считается
