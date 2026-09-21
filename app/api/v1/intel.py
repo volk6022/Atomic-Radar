@@ -258,8 +258,10 @@ async def create_batch(body: BatchBody, request: Request, db: GetDB,
                 for i, row in enumerate(body.rows, 1)])
     await db.commit()
     try:
+        # `runs.name` — String(120), имя пачки — до 255: длинное имя роняло старт 500-й
+        # (прод 21.09, пачка 2 при возобновлении). Имя прогона — только вывеска.
         run = await jobs.start(db, kind="intel_research", params={"batch_id": batch.id},
-                               name=f"Intel · {body.name}", user_email=user.email)
+                               name=f"Intel · {body.name}"[:120], user_email=user.email)
     except jobs.JobBusy as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
     except jobs.JobQueueDown as e:

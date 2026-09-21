@@ -132,7 +132,9 @@ def test_key_is_read_by_staff_and_written_by_owner_only(stand):
 
 
 def test_customer_starts_a_batch_reviewer_cannot_second_batch_is_409(stand):
-    payload = {"name": "тест", "rows": ROWS, "prompt_template": "Кто {{name}} ({{city}})",
+    # Имя пачки — предельные 255 символов: `runs.name` короче (120), и без обрезки старт
+    # падал 500-й (прод 21.09).
+    payload = {"name": "т" * 255, "rows": ROWS, "prompt_template": "Кто {{name}} ({{city}})",
                "schema_json": {"type": "object", "properties": {"site": {"type": "string"}}}}
     assert _as(stand, "reviewer").post("/api/v1/intel/batches", json=payload).status_code == 403
     r = _as(stand, "customer").post("/api/v1/intel/batches/validate", json=payload)
