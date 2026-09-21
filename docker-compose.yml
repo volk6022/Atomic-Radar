@@ -62,6 +62,9 @@ services:
       RADAR_LLM_BASE_URL: ${RADAR_LLM_BASE_URL:-}
       RADAR_LLM_MODEL: ${RADAR_LLM_MODEL:-qwen-local}
       RADAR_DEBUG: "false"
+      # Intel (SPEC-intel-screens): значение ключа — только из .env, адрес — в GUI «Ключ Intel».
+      RADAR_INTEL_BASE_URL: ${RADAR_INTEL_BASE_URL:-https://api.atomic-automation.net}
+      RADAR_INTEL_API_KEY: ${RADAR_INTEL_API_KEY:-}
     ports:
       # Только петля. Наружу — исключительно через Caddy по TLS: сервис держит
       # cookie-сессии, открытый порт сделал бы их доступными по http.
@@ -108,6 +111,9 @@ services:
       RADAR_LLM_BASE_URL: ${RADAR_LLM_BASE_URL:-}
       RADAR_LLM_MODEL: ${RADAR_LLM_MODEL:-qwen-local}
       RADAR_DEBUG: "false"
+      # Intel (SPEC-intel-screens): значение ключа — только из .env, адрес — в GUI «Ключ Intel».
+      RADAR_INTEL_BASE_URL: ${RADAR_INTEL_BASE_URL:-https://api.atomic-automation.net}
+      RADAR_INTEL_API_KEY: ${RADAR_INTEL_API_KEY:-}
     networks: [radar_network, engage_vertsanov]
 
   worker-jobs:
@@ -160,6 +166,9 @@ services:
       RADAR_LLM_BASE_URL: ${RADAR_LLM_BASE_URL:-}
       RADAR_LLM_MODEL: ${RADAR_LLM_MODEL:-qwen-local}
       RADAR_DEBUG: "false"
+      # Intel (SPEC-intel-screens): значение ключа — только из .env, адрес — в GUI «Ключ Intel».
+      RADAR_INTEL_BASE_URL: ${RADAR_INTEL_BASE_URL:-https://api.atomic-automation.net}
+      RADAR_INTEL_API_KEY: ${RADAR_INTEL_API_KEY:-}
     # Сеть Engage подключена, и это исправление, а не расширение доступа. Здесь
     # стояло «прогон в Telegram не ходит» — неверно с того дня, как в этом воркере
     # появился разбор групп обсуждения: он спрашивает у Engage карточки и историю,
