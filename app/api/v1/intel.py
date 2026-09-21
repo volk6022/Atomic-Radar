@@ -309,14 +309,13 @@ async def get_batch(batch_id: int, db: GetDB, user=requires(Section.INTEL)):
     counts = dict((await db.execute(
         select(ResearchItem.status, func.count()).where(ResearchItem.batch_id == b.id)
         .group_by(ResearchItem.status))).all())
-    log: list = []
-    if b.run_id:
-        run = await db.get(Run, b.run_id)
-        log = (run.log or [])[-50:] if run is not None else []
+    run = await db.get(Run, b.run_id) if b.run_id else None
+    log = (run.log or [])[-50:] if run is not None else []
+    # `run_status` — экрану нужно видеть упавший прогон, чтобы показать «Возобновить».
     return {**_batch_row(b), "counts": counts,
             "waiting_llm": counts.get("waiting_llm", 0),
             "running": counts.get("running", 0) + counts.get("submitted", 0),
-            "log": log}
+            "log": log, "run_status": run.status if run is not None else None}
 
 
 @router.post("/batches/{batch_id}/cancel")
@@ -340,6 +339,43 @@ async def cancel_batch(batch_id: int, request: Request, db: GetDB,
                     ip=request.client.host if request.client else None))
     await db.commit()
     return {"id": b.id, "status": b.status}
+
+
+@router.post("/batches/{batch_id}/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume_batch(batch_id: int, request: Request, db: GetDB,
+                       user=permits(Section.INTEL, Capability.INTEL_RUN)):
+    """Новый прогон для пачки после падения старого (прод 21.09): строки `submitted`
+    с `intel_task_id` `run_batch` подхватывает сам, счёт пачки продолжается."""
+    b = await _batch_or_404(db, batch_id)
+    if b.status not in ("queued", "running"):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"пачка уже завершена ({b.status})")
+    if b.run_id:
+        run = await db.get(Run, b.run_id)
+        if run is not None and run.status in jobs.ACTIVE:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"прогон #{b.run_id} ещё идёт")
+    busy = await jobs.active_run(db, "intel_research")
+    if busy is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"уже идёт пачка (прогон #{busy.id}) — дождитесь или отмените")
+    old_run_id = b.run_id
+    try:
+        # `runs.name` — String(120): « (resume)» — 9 символов, поэтому срез [:111],
+        # итого ≤120 (длинное имя роняло старт 500-й, прод 21.09).
+        run = await jobs.start(db, kind="intel_research", params={"batch_id": b.id},
+                               name=f"Intel · {b.name}"[:111] + " (resume)",
+                               user_email=user.email)
+    except jobs.JobBusy as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    except jobs.JobQueueDown as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e)) from e
+    b.run_id = run.id
+    db.add(AuditLog(user_id=user.id, user_email=user.email, action="intel_batch_resume",
+                    detail={"batch_id": b.id, "old_run_id": old_run_id, "run_id": run.id},
+                    ip=request.client.host if request.client else None))
+    await db.commit()
+    logger.info("intel_batch_resumed batch=%s run=%s old_run=%s by=%s",
+                b.id, run.id, old_run_id, user.email)
+    return {"batch_id": b.id, "run_id": run.id, "status": b.status}
 
 
 @router.get("/batches/{batch_id}/items")

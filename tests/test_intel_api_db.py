@@ -21,7 +21,7 @@ os.environ.setdefault("RADAR_DEBUG", "true")
 from app.api.v1 import intel as intel_api  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import SessionSigner  # noqa: E402
-from app.db.models import Base, IntelKey, ResearchBatch, ResearchItem, Run, User  # noqa: E402
+from app.db.models import AuditLog, Base, IntelKey, ResearchBatch, ResearchItem, Run, User  # noqa: E402
 from app.db.session import get_engine, get_session_maker  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.services import jobs  # noqa: E402
@@ -190,3 +190,95 @@ def test_review_patch_validates_edits_against_schema_and_export_works(stand):
     assert r.status_code == 200
     r = _as(stand, "reviewer").get(f"/api/v1/intel/batches/{bid}/items", params={"status": "cancelled"})
     assert r.json()["total"] == 1, "pending → cancelled сразу, завершённая строка не тронута"
+
+
+async def _tweak(fn):
+    """Правка сцены напрямую в базе стенда. Локальный движок в СВОЁМ loop'е — по той
+    же причине, что и в `finish()` выше: глобальный принадлежит loop'у TestClient."""
+    engine = create_async_engine(DB_URL)
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as db:
+            return await fn(db)
+    finally:
+        await engine.dispose()
+
+
+RESUME_PAYLOAD = {"name": "т" * 255, "rows": ROWS, "prompt_template": "Кто {{name}} ({{city}})",
+                  "schema_json": {"type": "object", "properties": {"site": {"type": "string"}}}}
+
+
+def test_resume_after_failed_run_starts_new_run_and_audits(stand):
+    async def previous_runs_died(db):
+        # Прогоны intel от прошлых тестов «упали» — как на проде 21.09: пачка
+        # осталась running, строки submitted, runs.status=failed.
+        for r in (await db.execute(select(Run).where(
+                Run.kind == "intel_research", Run.status.in_(jobs.ACTIVE)))).scalars():
+            r.status = "failed"
+        await db.commit()
+
+    asyncio.run(_tweak(previous_runs_died))
+    # Имя предельные 255 символов: имя прогона обязано уложиться в `runs.name` (120).
+    r = _as(stand, "customer").post("/api/v1/intel/batches", json=RESUME_PAYLOAD)
+    assert r.status_code == 202, r.text
+    bid, old_run_id = r.json()["batch_id"], r.json()["run_id"]
+    r = _as(stand, "reviewer").get(f"/api/v1/intel/batches/{bid}")
+    assert r.status_code == 200 and r.json()["run_status"] == "queued"
+    r = _as(stand, "customer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 409 and r.json()["detail"] == f"прогон #{old_run_id} ещё идёт"
+
+    async def crash(db):
+        run = await db.get(Run, old_run_id)
+        run.status = "failed"
+        batch = await db.get(ResearchBatch, bid)
+        batch.status = "running"
+        item = (await db.execute(select(ResearchItem).where(
+            ResearchItem.batch_id == bid, ResearchItem.row_no == 1))).scalar_one()
+        item.status, item.intel_task_id = "submitted", "task-crash-1"
+        await db.commit()
+
+    asyncio.run(_tweak(crash))
+    r = _as(stand, "reviewer").get(f"/api/v1/intel/batches/{bid}")
+    assert r.json()["run_status"] == "failed", "экран обязан показать «Возобновить»"
+    r = _as(stand, "customer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["batch_id"] == bid and body["status"] == "running"
+    new_run_id = body["run_id"]
+    assert new_run_id != old_run_id
+
+    async def check_resume(db):
+        assert (await db.get(ResearchBatch, bid)).run_id == new_run_id
+        run = await db.get(Run, new_run_id)
+        assert run.status == "queued" and run.name.endswith(" (resume)")
+        assert len(run.name) <= 120, "runs.name — String(120), длинное имя роняло прод"
+        logs = (await db.execute(select(AuditLog).where(
+            AuditLog.action == "intel_batch_resume"))).scalars().all()
+        assert len(logs) == 1
+        assert logs[0].detail == {"batch_id": bid, "old_run_id": old_run_id,
+                                  "run_id": new_run_id}
+
+    asyncio.run(_tweak(check_resume))
+    r = _as(stand, "customer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 409 and r.json()["detail"] == f"прогон #{new_run_id} ещё идёт"
+
+
+def test_resume_rejects_finished_batch_and_reviewer(stand):
+    async def latest_batch_id(db):
+        return (await db.execute(select(ResearchBatch)
+                .order_by(ResearchBatch.id.desc()))).scalars().first().id
+
+    bid = asyncio.run(_tweak(latest_batch_id))
+    r = _as(stand, "reviewer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 403, "возобновление пачки — не для reviewer"
+    r = _as(stand, "customer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 409, "новый прогон из прошлого теста ещё активен"
+
+    async def mark_done(db):
+        batch = await db.get(ResearchBatch, bid)
+        batch.status = "done"
+        await db.commit()
+
+    asyncio.run(_tweak(mark_done))
+    r = _as(stand, "customer").post(f"/api/v1/intel/batches/{bid}/resume")
+    assert r.status_code == 409 and r.json()["detail"] == "пачка уже завершена (done)"
