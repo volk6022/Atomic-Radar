@@ -222,6 +222,88 @@ STATEMENTS: list[str] = [
 ]
 
 
+# ── Intel (SPEC-intel-screens, 20.09): три таблицы экранов Intel. CREATE TABLE IF NOT
+# EXISTS, как у cascade_versions: повторный запуск ничего не ломает.
+STATEMENTS.append("""
+CREATE TABLE IF NOT EXISTS intel_keys (
+    id BIGSERIAL PRIMARY KEY,
+    key VARCHAR(32) UNIQUE NOT NULL DEFAULT 'default',
+    base_url VARCHAR(255) NOT NULL,
+    api_key_env VARCHAR(64) NOT NULL DEFAULT 'RADAR_INTEL_API_KEY',
+    concurrency INT NOT NULL DEFAULT 2,
+    quota_per_hour INT NOT NULL DEFAULT 500,
+    is_active BOOL NOT NULL DEFAULT TRUE,
+    last_ok_at TIMESTAMPTZ,
+    last_error TEXT,
+    last_ratelimit_limit INT,
+    last_ratelimit_remaining INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""")
+
+STATEMENTS.append("""
+CREATE TABLE IF NOT EXISTS research_batches (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    prompt_template TEXT NOT NULL,
+    schema_json JSONB,
+    source_kind VARCHAR(8) NOT NULL,
+    source_name VARCHAR(255),
+    mode VARCHAR(16) NOT NULL DEFAULT 'quality',
+    language VARCHAR(8) NOT NULL DEFAULT 'ru',
+    total INT NOT NULL DEFAULT 0,
+    done INT NOT NULL DEFAULT 0,
+    failed INT NOT NULL DEFAULT 0,
+    log JSONB,
+    created_by VARCHAR(255),
+    run_id BIGINT REFERENCES runs(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ
+);
+""")
+
+STATEMENTS.append("""
+CREATE INDEX IF NOT EXISTS idx_research_batches_status ON research_batches (status);
+""")
+
+STATEMENTS.append("""
+CREATE TABLE IF NOT EXISTS research_items (
+    id BIGSERIAL PRIMARY KEY,
+    batch_id BIGINT NOT NULL REFERENCES research_batches(id) ON DELETE CASCADE,
+    row_no INT NOT NULL,
+    input JSONB NOT NULL,
+    query TEXT NOT NULL,
+    intel_task_id VARCHAR(64),
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    result JSONB,
+    critic_score NUMERIC(4,2),
+    tokens INT,
+    elapsed_seconds NUMERIC(10,2),
+    review_status VARCHAR(16) NOT NULL DEFAULT 'new',
+    notes TEXT,
+    edited JSONB,
+    error TEXT,
+    submitted_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+""")
+
+STATEMENTS.append("""
+CREATE INDEX IF NOT EXISTS idx_research_items_batch_status ON research_items (batch_id, status);
+""")
+
+STATEMENTS.append("""
+CREATE INDEX IF NOT EXISTS idx_research_items_batch_review ON research_items (batch_id, review_status);
+""")
+
+STATEMENTS.append("""
+CREATE UNIQUE INDEX IF NOT EXISTS idx_research_items_batch_row ON research_items (batch_id, row_no);
+""")
+
 async def apply(conn) -> int:
     """Выполнить всё по очереди. Возвращает число выполненных выражений.
 

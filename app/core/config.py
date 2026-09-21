@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # инстансы Радара на одной карте — capacity-note §4). 0 — умолчание из кода (4).
     L3_CONCURRENCY: int = 0
 
+    # Intel (SPEC-intel-screens): адрес по умолчанию, если строки intel_keys ещё нет;
+    # ключ — из переменной окружения RADAR_INTEL_API_KEY (значение в API не принимается).
+    INTEL_BASE_URL: str = "http://atomic-intel-api-1:8000"
+
     # Подпись cookie-сессии. Пустая по умолчанию, и это проверяется при старте:
     # рабочий ключ, случайно уехавший в репозиторий, хуже упавшего сервиса.
     SECRET_KEY: str = ""

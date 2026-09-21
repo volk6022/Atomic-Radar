@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import (alerts, auth, automation, backfill, discovery, drafts, ingest,
+from app.api.v1 import (alerts, auth, automation, backfill, discovery, drafts, ingest, intel,
                         leads, manual_sends, profile, runs, screens, system, wf_queues)
 # Роутер и сервис называются одинаково; без псевдонима второй импорт молча затирает
 # первый, и `include_router` уходит в модуль сервисов. Тот же приём, что у `events`
@@ -123,6 +123,7 @@ def create_app() -> FastAPI:
     # ею право run.backfill. Правила — в самом модуле.
     app.include_router(backfill.router)
     app.include_router(discovery.router)
+    app.include_router(intel.router)
     app.include_router(alerts.router)
     app.include_router(events_api.router)
     app.include_router(leads.router)

@@ -10,8 +10,9 @@ import pytest
 from app.core.access import ACCESS, Role, Section, can, sections_for
 
 # Дословно из `ACCESS` в `Atomic Radar.dc.html` (см. contract/Atomic-Radar.md),
-# сверено 2026-08-24 после подключения раздела ручных отправок и 2026-08-26 после
-# раздела активности сценария.
+# сверено 2026-08-24 после подключения раздела ручных отправок, 2026-08-26 после
+# раздела активности сценария и 2026-09-21 после раздела intel (SPEC-intel-screens):
+# штат, как `runs` — право на запуск пачки отдельной способностью (test_capabilities).
 #
 # Одно расхождение остаётся намеренно: в оболочке есть маршрут `draftsTable` —
 # второй вид того же раздела черновиков, у которого нет и не должно быть отдельного
@@ -33,6 +34,7 @@ EXPECTED = {
     "profile": {"owner", "customer", "reviewer"},
     "runs": {"owner", "customer", "reviewer"},
     "evals": {"owner", "customer", "reviewer"},
+    "intel": {"owner", "customer", "reviewer"},
     "attribution": {"owner", "customer", "viewer"},
     "observability": {"owner"},
     "safety": {"owner", "customer"},

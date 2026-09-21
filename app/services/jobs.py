@@ -59,7 +59,7 @@ ACTIVE = ("queued", "running")
 # Виды задач и права, которые для них нужны. Список закрытый: `kind` приходит из
 # браузера, и запускать по нему произвольную функцию нельзя.
 KINDS = ("reclassify", "backfill", "channel_add", "export", "discussions",
-         "group_join", "discovery_scan", "discovery_check")
+         "group_join", "discovery_scan", "discovery_check", "intel_research")
 
 
 class JobBusy(Exception):
@@ -271,12 +271,23 @@ async def _job_discovery_check(run_id: int, params: dict) -> dict:
         return await discovery.run_check(report=report, cancelled=cancelled)
 
 
+
+async def _job_intel_research(run_id: int, params: dict) -> dict:
+    """Пачка ресёрчей Intel (SPEC-intel-screens): тело — в `intel_research`, здесь
+    только обвязка прогона, как у поиска каналов."""
+    from app.services import intel_research
+    async with _tracked(run_id) as (report, cancelled):
+        return await intel_research.run_batch(run_id, batch_id=int(params["batch_id"]),
+                                              report=report, cancelled=cancelled)
+
+
 RUNNERS: dict[str, Callable[[int, dict], Awaitable[dict]]] = {
     "reclassify": _job_reclassify,
     "discussions": _job_discussions,
     "group_join": _job_group_join,
     "discovery_scan": _job_discovery_scan,
     "discovery_check": _job_discovery_check,
+    "intel_research": _job_intel_research,
 }
 
 

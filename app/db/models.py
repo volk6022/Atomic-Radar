@@ -1317,3 +1317,74 @@ class DraftComment(Base):
         # идут «по этому черновику, свежие раньше».
         Index("ix_draft_comment_draft", "contour", "draft_id", "created_at"),
     )
+
+
+# ── Intel ─────────────────────────────────────────────────────────────────────
+
+class IntelKey(Base):
+    """Ключ Intel по инстансу. Одна строка на инстанс (`key='default'`).
+    Значение API-ключа не хранится: лежит имя переменной окружения,
+    значение читается из окружения процесса."""
+    __tablename__ = "intel_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, default="default")
+    base_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key_env: Mapped[str] = mapped_column(String(64), nullable=False, default="RADAR_INTEL_API_KEY")
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    quota_per_hour: Mapped[int] = mapped_column(Integer, nullable=False, default=500)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_ratelimit_limit: Mapped[int | None] = mapped_column(Integer)
+    last_ratelimit_remaining: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class ResearchBatch(Base):
+    """Пачка Intel-исследований. Статусы: queued|running|done|failed|cancelled|interrupted."""
+    __tablename__ = "research_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    prompt_template: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_json: Mapped[dict | None] = mapped_column(JSONB)
+    source_kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    source_name: Mapped[str | None] = mapped_column(String(255))
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="quality")
+    language: Mapped[str] = mapped_column(String(8), nullable=False, default="ru")
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    log: Mapped[dict | None] = mapped_column(JSONB)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    run_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("runs.id"))
+    created_at: Mapped[datetime] = _created()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResearchItem(Base):
+    """Строка пачки Intel. Статусы: pending|submitted|running|waiting_llm|completed|failed|stalled|cancelled."""
+    __tablename__ = "research_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(Integer, ForeignKey("research_batches.id", ondelete="CASCADE"), nullable=False)
+    row_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    input: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    intel_task_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    critic_score: Mapped[float | None] = mapped_column(Numeric(4, 2))
+    tokens: Mapped[int | None] = mapped_column(Integer)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    review_status: Mapped[str] = mapped_column(String(16), nullable=False, default="new")
+    notes: Mapped[str | None] = mapped_column(Text)
+    edited: Mapped[dict | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = _updated()

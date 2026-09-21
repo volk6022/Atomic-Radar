@@ -36,6 +36,8 @@ class Section(StrEnum):
     EVALS = "evals"
     ATTRIBUTION = "attribution"
     OBSERVABILITY = "observability"
+    # Intel (SPEC-intel-screens): ключ, пачки ресёрчей, ревью — общий раздел, не сценарный.
+    INTEL = "intel"
     SAFETY = "safety"
     ADMIN = "admin"
 
@@ -69,6 +71,7 @@ ACCESS: dict[Section, frozenset[Role]] = {
     # Заказчик видит свою экономику, гость — только её (это витрина для инвестора).
     Section.ATTRIBUTION: frozenset({Role.OWNER, Role.CUSTOMER, Role.VIEWER}),
     Section.OBSERVABILITY: _OWNER,
+    Section.INTEL: _STAFF,
     # Заказчик обязан видеть Safety: там переключатель DRY_RUN, а по договорённости
     # с ним ни одно сообщение не уходит без его ведома.
     Section.SAFETY: frozenset({Role.OWNER, Role.CUSTOMER}),
@@ -102,6 +105,11 @@ class Capability(StrEnum):
     # смена состояния нитки (передать/закрыть) — рабочий инструмент разборщика.
     CONVERSATION_REPLY = "conversation.reply"
     CONVERSATION_STATE = "conversation.state"
+    # Intel: запуск пачки — владелец и заказчик; ключ — только владелец; ревью и выгрузка — все.
+    INTEL_RUN = "intel.run"
+    INTEL_KEY_EDIT = "intel.key_edit"
+    INTEL_REVIEW = "intel.review"
+    INTEL_EXPORT = "intel.export"
     DRAFT_REOPEN = "draft.reopen"
     LEAD_STATUS = "lead.status"
     BULK_DECIDE = "bulk.decide"
@@ -150,6 +158,10 @@ CAPABILITIES: dict[Capability, frozenset[Role]] = {
     Capability.DRAFT_SEND: _OWNER_CUSTOMER,
     Capability.CONVERSATION_REPLY: _OWNER_CUSTOMER,
     Capability.CONVERSATION_STATE: _STAFF,
+    Capability.INTEL_RUN: _OWNER_CUSTOMER,
+    Capability.INTEL_KEY_EDIT: _OWNER,
+    Capability.INTEL_REVIEW: _STAFF,
+    Capability.INTEL_EXPORT: _STAFF,
     Capability.DRAFT_REOPEN: _STAFF,
     Capability.LEAD_STATUS: _STAFF,
     # Наёмный разборщик решает по одному. Одна ошибка в фильтре — и триста лидов

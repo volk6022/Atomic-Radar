@@ -111,7 +111,8 @@ def test_migrations_only_add_never_drop():
     losing = ("DROP COLUMN", "DROP TABLE", "DROP SCHEMA", "DROP INDEX",
               "DELETE", "TRUNCATE")
     for stmt in STATEMENTS:
-        upper = stmt.upper()
+        # `ON DELETE CASCADE` у внешнего ключа — правило каскада, не удаление данных.
+        upper = stmt.upper().replace("ON DELETE CASCADE", "ON CASCADE")
         for token in losing:
             assert token not in upper, stmt
         # Идемпотентность у каждого шага своя: синтаксисом (IF EXISTS/IF NOT EXISTS),
