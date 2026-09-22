@@ -577,6 +577,51 @@ def _outbound_view(row: WfOutbound | None) -> dict | None:
             "created_at": row.created_at.isoformat() if row.created_at else None}
 
 
+async def _already_sent_by_draft(db, wf: Workflow,
+                                 rows: list[tuple]) -> dict[int, dict | None]:
+    """Метка «этому человеку уже отправлено» — другим черновиком этого сценария.
+
+    Правило экрана «одобрен + последняя попытка failed → кнопку вернуть» играет
+    злую шутку, когда у цели два черновика: один доставлен, у второго попытки
+    упали. Оператор видит красное «не отправлено» и кнопку, хотя человек сообщение
+    уже получил — гейт это отсечёт только при заказе. Метка говорит об этом до
+    нажатия: `wf_outbound` со `state='delivered'` по тому же `recipient_peer_id`
+    в том же сценарии, но по ДРУГОМУ черновику. Своя доставка не считается: у
+    такого черновика и так `state='sent'`, кнопки нет, и метка повторила бы бейдж.
+    Доставок по чужим черновикам несколько — свежайшая из них: оператору видно
+    последнее касание, а не первое.
+
+    Адресат читается со снимка `wf_outbound.recipient_peer_id`, а не с цели: журнал
+    хранит, куда сообщение ушло на самом деле, даже если цель потом переоценили.
+    Один запрос на страницу — по списку адресатов, не по запросу на черновик, по
+    той же причине, что и у `_outbound_by_draft`; свежайшая — по id, а не по
+    времени: id растут вместе с созданием, и одна секунда на две попытки не
+    перевернёт метку.
+    """
+    peers = {t.recipient_peer_id for _, t, _ in rows
+             if t.recipient_peer_id is not None}
+    delivered: dict[int, list[WfOutbound]] = {}
+    if peers:
+        for row in (await db.execute(
+                select(WfOutbound)
+                .where(WfOutbound.workflow_id == wf.id,
+                       WfOutbound.state == "delivered",
+                       WfOutbound.draft_id.isnot(None),
+                       WfOutbound.recipient_peer_id.in_(peers))
+                .order_by(WfOutbound.id.desc()))).scalars():
+            delivered.setdefault(row.recipient_peer_id, []).append(row)
+
+    out: dict[int, dict | None] = {}
+    for d, t, _ in rows:
+        fresh = next((o for o in delivered.get(t.recipient_peer_id, [])
+                      if o.draft_id != d.id), None)
+        out[d.id] = (None if fresh is None else
+                     {"draft_id": fresh.draft_id,
+                      "at": fresh.created_at.isoformat() if fresh.created_at else None,
+                      "conversation_id": fresh.conversation_id})
+    return out
+
+
 @router.get("/drafts")
 async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
                  user=requires(Section.DRAFTS),
@@ -685,6 +730,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
     source = await _source_by_message(db, {c.id: c for _, _, c in rows},
                                       [t for _, t, _ in rows])
     outbound = await _outbound_by_draft(db, [d.id for d, _, _ in rows])
+    already_sent = await _already_sent_by_draft(db, wf, rows)
 
     out = [{
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -703,6 +749,7 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
         "prompt_version": d.prompt_version,
         "source_message_link": d.source_message_link,
         "outbound": _outbound_view(outbound.get(d.id)),
+        "already_sent": already_sent.get(d.id),
         "created_at": d.created_at.isoformat() if d.created_at else None,
     } for d, t, c in rows]
 
@@ -714,7 +761,8 @@ async def drafts(db: GetDB, wf: Workflow = GetWorkflow,
 def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
          readers: list[dict], source: dict | None = None,
          comments: list[dict] | None = None,
-         outbound: dict | None = None) -> dict:
+         outbound: dict | None = None,
+         already_sent: dict | None = None) -> dict:
     """Черновик целиком — для карточки, а не для строки таблицы.
 
     Одна форма на курсорную выдачу и на прямую ссылку: экран у них общий, и разойдись
@@ -730,6 +778,9 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
     прямая ссылка не могли показать карточку с разным числом отзывов. Бейдж
     отправки (`outbound`) — по той же причине: его достаёт вызывающая ручка,
     иначе карточка и строка списка разошлись бы в том, заказана ли отправка.
+    Метка `already_sent` — рядом с `outbound` и по той же причине: у неё один
+    запрос на страницу, и доставать её здесь, без сессии и списка соседей, было бы
+    нечем.
     """
     return {
         "id": d.id, "target_id": t.id, "state": d.state,
@@ -756,6 +807,7 @@ def _one(wf: Workflow, d: WfDraft, t: WfTarget, c: Channel,
         "prompt_version": d.prompt_version,
         "source_message_link": d.source_message_link,
         "outbound": outbound,
+        "already_sent": already_sent,
     }
 
 
@@ -828,9 +880,11 @@ async def next_draft(db: GetDB, wf: Workflow = GetWorkflow,
         source = await _source_by_message(db, {row[2].id: row[2]}, [row[1]])
         comments = await draft_comments.list_for(db, "wf", row[0].id)
         outbound = await _outbound_by_draft(db, [row[0].id])
+        already_sent = await _already_sent_by_draft(db, wf, [row])
         one = _one(wf, row[0], row[1], row[2], readers.get(row[1].message_id, []),
                    source.get(row[1].message_id), comments,
-                   _outbound_view(outbound.get(row[0].id)))
+                   _outbound_view(outbound.get(row[0].id)),
+                   already_sent.get(row[0].id))
 
     # `readers` и `tg_link` продублированы на верхний уровень конверта — как у
     # прямой ссылки на карточку: конверты у ручек обязаны совпадать, экран их не
@@ -898,8 +952,9 @@ async def draft(draft_id: int, db: GetDB, wf: Workflow = GetWorkflow,
     source = await _source_by_message(db, {row[2].id: row[2]}, [t])
     comments = await draft_comments.list_for(db, "wf", d.id)
     outbound = await _outbound_by_draft(db, [d.id])
+    already_sent = await _already_sent_by_draft(db, wf, [row])
     one = _one(wf, d, t, row[2], readers, source.get(t.message_id), comments,
-               _outbound_view(outbound.get(d.id)))
+               _outbound_view(outbound.get(d.id)), already_sent.get(d.id))
     return {"remaining": await _pending(db, wf), "state": d.state,
             "workflow": wf.key,
             "readers": one["readers"], "tg_link": one["tg_link"],
