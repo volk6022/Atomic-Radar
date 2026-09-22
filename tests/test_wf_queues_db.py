@@ -658,7 +658,8 @@ def test_drafts_min_score_cuts_rows_and_total_but_not_states(authed_filters):
     assert [r["score"] for r in edge["rows"]] == [90]
 
     states = {s["key"]: s["count"] for s in edge["states"]}
-    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0}
+    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0,
+                      "sent": 0}
 
 
 def test_drafts_channel_filter_by_title(authed_filters):
@@ -708,7 +709,8 @@ def test_drafts_filters_combine_with_state(authed_filters):
     assert [r["score"] for r in combined["rows"]] == [90]
     # Сводка и здесь не срезана фильтрами: `state` и `min_score` на неё не влияют.
     states = {s["key"]: s["count"] for s in combined["states"]}
-    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0}
+    assert states == {"pending": 1, "approved": 1, "rejected": 1, "edited": 0,
+                      "sent": 0}
 
     assert authed_filters.get(
         "/api/v1/workflows/cold_dm/drafts?state=rejected").json()["total"] == 1
