@@ -135,6 +135,7 @@ async def run(ep: Endpoint, *, query: str, mode: str, output_schema: dict | None
     for attempt in range(3):
         try:
             r = await client.post("/intel/api/v1/research/run", json=payload)
+            _note_ratelimit(r)
             if r.status_code == 429:
                 body = r.json()
                 raise IntelRateLimited(
@@ -168,6 +169,7 @@ async def status(ep: Endpoint, task_id: str) -> dict:
     for attempt in range(3):
         try:
             r = await client.get(f"/intel/api/v1/research/status/{task_id}")
+            _note_ratelimit(r)
             if r.status_code == 404:
                 raise IntelNotFound(f"Intel task {task_id} not found")
             if r.status_code == 429:
@@ -197,8 +199,25 @@ async def status(ep: Endpoint, task_id: str) -> dict:
     raise IntelUnavailable(f"Intel недоступен: {last_exc}")
 
 
-def ratelimit_from(headers: dict) -> tuple[int | None, int | None]:
-    """Извлечь X-RateLimit-Limit/Remaining из заголовков."""
+def ratelimit_from(headers) -> tuple[int | None, int | None]:
+    """Извлечь X-RateLimit-Limit/Remaining из заголовков (httpx отдаёт их без учёта регистра)."""
     limit = headers.get("X-RateLimit-Limit")
     remaining = headers.get("X-RateLimit-Remaining")
-    return (int(limit) if limit else None, int(remaining) if remaining else None)
+    try:
+        return (int(limit) if limit else None, int(remaining) if remaining else None)
+    except ValueError:
+        return (None, None)
+
+
+# Последний ответ Intel с заголовками лимита: (limit, remaining) или None. Прогон
+# переписывает это в `intel_keys.last_ratelimit_*` при каждом удачном опросе — до
+# 22.09 помощник выше никто не звал, и колонки на проде оставались пустыми, хотя
+# Intel шлёт `x-ratelimit-limit: 1000` в каждом ответе.
+last_ratelimit: tuple[int | None, int | None] | None = None
+
+
+def _note_ratelimit(r) -> None:
+    global last_ratelimit
+    lim, rem = ratelimit_from(r.headers)
+    if lim is not None or rem is not None:
+        last_ratelimit = (lim, rem)

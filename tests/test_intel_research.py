@@ -57,6 +57,19 @@ async def test_run_returns_task_id_and_sends_key(monkeypatch):
     assert seen["auth"] == "k" and b'"output_schema"' in seen["body"]
 
 
+async def test_ratelimit_headers_are_noted(monkeypatch):
+    # Прод 21.09: Intel шлёт x-ratelimit-limit/remaining в каждом ответе, а колонки
+    # intel_keys.last_ratelimit_* были пустые — помощник ratelimit_from никто не звал.
+    def handler(req: httpx.Request):
+        return httpx.Response(200, json={"task_id": "t-1", "status": "running"},
+                              headers={"x-ratelimit-limit": "1000", "x-ratelimit-remaining": "999"})
+
+    _client_with(handler, monkeypatch)
+    intel_client.last_ratelimit = None
+    await intel_client.status(EP, "t-1")
+    assert intel_client.last_ratelimit == (1000, 999)
+
+
 async def test_429_carries_retry_after_and_scope(monkeypatch):
     def handler(req):
         return httpx.Response(429, json={"detail": "quota", "retry_after": 37, "scope": "work"},
@@ -185,9 +198,12 @@ async def test_batch_runs_within_concurrency_and_records_results(db, monkeypatch
     fake = FakeIntel({"t2": ["running", "queued_waiting_llm", "completed"], "t3": ["failed"],
                       "t4": ["404"]})
     _fast(monkeypatch, fake)
+    intel_client.last_ratelimit = (1000, 997)
     lines, report = await _log()
     out = await intel_research.run_batch(0, batch_id=1, report=report, cancelled=lambda: False)
     assert out == {"batch_id": 1, "total": 4, "done": 2, "failed": 2, "status": "done"}
+    key = (await db.execute(select(IntelKey))).scalars().first()
+    assert (key.last_ratelimit_limit, key.last_ratelimit_remaining) == (1000, 997)
     assert fake.in_flight_max <= 2, "не больше concurrency задач в полёте"
     items = {r.row_no: r for r in (await db.execute(select(ResearchItem))).scalars().all()}
     assert items[1].status == "completed" and float(items[1].critic_score) == 7.5 and items[1].tokens == 16953

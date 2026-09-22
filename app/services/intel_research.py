@@ -206,6 +206,9 @@ async def run_batch(run_id: int, *, batch_id: int, report, cancelled) -> dict:
                     continue
                 if key is not None:
                     key.last_ok_at = clock.utcnow()
+                    rl = intel_client.last_ratelimit
+                    if rl is not None:
+                        key.last_ratelimit_limit, key.last_ratelimit_remaining = rl
                 status = data.get("status")
                 if status == "completed":
                     result = data.get("result") or {}
