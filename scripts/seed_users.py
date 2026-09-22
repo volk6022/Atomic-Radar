@@ -9,6 +9,7 @@ QR-код в приложении-аутентификаторе.
 Запуск:
     python scripts/seed_users.py
     python scripts/seed_users.py --reset-password ivan@atomic-automation.net
+    python scripts/seed_users.py --add ksenia@atomic-automation.net         --name Ксения --initials КС --role customer
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
 
+from app.core.access import Role  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.security import hash_password, new_totp_secret, totp_uri  # noqa: E402
 from app.db.models import Base, Limit, SystemState, User  # noqa: E402
@@ -54,6 +56,11 @@ async def main() -> int:
                     help="выдать новый пароль существующему пользователю")
     ap.add_argument("--reset-totp", metavar="EMAIL",
                     help="перевыпустить секрет TOTP (старый перестанет работать)")
+    ap.add_argument("--add", metavar="EMAIL",
+                    help="завести нового пользователя (требует --name, --initials, --role)")
+    ap.add_argument("--name", help="имя для --add, как его увидят в панели")
+    ap.add_argument("--initials", help="инициалы для --add, 1-8 символов")
+    ap.add_argument("--role", choices=[r.value for r in Role], help="роль для --add")
     args = ap.parse_args()
 
     get_settings().validate_runtime()
@@ -72,6 +79,34 @@ async def main() -> int:
             user.password_hash = hash_password(pwd)
             await db.commit()
             print(f"{user.email}: новый пароль {pwd}")
+            return 0
+
+        if args.add:
+            # Вход сравнивает адрес приведённым к нижнему регистру
+            # (`api/v1/auth.py`: `body.username.strip().lower()`), а сюда его
+            # передаёт человек руками. Адрес с заглавной буквой завёл бы учётку,
+            # в которую нельзя войти вообще никогда, и выглядело бы это как
+            # «неверный пароль».
+            email = args.add.strip().lower()
+            missing = [f for f, v in (("--name", args.name), ("--initials", args.initials),
+                                      ("--role", args.role)) if not v]
+            if missing:
+                print(f"--add требует {', '.join(missing)}")
+                return 2
+            if (await db.execute(select(User).where(User.email == email))).scalar_one_or_none():
+                print(f"{email}: уже есть, ничего не делаю")
+                return 1
+            pwd, secret = new_password(), new_totp_secret()
+            db.add(User(email=email, name=args.name, initials=args.initials,
+                        role=args.role, password_hash=hash_password(pwd),
+                        totp_secret=secret))
+            await db.commit()
+            print("=" * 70)
+            print("СОХРАНИ ЭТО СЕЙЧАС — пароль больше нигде не появится")
+            print("=" * 70)
+            print(f"{email}  ({args.role})")
+            print(f"  пароль: {pwd}")
+            print(f"  TOTP:   {totp_uri(secret, email)}")
             return 0
 
         if args.reset_totp:
