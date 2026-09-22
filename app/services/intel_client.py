@@ -11,6 +11,7 @@ Intel держит задачи LLM; Radar ходит в него как обы�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 TIMEOUT = httpx.Timeout(connect=10, read=60, write=30, pool=10)
+# Поиск организаций в Яндексе идёт десятки секунд — чтение ждём дольше обычного.
+YANDEX_TIMEOUT = httpx.Timeout(connect=10, read=180, write=30, pool=10)
+YANDEX_KINDS = ("extract", "card", "reviews")
 DEFAULT_KEY = "default"
 
 
@@ -48,6 +52,12 @@ class IntelNotFound(Exception):
 
 class IntelForbidden(Exception):
     """Intel отклонил запрос: ключ отозван."""
+
+
+class IntelYandexCaptcha(Exception):
+    """Яндекс показал капчу при разборе карт: Intel ответил 503 с «yandex captcha»
+    в detail. Отдельное исключение, чтобы экран сказал «Яндекс просит капчу»,
+    а не «Intel недоступен»."""
 
 
 @dataclass(frozen=True)
@@ -156,6 +166,63 @@ async def run(ep: Endpoint, *, query: str, mode: str, output_schema: dict | None
         except IntelRateLimited:
             raise
         except IntelForbidden:
+            raise
+
+    raise IntelUnavailable(f"Intel недоступен: {last_exc}")
+
+
+def _error_detail(r: httpx.Response) -> str:
+    """Текст `detail` из ответа Intel; не-JSON и не-строка — строковым представлением."""
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text[:500]
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if detail is None:
+        return r.text[:500]
+    return detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)[:500]
+
+
+async def yandex(ep: Endpoint, *, kind: str, payload: dict) -> dict:
+    """POST /intel/api/v1/yandex-maps/{kind} → ответ Intel как есть.
+
+    Отличия от `run()`: длинный таймаут чтения (поиск организаций идёт десятки
+    секунд) и 4xx без ретраев — Intel на ту же строку ответит тем же, повторы
+    только жгут время синхронной пачки; плохая строка уезжает наверх как
+    `ValueError`, ручка показывает её как `bad_request`.
+    """
+    if kind not in YANDEX_KINDS:
+        raise ValueError(f"kind: ожидается {YANDEX_KINDS}")
+    client = _get_client(ep)
+    last_exc: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            r = await client.post(f"/intel/api/v1/yandex-maps/{kind}",
+                                  json=payload, timeout=YANDEX_TIMEOUT)
+            _note_ratelimit(r)
+            if r.status_code == 429:
+                body = r.json()
+                raise IntelRateLimited(
+                    int(body.get("retry_after", 0)),
+                    body.get("scope", "work"),
+                )
+            if r.status_code == 403:
+                raise IntelForbidden("Intel API key revoked")
+            if r.status_code >= 500:
+                if r.status_code == 503:
+                    detail = _error_detail(r)
+                    if "yandex captcha" in detail.lower():
+                        raise IntelYandexCaptcha(detail)
+                raise httpx.HTTPError(f"Intel {r.status_code}")
+            if r.status_code >= 400:
+                raise ValueError(f"Intel {r.status_code}: {_error_detail(r)}")
+            return r.json()
+        except httpx.HTTPError as e:
+            last_exc = e
+            if attempt < 2:
+                await asyncio.sleep([5, 15, 45][attempt])
+        except (IntelRateLimited, IntelForbidden, IntelYandexCaptcha, ValueError):
             raise
 
     raise IntelUnavailable(f"Intel недоступен: {last_exc}")

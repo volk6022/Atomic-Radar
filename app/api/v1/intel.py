@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -16,6 +17,7 @@ import math
 import os
 import re
 from copy import deepcopy
+from typing import Literal
 from urllib.parse import quote
 
 import jsonschema
@@ -171,6 +173,15 @@ class BatchBody(ValidateBody):
     name: str = Field(min_length=1, max_length=255)
 
 
+class YandexBody(BaseModel):
+    """Пачка разборов Яндекс-карт одним запросом. Содержимое строк по полям не
+    валидируем — это дело Intel; ловим только отсутствие обязательных ключей,
+    чтобы не жечь десятки секунд на заведомо дырявой строке."""
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["extract", "card", "reviews"]
+    rows: list[dict] = Field(min_length=1, max_length=50)
+
+
 class ItemPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     review_status: str | None = None
@@ -275,6 +286,70 @@ async def create_batch(body: BatchBody, request: Request, db: GetDB,
     logger.info("intel_batch_started batch=%s run=%s total=%s by=%s",
                 batch.id, run.id, batch.total, user.email)
     return {"batch_id": batch.id, "run_id": run.id, "total": batch.total}
+
+
+def yandex_row_errors(kind: str, rows: list[dict]) -> list[dict]:
+    """Обязательные ключи строки: `extract` → `query`; `card`/`reviews` →
+    `business_oid` (только цифры) и `seoname`. Остальные поля проверяет Intel.
+    Номер строки — с нуля, тем же `i`, каким строка встанет в результаты."""
+    errors: list[dict] = []
+    for i, row in enumerate(rows):
+        if kind == "extract":
+            if "query" not in row:
+                errors.append({"i": i, "field": "query", "message": "в строке нет ключа query"})
+            continue
+        oid = row.get("business_oid")
+        if oid is None or not re.fullmatch(r"\d+", str(oid)):
+            errors.append({"i": i, "field": "business_oid",
+                           "message": "обязателен ключ business_oid из цифр"})
+        if "seoname" not in row:
+            errors.append({"i": i, "field": "seoname", "message": "в строке нет ключа seoname"})
+    return errors
+
+
+@router.post("/yandex")
+async def yandex(body: YandexBody, request: Request, db: GetDB,
+                 user=permits(Section.INTEL, Capability.INTEL_RUN)):
+    """Разбор Яндекс-карт пачкой одним запросом: `extract|card|reviews` Intel.
+    Ничего не храним — операция синхронная, на входе список заданий, на выходе
+    таблица результатов. Строки идут последовательно (Яндекс капризен к темпу),
+    между строками пауза 1 с; упавшая строка пачку не прерывает."""
+    errors = yandex_row_errors(body.kind, body.rows)
+    if errors:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, {"errors": errors})
+    try:
+        ep = await intel_client.endpoint(db)
+    except intel_client.IntelNotConfigured as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    results: list[dict] = []
+    ok = 0
+    for i, row in enumerate(body.rows):
+        if i:
+            await asyncio.sleep(1)
+        try:
+            data = await intel_client.yandex(ep, kind=body.kind, payload=row)
+        except intel_client.IntelYandexCaptcha as e:
+            failed = ("captcha", str(e))
+        except intel_client.IntelRateLimited as e:
+            failed = ("rate_limited", str(e))
+        except intel_client.IntelForbidden as e:
+            failed = ("forbidden", str(e))
+        except intel_client.IntelUnavailable as e:
+            failed = ("unavailable", str(e))
+        except ValueError as e:  # Intel отклонил строку (4xx) — см. intel_client.yandex
+            failed = ("bad_request", str(e))
+        else:
+            results.append({"i": i, "ok": True, "data": data, "error": None})
+            ok += 1
+            continue
+        results.append({"i": i, "ok": False, "data": None,
+                        "error": {"code": failed[0], "message": failed[1]}})
+    db.add(AuditLog(user_id=user.id, user_email=user.email, action="intel_yandex",
+                    detail={"kind": body.kind, "rows": len(body.rows)},
+                    ip=request.client.host if request.client else None))
+    await db.commit()
+    return {"kind": body.kind, "total": len(body.rows), "ok": ok,
+            "failed": len(body.rows) - ok, "results": results}
 
 
 def _batch_row(b: ResearchBatch) -> dict:
