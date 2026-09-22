@@ -35,11 +35,12 @@ from app.core.access import Capability, Section, allows
 from app.core.config import get_settings
 from app.api.v1.system import get_state
 from app.db.models import (Attribution, AuditLog, Channel, ChannelCandidate,
-                           Conversation, Draft, Lead, LlmTrace, Message,
-                           MessageReader, OutboundAttempt, ProfileVersion, User,
-                           WfDraft, Workflow)
+                           ConfigFile, Conversation, Draft, Lead, LlmTrace,
+                           Message, MessageReader, OutboundAttempt,
+                           ProfileVersion, User, WfDraft, Workflow)
 from app.services import (cascade_registry, discussions, drafting, embeddings,
-                          engage, llm, queue)
+                          engage, llm, llm_grammar, queue, reclassify,
+                          wf_drafting)
 
 router = APIRouter(prefix="/api/v1", tags=["screens"])
 
@@ -597,6 +598,152 @@ async def channel_card(channel_id: int, db: GetDB,
 
 # ── настройка ─────────────────────────────────────────────────────────────────
 
+def _under_the_hood_stages(rules: cascade.CascadeProfile,
+                           thresholds: dict[str, float]) -> list[dict]:
+    """Ступени каскада по порядку исполнения: что отсекает каждая и где в коде.
+
+    `where` — файл:строка функции ступени, посчитано по факту; при переносе
+    функции строка обновляется здесь же. Тексты — своими словами по коду: экран
+    существует ради вопроса «что вообще происходит», и отвечать на него цитатой
+    из докстринга значило бы переносить туда же его чтение.
+    """
+    return [
+        {"key": "l0", "title": "L0 · отсев до модели",
+         "where": "app/core/cascade.py:456",
+         "text": ("Отсекает то, что вообще не реплика человека: автопересылку поста "
+                  "канала, бота, безымянный пост, пустой и короткий текст, команду "
+                  "боту, голую ссылку без слов. Первые две проверки профиль умеет "
+                  "снимать: для публичного контура и то и другое законно.")},
+        {"key": "l1", "title": "L1 · словарь",
+         "where": "app/core/cascade.py:490",
+         "text": ("Ищет в тексте подстрокой якоря боли. Пока L2 выключен, режим "
+                  "строгий: нужен ещё признак проблемы или просьба о помощи. "
+                  "Минус-слова не отсеивают, а помечают карточку. Если якорей нет, "
+                  "у канала включён обход, а текст длиннее 200 символов — сообщение "
+                  "уходит на решение L2 вместо приговора."),
+         "params": {"l1_bypass_pos_min":
+                        thresholds[cascade_registry.L1_BYPASS_POS_MIN_LIMIT_KEY],
+                    "anchors_total": sum(len(a)
+                                         for a in rules.pain_anchors.values()),
+                    "disqualifiers": len(rules.disqualifier_markers)}},
+        {"key": "l2", "title": "L2 · эмбеддинги",
+         "where": "app/core/cascade.py:535",
+         "text": ("Сравнивает сообщение с эталонными фразами «болей» и «шума» по "
+                  "косинусу и решает по ближайшему: верхний шум — отсев; верхняя "
+                  "боль проходит, если отрыв от второго класса больше порога. Для "
+                  "пришедших обходом L1 работает правило близости, а не отрыва."),
+         "params": {"model": get_settings().EMBED_MODEL
+                              if embeddings.enabled() else None,
+                    "l2_min_margin":
+                        thresholds[cascade_registry.L2_MIN_MARGIN_LIMIT_KEY],
+                    "positive_prototypes":
+                        sum(len(v) for v in prototypes.POSITIVE.values()),
+                    "negative_prototypes":
+                        sum(len(v) for v in prototypes.NEGATIVE.values())}},
+        {"key": "l3", "title": "L3 · LLM",
+         "where": "app/core/cascade.py:624",
+         "text": ("Модель (вызов — app/services/llm.py:313) разбирает сообщение с "
+                  "соседними и отвечает наблюдениями: есть ли проблема, не продавец "
+                  "ли автор, не отвечает ли он другому. Приговор по наблюдениям "
+                  "выносит правило профиля здесь, а не сама модель."),
+         "params": {"model": get_settings().LLM_MODEL if llm.enabled() else None,
+                    # Эффективный потолок параллельных вопросов к модели: строка
+                    # `RADAR_L3_CONCURRENCY` поверх умолчания кода — та же формула,
+                    # что в reclassify._stage_l3, где семафор и стоит.
+                    "concurrency": get_settings().L3_CONCURRENCY
+                                   or reclassify.L3_CONCURRENCY,
+                    # Ноль, а не «поменьше»: одинаковый вопрос обязан получать
+                    # одинаковый ответ (см. llm.verdict).
+                    "temperature": 0.0,
+                    "max_tokens": get_settings().LLM_MAX_TOKENS}},
+    ]
+
+
+# Откуда вызывается каждый контур — по факту: `used_for` собирается вручную из
+# мест вызова (`llm.verdict(... prompt_key=...)` и `b.profile.l3_prompt_key` в
+# reclassify/discovery). Реестр промптов знать адресатов не может — это обратная
+# зависимость, — поэтому соответствие живёт здесь, у витрины.
+_PROMPT_USED_FOR = {
+    "dm_v1": "личка: вердикт по сообщению (контур cold_dm)",
+    "public_v1": "публичный ответ в ветке (контур public_reply)",
+    "channel_fit_v1": "подбор каналов: оценка кандидата (discovery.check_fit)",
+}
+
+
+def _prompt_user_template(key: str) -> str:
+    """Как реально собирается пользовательское сообщение контура.
+
+    Для контуров-сообщений — форма `llm.build_prompt` с плейсхолдерами; канал
+    (`channel_fit_v1`) собирает карточку сам, «разбираемого сообщения» у него нет.
+    """
+    if key == "channel_fit_v1":
+        return ("Карточка канала:\nНазвание: …\nUsername: …\nУчастников: …\n"
+                "Тип чата: …\nПоследние сообщения (выборка):\n- «…»"
+                " — до 10 строк по 200 знаков (discovery.build_channel_fit_input)")
+    return ("Соседние сообщения в чате:\n{context}\n\nРазбираемое сообщение:\n"
+            "«{text}» — {context} это строки «- …» по одной на соседнее сообщение, "
+            "либо «(контекста нет)» (llm.build_prompt)")
+
+
+def _under_the_hood_prompts() -> list[dict]:
+    """Все промпты реестра `llm`, а не только активный в этом экране.
+
+    Блок «каскад» показывает промпт профиля `dm_v1`; здесь же видно, что контуров
+    три, у каждого свой вопрос, своя версия и своя грамматика ответа. Грамматика
+    строится из текста промпта той же функцией, что и перед отправкой запроса, —
+    показать «другую» значило бы соврать про то, что слышит модель.
+    """
+    out = []
+    for key in llm.prompt_keys():
+        p = llm.prompt(key)
+        out.append({"key": key, "version": p.version,
+                    "used_for": _PROMPT_USED_FOR.get(key),
+                    "system": p.system,
+                    "user_template": _prompt_user_template(key),
+                    "grammar": llm_grammar.grammar_for(p.system)})
+    return out
+
+
+def _under_the_hood_drafts() -> dict:
+    """Шаблоны черновиков, зашитые в код: модель текст не пишет.
+
+    Ключ `_fallback` — варианты для боли, которой в шаблонах нет. Контакт вынесен
+    отдельным полем не ради удобства копирования: политику «где его называть
+    уместно» проверяет `wf_drafting.lint` по этой самой константе.
+    """
+    return {
+        "prompt_version": drafting.PROMPT_VERSION,
+        "note": ("шаблоны зашиты в код, модель текст не пишет; контакт и тексты "
+                 "не настраиваются с экрана"),
+        "contact": wf_drafting.CONTACT,
+        # Единственная боль, при которой контакт уместен и в публичном ответе:
+        # человек сам спросил, кого позвать.
+        "contact_allowed_pain": wf_drafting.ASKS_FOR_CONTRACTOR,
+        "dm": {**{pain: list(texts) for pain, texts in drafting.TEMPLATES.items()},
+               "_fallback": list(drafting.FALLBACK)},
+        "public": {**{pain: list(texts)
+                      for pain, texts in wf_drafting.PUBLIC_TEMPLATES.items()},
+                   "_fallback": list(wf_drafting.PUBLIC_FALLBACK)},
+    }
+
+
+async def _under_the_hood_bundle(db) -> dict | None:
+    """Текущий набор настроек (`config_files`): применённый последним.
+
+    Тот же `_current_file_id`, что помечает файл текущим в списке наборов, и та же
+    оговорка: «текущий» значит «этим файлом настройки приводили в порядок
+    последним», а не «настройки равны файлу» — их можно поправить и мимо файлов.
+    """
+    current_id = await profile_api._current_file_id(db)
+    if current_id is None:
+        return None
+    row = await db.get(ConfigFile, current_id)
+    if row is None:
+        return None
+    return {"id": row.id, "name": row.name,
+            "applied_at": row.applied_at.isoformat() if row.applied_at else None}
+
+
 @router.get("/profile")
 async def profile(db: GetDB, user=requires(Section.PROFILE)):
     """Профиль заказчика и таксономия болей.
@@ -667,6 +814,18 @@ async def profile(db: GetDB, user=requires(Section.PROFILE)):
             "l3_prompt_key": rules.l3_prompt_key,
             "l3_prompt_version": llm.prompt(rules.l3_prompt_key).version,
             "l3_prompt": llm.prompt(rules.l3_prompt_key).system,
+            # Всё, что реально исполняется под капотом каскада, одним ключом и
+            # только на чтение: ступени с местом в коде, все промпты реестра (не
+            # только активный) с грамматикой и шаблоном сообщения, зашитые шаблоны
+            # черновиков и текущий набор настроек. Владелец видит «Профиль →
+            # Каскад» и до сих пор видит один промпт и четыре числа — остальное
+            # отсюда достаёт экран (он читает `cascade.under_the_hood`).
+            "under_the_hood": {
+                "bundle": await _under_the_hood_bundle(db),
+                "stages": _under_the_hood_stages(rules, thresholds),
+                "prompts": _under_the_hood_prompts(),
+                "draft_templates": _under_the_hood_drafts(),
+            },
         },
         "generation": {
             "prompt_version": drafting.PROMPT_VERSION,
